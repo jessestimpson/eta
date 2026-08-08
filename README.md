@@ -54,10 +54,17 @@ When a run fails, shrink it:
     eta_shrink:shrink(my_harness, Trace, #{seed => 7, max_ops => 25, preload => [my_app]}).
 ```
 
-The library ships with a [two-phase commit implementation as an example](test/support/ets_2pc.erl),
+The library ships with a [two-phase commit implementation as an example](test/support/eta_2pc.erl),
 and includes an optional bug that will break an invariant for demonstration
 purposes. We also provide a [walkthrough that implements an ABD Qurom Register](docs/06-a-journey-through-dst.md)
 and demonstrates the creation of a project from scratch.
+
+A third example, [leader election by heartbeat lease](test/support/eta_elect.erl),
+is the one whose correctness is a statement about time: every deadline it has is
+a `gen_statem` state timeout. Its planted bug is a member that grants a vote it
+has already given away, and it does nothing at all until a cut link lets two
+members reach the same term — which is the case for injecting faults, written as
+three tests.
 
 ## Documentation
 

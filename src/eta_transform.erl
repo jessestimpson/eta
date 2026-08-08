@@ -11,7 +11,7 @@ Nothing else about the module changes, and the rewrite is a pure call-target
 substitution: `erlang:send_after(T, D, M)` becomes `eta_time:send_after(T, D, M)`,
 and so on for the table below.
 
-## Four passes, one transform
+## Five passes, one transform
 
 A module never names more than one `parse_transform`. The extra passes are
 controlled by attributes rather than by naming another transform:
@@ -26,6 +26,10 @@ controlled by attributes rather than by naming another transform:
    `-eta_observe(all)` or `-eta_observe({Record, Fields})`, which republishes the
    state on every `gen_server` or `gen_statem` callback return so a simulation can
    read it while the process is suspended. See `eta_observe`.
+5. **`gen_statem` state time-outs** — takes `{state_timeout, ...}` out of a
+   callback's returned action list and arms a virtual deadline instead, and
+   prepends the clause that delivers it. Applied to every module declaring
+   `-behaviour(gen_statem)`. See `eta_statem`.
 
 They live here rather than in modules of their own for a build reason, and it is
 worth recording because it cost a broken CI run to find. **Mix does not reliably
@@ -182,12 +186,18 @@ reachable state. See `eta_net:call/3`.
 `gen_statem`'s starts are gated like `gen_server`'s, through
 `eta_sched:statem_start_link/3` and friends.
 
-**What `gen_statem` support does not include.** The asynchronous
-`send_request`/`wait_response` interface, and any state-machine feature whose
-behaviour under simulation has not been established — state time-outs and
-`hibernate` in particular. `init/1` returning something other than
-`{ok, State, Data}` or `{ok, State, Data, Actions}` is refused by
-`eta_sched:statem_start_link/3` rather than guessed at.
+**State time-outs are virtualised**, by the fifth pass and `eta_statem`. That is
+a `gen_statem`-shaped hole the other passes cannot reach, because the timer is
+armed inside `gen_statem` rather than by anything this transform rewrites, and
+the answer is to take the action out of the callback's return before OTP sees it.
+
+**What `gen_statem` support still does not include.** The asynchronous
+`send_request`/`wait_response` interface; `hibernate`; and the *other* two kinds
+of time-out — event time-outs and generic (`{timeout, Name}`) ones — which raise
+while a clock is running rather than staying quietly on the real one. See
+`eta_statem` for why they cannot simply be left alone. `init/1` returning
+something other than `{ok, State, Data}` or `{ok, State, Data, Actions}` is
+refused by `eta_sched:statem_start_link/3` rather than guessed at.
 
 ## What raises rather than being rewritten
 
@@ -347,7 +357,15 @@ it would hide that rather than surface it.
 parse_transform(Forms, _Options) ->
     Locals = local_functions(Forms),
     Rewritten = [walk(Form, Locals) || Form <- Forms],
-    observe_pass(after_pass(net_pass(Rewritten, Locals))).
+    %% The state-time-out pass runs **last**, and that is not arbitrary. It
+    %% prepends a clause rather than only wrapping one, and a prepended clause
+    %% must not be wrapped by the passes before it: it is generated complete, it
+    %% publishes no state and returns no reply, and putting it through
+    %% `$eta_observe` or `eta_net:statem_return/1` would only cost calls. Wrapping
+    %% last also means its own wrapper sits outermost, which is the right order —
+    %% the state is published and the replies are sent before the action list is
+    %% read for time-outs.
+    statem_timeout_pass(observe_pass(after_pass(net_pass(Rewritten, Locals)))).
 
 %% Every `{Name, Arity}` the module defines itself. Needed to decide whether an
 %% unqualified `spawn(F)` is the auto-imported BIF or the module's own function.
@@ -941,12 +959,12 @@ after_expand(Anno, Clauses, Timeout, AfterBody, N) ->
     %% position — for `loop() -> receive ... -> loop() end` that turns constant
     %% stack into unbounded growth. It also makes the disarm exception-safe for
     %% free, since it has already run before any body that might throw.
-    Disarm = after_call(Anno, eta_time, disarm_after, [TRefV, RefV]),
+    Disarm = remote_call(Anno, eta_time, disarm_after, [TRefV, RefV]),
     Clauses1 = [after_prepend(Disarm, C) || C <- Clauses],
 
     {block, Anno, [
-        {match, Anno, RefV, after_call(Anno, erlang, make_ref, [])},
-        {match, Anno, TRefV, after_call(Anno, eta_time, arm_after, [Timeout, RefV])},
+        {match, Anno, RefV, remote_call(Anno, erlang, make_ref, [])},
+        {match, Anno, TRefV, remote_call(Anno, eta_time, arm_after, [Timeout, RefV])},
         {'receive', Anno, Clauses1 ++ [TimeoutClause]}
     ]}.
 
@@ -956,8 +974,109 @@ after_prepend(Expr, {clause, Anno, Pats, Guards, Body}) ->
 after_var(Anno, Prefix, N) ->
     {var, Anno, list_to_atom(Prefix ++ integer_to_list(N))}.
 
-after_call(Anno, Mod, Fun, Args) ->
+remote_call(Anno, Mod, Fun, Args) ->
     {call, Anno, {remote, Anno, {atom, Anno, Mod}, {atom, Anno, Fun}}, Args}.
+
+%% ---------------------------------------------------------------------------
+%% State-time-out pass — applied to every `gen_statem`
+%% ---------------------------------------------------------------------------
+
+%% Puts a `gen_statem`'s state time-outs on the virtual clock. See `eta_statem`
+%% for what the generated code does and why it takes three pieces; this is only
+%% the code generation.
+%%
+%% Two edits per state callback, and the second is the unusual one:
+%%
+%%     StateName(info, {'$eta_statem', Ref}, _) ->      %% prepended
+%%         eta_statem:fire(Ref);
+%%     StateName(T = Type, Content, Data) ->            %% original, wrapped
+%%         eta_statem:return(T, state_name, begin OriginalBody end).
+%%
+%% **Prepended, not appended.** The delivery message arrives as an ordinary
+%% `info` event, and clause selection happens before any wrapper can run — so a
+%% module whose own clauses do not have a catch-all would die of `function_clause`
+%% on the very event that is supposed to be its time-out. Going first also means
+%% the module cannot accidentally match it.
+%%
+%% The state handed to `return/3` differs by callback mode, which is the whole
+%% reason the two are told apart here. In `handle_event_function` mode it is the
+%% third argument, bound to a fresh variable because the clause may have written
+%% any pattern there — or ignored it. In `state_functions` mode the state *is*
+%% the function's name, which this pass knows statically and can write as a
+%% literal.
+%%
+%% The **event type** is bound the same way, from the first argument, and is
+%% needed for a narrower reason: a `state_timeout` event means the time-out that
+%% produced it has stopped running, and `eta_statem` has to know that before it
+%% reads the return. See `eta_statem:return/3`.
+%%
+%% Unconditional, for the same reason the `after` pass is: a state time-out is a
+%% real-clock dependence a machine can hold, and one that does not even leave a
+%% stray timer behind to report it. There is no attribute to turn it off, because
+%% a `gen_statem` that wants none simply sets none.
+statem_timeout_pass(Forms) ->
+    case lists:member(gen_statem, behaviours(Forms)) of
+        false ->
+            Forms;
+        true ->
+            Callbacks = statem_callbacks(Forms),
+            [statem_timeout_form(F, Callbacks) || F <- Forms]
+    end.
+
+%% `init/1` gets the wrapper and no prepended clause. It can carry actions, and
+%% `eta_sched:statem_start_link/3` hands them to `gen_statem:enter_loop/6`, so a
+%% time-out set there would be armed by OTP before the machine saw an event. It
+%% is not a state callback, so no time-out is ever delivered *to* it.
+statem_timeout_form({function, Anno, init, 1, Clauses}, _Callbacks) ->
+    {function, Anno, init, 1, [statem_init_clause(C) || C <- Clauses]};
+statem_timeout_form({function, Anno, Name, Arity, Clauses}, Callbacks) ->
+    case sets:is_element({Name, Arity}, Callbacks) of
+        true ->
+            Wrapped = [statem_timeout_clause(C, Name, Arity) || C <- Clauses],
+            {function, Anno, Name, Arity, [statem_fire_clause(Anno, Arity) | Wrapped]};
+        false ->
+            {function, Anno, Name, Arity, Clauses}
+    end;
+statem_timeout_form(Form, _Callbacks) ->
+    Form.
+
+statem_init_clause({clause, Anno, Pats, Guards, Body}) ->
+    {clause, Anno, Pats, Guards, [
+        remote_call(Anno, eta_statem, init_return, [{block, Anno, Body}])
+    ]}.
+
+%% `handle_event/4` — the state is the third argument. Fresh variables are bound
+%% to whatever patterns the clause used, the same device `wrap_handle_call_clause/1`
+%% needs for `From` and for the same reason: a pattern may be a match, a
+%% destructuring, or `_`.
+statem_timeout_clause({clause, Anno, [Type, Content, State, Data], Guards, Body}, handle_event, 4) ->
+    T = {var, Anno, '$eta_statem_event'},
+    V = {var, Anno, '$eta_statem_state'},
+    Pats = [{match, Anno, T, Type}, Content, {match, Anno, V, State}, Data],
+    {clause, Anno, Pats, Guards, [
+        remote_call(Anno, eta_statem, return, [T, V, {block, Anno, Body}])
+    ]};
+%% A state function — the state is its name, so only the event type is bound.
+statem_timeout_clause({clause, Anno, [Type, Content, Data], Guards, Body}, Name, 3) ->
+    T = {var, Anno, '$eta_statem_event'},
+    {clause, Anno, [{match, Anno, T, Type}, Content, Data], Guards, [
+        remote_call(Anno, eta_statem, return, [T, {atom, Anno, Name}, {block, Anno, Body}])
+    ]};
+statem_timeout_clause(Clause, _Name, _Arity) ->
+    Clause.
+
+%% `F(info, {'$eta_statem', Ref}, _, _) -> eta_statem:fire(Ref).`, at the arity
+%% the callback mode implies. The tag comes from `eta_statem:tag/0` rather than
+%% being written here, so the pattern that catches the message and the code that
+%% sends it cannot drift apart.
+statem_fire_clause(Anno, Arity) ->
+    Ref = {var, Anno, '$eta_statem_ref'},
+    U = {var, Anno, '_'},
+    Msg = {tuple, Anno, [{atom, Anno, eta_statem:tag()}, Ref]},
+    Ignored = lists:duplicate(Arity - 2, U),
+    {clause, Anno, [{atom, Anno, info}, Msg | Ignored], [], [
+        remote_call(Anno, eta_statem, fire, [Ref])
+    ]}.
 
 %% ---------------------------------------------------------------------------
 %% Observability pass — applied only to a module declaring `-eta_observe(...)`

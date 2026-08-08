@@ -310,6 +310,54 @@ module that quietly wakes on the wall clock with nothing reporting it.
 arming and cancelling a timer per receive is measurable. `after 0` is never
 rewritten, since it's a mailbox poll rather than a wait.
 
+### gen_statem's state_timeout is handled, and its other two aren't
+
+A `state_timeout` is armed by `erlang:start_timer` *inside* `gen_statem`, where
+no transform of your code reaches. `eta` takes the action out of the callback's
+returned action list instead, before OTP ever sees it, and arms a virtual
+deadline in its place. Nothing to turn on, and nothing to write differently.
+
+This one was worth chasing because of how it failed. The timer went into the
+VM's wheel rather than `eta_time`'s, so it wasn't a stray timer either — nothing
+counted it and nothing warned. A machine waiting on a 30 second election period
+just sat there, and whatever happened next was ordered by the wall clock.
+
+**Event time-outs and generic time-outs raise.** `{timeout, T, Msg}`, a bare
+integer action, and `{{timeout, Name}, T, Msg}` all error while a clock is
+running. They can't be left alone: every event a `gen_statem` processes cancels
+a running event time-out, and delivering a virtualized state time-out spends
+one, so a machine using both would find eta's own traffic cancelling its
+deadlines. Use `state_timeout`, which is the right tool for most of what people
+reach for an event time-out to do anyway.
+
+### A state_timeout's cancellation rules are subtler than they look
+
+Worth knowing whether or not you use `eta`, and `eta` reproduces them exactly:
+
+- A **state change** cancels it. `keep_state`, `keep_state_and_data`,
+  `repeat_state`, `repeat_state_and_data`, and `{next_state, SameState, _}` do
+  not — the comparison is `=:=` on the state term.
+- A follower that rearms its election deadline on every heartbeat depends on
+  both halves of that: the `keep_state` doesn't cancel, and the new action
+  replaces the deadline.
+- `{state_timeout, update, Content}` with **nothing running** isn't an error. It
+  fires the event immediately, which `gen_statem` documents as deliberate.
+- A time-out cancelled *after* its timer fired produces no event at all — not
+  even a discarded one.
+- `{state_timeout, 0, Msg}` is delivered when the event **queue** drains, which
+  is after any event inserted with `next_event` and after any postponed event,
+  and before the next message is taken from the mailbox. It's still cancellable
+  while it waits, so "do this next, unless one of those makes me leave the state
+  first" is a thing you can write and rely on.
+
+That last one is why `eta` leaves zero time-outs with `gen_statem` rather than
+virtualizing them. A zero consults no clock — there's nothing in it to make
+virtual — and no substitution reproduces both its position and its
+cancellability.
+
+`test/support/eta_elect.erl` is a leader election written against these rules,
+and `test/eta_state_timeout_test.exs` is each of them as a test.
+
 ### timer:sleep/1 is not rewritten, deliberately
 
 A sleep is `receive after T -> ok end` inside OTP's `timer` module, which no

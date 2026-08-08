@@ -91,6 +91,13 @@ concurrently in the same node.
     disarm_after/2
 ]).
 
+%% The same thing with a caller-chosen message — what `eta_statem` arms a
+%% `gen_statem` state time-out with.
+-export([
+    arm_self/2,
+    disarm_self/2
+]).
+
 %% Driving.
 -export([
     now_ms/0,
@@ -467,6 +474,55 @@ flush_after(Ref) ->
     receive
         {'$eta_after', Ref} -> ok
     after 0 -> ok
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Arms a deadline a process sets for **itself**, delivered as `Msg`.
+
+`arm_after/2` with the message chosen by the caller instead of fixed, and the
+same reasoning applies to all of it: exempt from `drop_p` because a process
+cannot lose a timer it armed for itself, subject to `skew_ms` because when it
+lands relative to other work is a real question.
+
+`eta_statem` is the caller — a `gen_statem` state time-out is exactly this
+shape, a deadline the machine sets for itself. Pair with `disarm_self/2`.
+""".
+-endif.
+-spec arm_self(non_neg_integer(), term()) -> reference().
+arm_self(Time, Msg) ->
+    case running() of
+        false -> erlang:send_after(Time, self(), Msg);
+        true -> insert_timer(Time, self(), Msg, send, exempt)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Cancels a deadline armed by `arm_self/2`, removing its message if it already
+landed.
+
+The flush is what makes a cancel a cancel rather than a race. A deadline that
+fired just before this ran has already put `Msg` in the mailbox, and the caller
+has by definition stopped expecting it — for a `gen_statem` that message would
+otherwise arrive as an `info` event for a time-out that was called off.
+
+Skipped when the cancel succeeded, since a timer removed before it fired never
+sent anything, and the flush is a selective receive that walks the whole mailbox
+before giving up.
+""".
+-endif.
+-spec disarm_self(reference() | undefined, term()) -> ok.
+disarm_self(undefined, _Msg) ->
+    ok;
+disarm_self(TRef, Msg) ->
+    case cancel_timer(TRef) of
+        false ->
+            receive
+                Msg -> ok
+            after 0 -> ok
+            end;
+        _Remaining ->
+            ok
     end.
 
 %% ---------------------------------------------------------------------------
