@@ -158,6 +158,9 @@ waiting one out costs no real time.
 -export([
     place/2,
     attach/2,
+    register_name/3,
+    unregister_name/2,
+    whereis_name/2,
     node_of/1,
     faultable/1,
     inherit/2
@@ -792,9 +795,14 @@ unsupported({M, F, _A} = MFA, Args) ->
 %%
 %% `undefined` means "not a local process this module can identify", and the
 %% caller falls back to sending directly.
+%% `{Name, Node}` for a *simulated* node resolves through the registry
+%% `register_name/3` fills, which is what lets a system address its peers the way
+%% distributed Erlang does. The real node is checked first so a harness that
+%% never registers anything behaves exactly as before.
 normalize(Pid) when is_pid(Pid) -> Pid;
 normalize(Name) when is_atom(Name) -> erlang:whereis(Name);
 normalize({Name, Node}) when is_atom(Name), Node =:= node() -> erlang:whereis(Name);
+normalize({Name, Node}) when is_atom(Name) -> whereis_name(Node, Name);
 normalize(_) -> undefined.
 
 %% ---------------------------------------------------------------------------
@@ -926,6 +934,74 @@ do_place(What, Node, Pids, Faultable) ->
         Pids
     ),
     ok.
+
+-if(?DOCATTRS).
+-doc """
+Registers `Name` on simulated node `Node`, so `{Name, Node}` resolves the way
+`{Name, node()}` does in a real cluster.
+
+```erlang
+eta_net:place(node_a, [ServerA]),
+eta_net:register_name(node_a, my_server, ServerA),
+eta_net:cast({my_server, node_a}, hello).   %% reaches ServerA
+```
+
+**This is what lets a system keep its own addressing.** A distributed Erlang
+program says `{RegisteredName, Node}` and lets the VM find the process; there is
+no way to write that against simulated nodes, because one VM holds one registry
+and a second `gen_server:start_link({local, Name}, ...)` fails with
+`already_started`. Without this, `{Name, SomeSimulatedNode}` normalizes to
+`undefined` and the send falls through to `erlang:send/2`, which on a
+non-distributed VM **drops it silently** — a whole cluster's traffic vanishing
+with nothing raised and nothing counted.
+
+The name is scoped to the node, so the same name on two nodes is two processes,
+which is the point: a per-node singleton is exactly the shape that cannot be
+expressed otherwise.
+
+Registration is independent of placement — this only answers "who is `Name` on
+`Node`" — but registering without placing is almost always a mistake, since an
+unplaced process is on no node and is never faulted. Register the pid you
+placed.
+
+A pid may hold several names, and re-registering a name moves it. Nothing is
+removed when a process dies: a name whose process is gone resolves to a dead pid,
+which routes and fails exactly as a stale `{Name, Node}` does against a real node
+that has restarted. Use `unregister_name/2` to model deregistration.
+""".
+-endif.
+-spec register_name(term(), atom(), dest()) -> ok.
+register_name(Node, Name, Dest) when is_atom(Name) ->
+    ok = require_running(register_name),
+    case normalize(Dest) of
+        Pid when is_pid(Pid) ->
+            true = ets:insert(?PLACE, {{name, Node, Name}, Pid}),
+            ok;
+        undefined ->
+            error({eta_net, {register_name, Node, Name, no_such_process}})
+    end.
+
+-if(?DOCATTRS).
+-doc "Removes a simulated registration. See `register_name/3`.".
+-endif.
+-spec unregister_name(term(), atom()) -> ok.
+unregister_name(Node, Name) when is_atom(Name) ->
+    true = ets:delete(?PLACE, {name, Node, Name}),
+    ok.
+
+-if(?DOCATTRS).
+-doc """
+The pid registered as `Name` on simulated node `Node`, or `undefined`.
+
+`erlang:whereis/1` for the simulated registry. See `register_name/3`.
+""".
+-endif.
+-spec whereis_name(term(), atom()) -> pid() | undefined.
+whereis_name(Node, Name) when is_atom(Name) ->
+    case running() andalso ets:lookup(?PLACE, {name, Node, Name}) of
+        [{_, Pid}] -> Pid;
+        _ -> undefined
+    end.
 
 %% A process keeps the sequence number it was first given, so re-placing one — a
 %% harness restating its topology after a restart, say — does not reshuffle the
@@ -1137,7 +1213,20 @@ do_monitor(Item, Opts) ->
     Watcher = self(),
     case normalize(Item) of
         Target when is_pid(Target) ->
-            case simulated_pair(Watcher, Target) of
+            %% `simulated_pair/2` decides whether the monitor can be *faulted*,
+            %% which same-node pairs cannot be. That is not the same question as
+            %% whether it can be handed to `erlang:monitor/3`: a `{Name, Node}`
+            %% naming a **simulated** node cannot, because the VM has no such
+            %% node and answers `badarg` when it is not distributed at all.
+            %%
+            %% This bit hard. An agent monitoring the lock server on its *own*
+            %% simulated node is a same-node pair, so it took the fallback and
+            %% died on the spot — and since the only node whose name the VM
+            %% recognises is `node()`, exactly one process per cluster survived
+            %% doing it. What that looks like from outside is a cluster that
+            %% elects exactly one leader and never two, which reads like the
+            %% system being conservative rather than like most of it being dead.
+            case simulated_pair(Watcher, Target) orelse simulated_name(Item) of
                 true -> simulate_monitor(Watcher, Target, Item, Opts);
                 false -> erlang:monitor(process, Item, Opts)
             end;
@@ -1204,6 +1293,15 @@ simulated_pair(Watcher, Target) ->
         {{A, _}, {B, _}} when A =/= B -> true;
         {_, _} -> false
     end.
+
+%% Whether this destination is a name only *this* module can resolve. `normalize/1`
+%% answers `{Name, Node}` from the simulated registry for any node that is not
+%% `node()`, so a pid coming back for one of those means the VM cannot resolve it
+%% and must not be asked to. See `register_name/3`.
+simulated_name({Name, Node}) when is_atom(Name), Node =/= node() ->
+    whereis_name(Node, Name) =/= undefined;
+simulated_name(_) ->
+    false.
 
 %% What `erlang:monitor/2` puts in the DOWN message's `Object` position.
 object(Pid) when is_pid(Pid) -> Pid;

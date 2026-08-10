@@ -773,6 +773,130 @@ defmodule EtaNetTest do
     end
   end
 
+  describe "simulated name registration" do
+    # What lets a system under test keep its own addressing. Distributed Erlang
+    # says `{Name, Node}` and lets the VM resolve it; one VM holds one registry,
+    # so a per-node singleton — a lock server, a metadata store — cannot be
+    # expressed without this.
+
+    test "the same name on two nodes is two processes" do
+      :ok = @net.start(%{seed: 1})
+      a = sink()
+      b = sink()
+      :ok = @net.place(:na, [a])
+      :ok = @net.place(:nb, [b])
+      :ok = @net.register_name(:na, :the_server, a)
+      :ok = @net.register_name(:nb, :the_server, b)
+
+      assert @net.whereis_name(:na, :the_server) == a
+      assert @net.whereis_name(:nb, :the_server) == b
+
+      :ok = send_from(a, {:the_server, :nb}, :across)
+      assert drained(b) == [:across]
+
+      :ok = send_from(b, {:the_server, :na}, :back)
+      assert drained(a) == [:back]
+    end
+
+    test "an unregistered name resolves to undefined" do
+      # The trap this closes. `{Name, SimNode}` used to normalize to `undefined`
+      # and fall through to `erlang:send/2`, which on a non-distributed VM drops
+      # it — a cluster's whole traffic vanishing with nothing raised and nothing
+      # counted.
+      :ok = @net.start(%{seed: 1})
+      assert @net.whereis_name(:nowhere, :the_server) == :undefined
+    end
+
+    test "a name is cut by a partition, because the pid behind it is" do
+      :ok = @net.start(%{seed: 1})
+      a = sink()
+      b = sink()
+      :ok = @net.place(:na, [a])
+      :ok = @net.place(:nb, [b])
+      :ok = @net.register_name(:nb, :the_server, b)
+
+      :ok = @net.partition(:na, :nb)
+      :ok = send_from(a, {:the_server, :nb}, :should_not_arrive)
+      assert drained(b) == []
+    end
+
+    test "re-registering moves the name" do
+      :ok = @net.start(%{seed: 1})
+      first = sink()
+      second = sink()
+      sender = sink()
+      :ok = @net.place(:na, [sender])
+      :ok = @net.place(:nb, [first, second])
+      :ok = @net.register_name(:nb, :the_server, first)
+      :ok = @net.register_name(:nb, :the_server, second)
+
+      :ok = send_from(sender, {:the_server, :nb}, :hello)
+      assert drained(first) == []
+      assert drained(second) == [:hello]
+    end
+
+    test "unregister_name/2 removes it" do
+      :ok = @net.start(%{seed: 1})
+      a = sink()
+      :ok = @net.place(:na, [a])
+      :ok = @net.register_name(:na, :the_server, a)
+      :ok = @net.unregister_name(:na, :the_server)
+
+      assert @net.whereis_name(:na, :the_server) == :undefined
+    end
+
+    test "registering something that is not a process is an error" do
+      :ok = @net.start(%{seed: 1})
+
+      assert_raise ErlangError, fn ->
+        @net.register_name(:na, :the_server, :no_such_name_anywhere)
+      end
+    end
+
+    test "monitoring a simulated name on your own node does not raise" do
+      # `{Name, SimNode}` can never be handed to `:erlang.monitor/2` — the VM has
+      # no such node, and answers `badarg` when it is not distributed at all.
+      # Whether the pair spans nodes decides if the monitor can be *faulted*, not
+      # whether it can be delegated, and conflating the two killed every process
+      # that monitored a per-node singleton on its own node. Exactly one survived
+      # doing it — the one on `node()` — so the system it was under looked
+      # conservative rather than mostly dead.
+      :ok = @net.start(%{seed: 1})
+      server = sink()
+      client = sink()
+      :ok = @net.place(:na, [server, client])
+      :ok = @net.register_name(:na, :the_server, server)
+
+      ref = monitor_from(client, {:the_server, :na})
+      assert is_reference(ref)
+      assert Process.alive?(client)
+    end
+
+    test "a simulated same-node monitor still fires when the target dies" do
+      :ok = @net.start(%{seed: 1})
+      server = sink()
+      client = sink()
+      :ok = @net.place(:na, [server, client])
+      :ok = @net.register_name(:na, :the_server, server)
+
+      _ = monitor_from(client, {:the_server, :na})
+      Process.exit(server, :kill)
+      :ok = @net.notify_exit(server, :killed)
+
+      assert [{:DOWN, _ref, :process, {:the_server, :na}, :killed}] = drained(client)
+    end
+
+    test "the registry does not outlive the network" do
+      :ok = @net.start(%{seed: 1})
+      a = sink()
+      :ok = @net.place(:na, [a])
+      :ok = @net.register_name(:na, :the_server, a)
+      @net.stop()
+
+      assert @net.whereis_name(:na, :the_server) == :undefined
+    end
+  end
+
   describe "node-level partitions" do
     setup do
       :ok = @net.start(%{seed: 1})
