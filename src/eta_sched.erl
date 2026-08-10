@@ -1322,9 +1322,16 @@ do_release(St = #st{procs = Procs, gated = Gated}) ->
         fun(_Id, Pid) ->
             %% `process_info/2` rather than `is_process_alive/1`, for the reason
             %% in `is_runnable/3`: these are still suspended when this runs.
+            %% Both calls are safe rather than guarded, because the status
+            %% above is a read and these are actions on something that can die
+            %% in between — the same window `step/2` documents, and the same one
+            %% `hold/1` was widened for. `erlang:trace/3` raises `badarg` on a
+            %% pid that is gone, and raising here kills the scheduler while it
+            %% is being torn down, so the run reports nothing at all. Reached by
+            %% any system whose processes are replaced as it runs.
             case status(Pid) =/= dead of
                 true ->
-                    erlang:trace(Pid, false, ?TRACE_FLAGS),
+                    safe_untrace(Pid),
                     safe_resume(Pid);
                 false ->
                     ok
@@ -1780,6 +1787,17 @@ status(Pid) ->
 safe_resume(Pid) ->
     try
         erlang:resume_process(Pid),
+        ok
+    catch
+        _:_ -> ok
+    end.
+
+%% Same reason as `safe_resume/1`: turning tracing off is an action on a pid
+%% that may already be gone, and `erlang:trace/3` answers that with `badarg`.
+-spec safe_untrace(pid()) -> ok.
+safe_untrace(Pid) ->
+    try
+        _ = erlang:trace(Pid, false, ?TRACE_FLAGS),
         ok
     catch
         _:_ -> ok
