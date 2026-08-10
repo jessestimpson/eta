@@ -14,7 +14,7 @@ against invariants. `eta_run` supplies the seed, owns the scheduler and the
 clock, decides when to inject work and when to let the system make progress, and
 records enough to replay the run exactly.
 
-Six callbacks are required and one is optional.
+Six callbacks are required and two are optional.
 
 ## Two rules that are not obvious, and both bite silently
 
@@ -59,6 +59,35 @@ Return the advanced state; drawing entropy from anywhere else breaks replay.
 `check(State)` — the invariants, run against a frozen system. See the second
 rule.
 
+`check_final(Settled, State)` — **optional.** The invariants that are only true
+once the system has stopped being driven. Called once, after the last action of a
+run that ended normally, and not at all for a run that ended on a violation or a
+budget error.
+
+Some properties are simply not instantaneous. "Exactly one leader per partition"
+is false for a moment after a partition heals and true again shortly after;
+"no lock is waited on forever" cannot be judged while requests are still being
+injected. Checking those after every action produces the choice between a check
+that flags correct code and one that is sound and blind, and neither is worth
+having — a threshold between the two is the trap, because the distributions
+overlap.
+
+`Settled` says how the run ended, and the two are not the same claim:
+
+- `quiescent` — nothing was runnable and no timer could make anything runnable.
+  The system is stopped, full stop.
+- `settle_budget` — `settle_steps` was spent with no operations left to inject.
+  The system was *left alone* for that long; it may still be ticking. A system
+  with a heartbeat never reaches `quiescent` and this is the strongest signal it
+  will ever give.
+
+Take `quiescent` as proof and `settle_budget` as evidence, and be explicit about
+which one a given property needs. A harness that only trusts the first returns
+`ok` for the second.
+
+Its return is the same as `check/1`'s, and a violation ends the run as any other
+does — `outcome` carries it and `terminate/1` still runs.
+
 `terminate(State)` — tear down. Called however the run ends, including on
 violation.
 
@@ -88,11 +117,16 @@ becomes itself, `{Kind, N}` becomes `kind-n`, anything else falls back to `~p`.
 """.
 -endif.
 
--export_type([state/0, op/0, violation/0]).
+-export_type([state/0, op/0, violation/0, settled/0]).
 
 -type state() :: term().
 -type op() :: term().
 -type violation() :: term().
+
+%% How a run reached its end, and how much a `check_final/2` may read into it.
+%% `quiescent' is proof the system stopped; `settle_budget' is only that it was
+%% left alone for `settle_steps'. See the module doc.
+-type settled() :: quiescent | settle_budget.
 
 -callback init(Seed :: integer(), Config :: map()) -> {ok, state()}.
 -callback processes(state()) -> [pid()].
@@ -101,5 +135,6 @@ becomes itself, `{Kind, N}` becomes `kind-n`, anything else falls back to `~p`.
 -callback check(state()) -> ok | {violation, violation()}.
 -callback terminate(state()) -> ok.
 -callback labels(state()) -> #{pid() => term()}.
+-callback check_final(settled(), state()) -> ok | {violation, violation()}.
 
--optional_callbacks([labels/1]).
+-optional_callbacks([labels/1, check_final/2]).

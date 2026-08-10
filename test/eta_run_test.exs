@@ -217,6 +217,82 @@ defmodule DstRunTest do
     end
   end
 
+  describe "check_final" do
+    # The callback for properties that are only true once the system has stopped
+    # being driven. "Exactly one leader per partition" is false for a moment
+    # after a heal and true again shortly after; checking it after every action
+    # leaves the choice between a check that flags correct code and one that is
+    # sound and blind.
+
+    @final %{seed: 1, max_ops: 3, max_steps: 5_000}
+
+    defp final_run(config, opts \\ %{}) do
+      @run.run(:eta_final_sut, Map.merge(Map.put(@final, :config, config), opts))
+    end
+
+    test "runs once at the end, and says the system stopped" do
+      assert %{outcome: :ok} = final_run(%{})
+      assert [{:final_called, :quiescent}] = :ets.lookup(:eta_final_sut, :final_called)
+    end
+
+    test "a system that never stops is told so" do
+      # A heartbeat means `advance_to_next/1` always has somewhere to go, so the
+      # run can only end on its settle budget. That is a weaker claim than
+      # quiescence and the callback is told which one it got.
+      assert %{outcome: :ok} = final_run(%{tick_ms: 5}, %{settle_steps: 20})
+
+      assert [{:final_called, :settle_budget}] =
+               :ets.lookup(:eta_final_sut, :final_called)
+    end
+
+    test "its violation ends the run like any other" do
+      assert %{outcome: {:violation, %{property: :final_said_no}}} =
+               final_run(%{final: :violation})
+    end
+
+    test "a crash in it is reported rather than taking the run down" do
+      # Same treatment `check/1` gets: the callback runs in its own process and
+      # whatever comes back that is not `ok` or a violation is an error about the
+      # check, not a verdict about the system.
+      assert %{outcome: {:error, {:check_returned, {:EXIT, {:deliberate, _}}}}} =
+               final_run(%{final: :crash})
+    end
+
+    test "a harness without one is unaffected" do
+      # Optional means optional: `eta_2pc` does not define it and nothing about
+      # its runs changes.
+      assert %{outcome: :ok} = @run.run(@sut, @opts)
+    end
+
+    test "the ending is in the trace, so a replay reproduces the verdict" do
+      # Whether a *replayed* run would have stopped by quiescence or by budget is
+      # not a question its trace answers. Recording it is what stops a replay
+      # returning a different verdict from the run it is reproducing.
+      opts = Map.put(@final, :config, %{})
+      original = @run.run(:eta_final_sut, opts)
+      assert List.last(original.trace) == {:final, :quiescent}
+
+      replayed = @run.replay(:eta_final_sut, original.trace, opts)
+      assert replayed.outcome == original.outcome
+      assert replayed.trace == original.trace
+      assert [{:final_called, :quiescent}] = :ets.lookup(:eta_final_sut, :final_called)
+    end
+
+    test "a run that hit its step budget gets no final verdict" do
+      # There is no settled state to judge: the run was still going when the
+      # safety bound stopped it, and a verdict about a system caught mid-flight
+      # is worse than no verdict.
+      result =
+        @run.run(
+          :eta_final_sut,
+          %{seed: 1, max_ops: 50, max_steps: 2, config: %{tick_ms: 5}}
+        )
+
+      assert %{outcome: {:error, :step_budget_exhausted}} = result
+      refute Enum.any?(result.trace, &match?({:final, _}, &1))
+    end
+  end
+
   # Loading a module on demand is a synchronous call into `code_server`, which
   # the scheduler does not own, so a scheduled process that reaches an unloaded
   # module blocks outside the schedule and is made runnable again on wall clock

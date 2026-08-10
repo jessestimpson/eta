@@ -74,7 +74,14 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
 
 -export_type([entry/0, outcome/0, result/0, fixture/0]).
 
--type entry() :: {op, eta_harness:op()} | {step, eta_sched:id()} | {clock, integer()}.
+-type entry() ::
+    {op, eta_harness:op()}
+    | {step, eta_sched:id()}
+    | {clock, integer()}
+    %% How the run ended, recorded so a replay can put a `check_final/2` in the
+    %% same position it was in. Always last, and only on a run that ended
+    %% normally.
+    | {final, eta_harness:settled()}.
 -type outcome() ::
     ok
     | {violation, eta_harness:violation()}
@@ -684,7 +691,7 @@ loop(R = #r{budget = 0}) ->
 %% the invariants get checked with no client traffic, which is the only way the
 %% quiet-period defects are reachable at all.
 loop(R = #r{ops_left = 0, settle_left = 0}) ->
-    {ok, R};
+    final(settle_budget, R);
 loop(R = #r{sched = Sched, ops_left = OpsLeft}) ->
     case choose(R, eta_sched:runnable(Sched), OpsLeft > 0) of
         {step, Id, R1} -> after_action(do_step(R1, Id));
@@ -741,7 +748,35 @@ idle(R = #r{ops_left = OpsLeft, trace = Trace}) ->
             %% `quiet_p` chose to let time pass and there was no time to pass.
             after_action(do_op(R));
         false ->
-            {ok, R}
+            %% Nothing runnable and no deadline that could make anything
+            %% runnable. This is the strong ending, and the only one a
+            %% `check_final/2` may read as proof rather than as evidence.
+            final(quiescent, R)
+    end.
+
+%% The last thing a normally-ending run does. A budget error skips it, because a
+%% run that hit the safety bound was still going and has no final state to judge;
+%% so does a violation, which has already ended the run and would otherwise be
+%% overwritten by a second verdict about a system that stopped early.
+%% **How the run ended goes in the trace**, for the reason `idle/1` records its
+%% clock entries: a replay walks the entries it is given and cannot re-derive
+%% this one. Whether a *replayed* run would have stopped by quiescence or by
+%% budget is not a question its trace answers, and guessing would let a replay
+%% return a different verdict from the run it is reproducing.
+final(Settled, R = #r{mod = Mod, sut = Sut, trace = Trace}) ->
+    _ = eta_log:log({final, Settled}),
+    R1 = R#r{trace = [{final, Settled} | Trace]},
+    do_final(Mod, Settled, Sut, R1).
+
+do_final(Mod, Settled, Sut, R) ->
+    case erlang:function_exported(Mod, check_final, 2) of
+        false ->
+            {ok, R};
+        true ->
+            case safe_check_final(Mod, Settled, Sut) of
+                ok -> {ok, R};
+                Other -> {Other, R}
+            end
     end.
 
 %% The log entry goes in *before* the step runs, so that everything the chosen
@@ -817,6 +852,12 @@ replay_loop(R = #r{sched = Sched, lenient = Lenient, skipped = Skipped}, [{step,
     end;
 replay_loop(R, [{op, Op} | Rest]) ->
     replay_after(apply_op(R, Op), Rest);
+%% The recorded ending. Replayed rather than re-derived, so a `check_final/2`
+%% sees the same `Settled` it saw in the run being reproduced — otherwise a
+%% harness that trusts `quiescent` and not `settle_budget` could answer
+%% differently for the same schedule. Last entry either way, so nothing follows.
+replay_loop(R = #r{mod = Mod, sut = Sut, trace = Trace}, [{final, Settled} | _Rest]) ->
+    do_final(Mod, Settled, Sut, R#r{trace = [{final, Settled} | Trace]});
 %% Time passed here. The recorded `Ms` is what the clock read *after* the advance,
 %% and a strict replay holds the replay to it: landing somewhere else means the timer
 %% wheel is not the one that was recorded, which is a divergence however faithfully
@@ -902,8 +943,20 @@ harness_labels(Mod, Sut) ->
 %% suspended process is reported rather than hanging the run. It cannot catch the
 %% worse case — a client API that swallows its own timeout and answers plausibly,
 %% making the invariant vacuous — which is why `eta_harness` says what it says.
+%% Same bounding as `safe_check/2`, and for the same reason: a callback that
+%% blocks on a suspended process must not take the run with it. The system is
+%% still frozen here — `finish/2` has not released the scheduler yet — so the
+%% rule that `check/1` may not talk to it holds for this one too.
+safe_check_final(Mod, Settled, Sut) ->
+    {Pid, MRef} =
+        spawn_monitor(fun() -> exit({checked, catch Mod:check_final(Settled, Sut)}) end),
+    collect_check(Pid, MRef).
+
 safe_check(Mod, Sut) ->
     {Pid, MRef} = spawn_monitor(fun() -> exit({checked, catch Mod:check(Sut)}) end),
+    collect_check(Pid, MRef).
+
+collect_check(Pid, MRef) ->
     receive
         {'DOWN', MRef, process, Pid, {checked, ok}} ->
             ok;
