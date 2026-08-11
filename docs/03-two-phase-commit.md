@@ -81,6 +81,11 @@ Under a simulation build the header brings the parse transform, so that
 `erlang:send_after/3` becomes `eta_time:send_after/3`. Under a release build it
 brings nothing and the line ships as written.
 
+This module lives inside `eta`'s own test suite, so it includes `eta.hrl`
+directly. In your project, include a wrapper header of your own instead, so that
+builds without `DST` don't need `eta` on the path at all.
+[Setting up a project](02-setting-up.md) has it.
+
 30 seconds is long enough that the timeout never fires by accident and short
 enough to be interesting, and it costs nothing because it's virtual. When every
 participant has stalled and no process is runnable, the driver advances the
@@ -283,7 +288,7 @@ wins, so this callback isn't what names them.
 the only thing that knows one of them is transaction 3. That's the general
 shape: reach for `labels/1` when the process can't name itself, whether it's a
 fun like this, something from a library you don't own, or a module you
-deliberately kept `eta.hrl` out of.
+deliberately kept the header out of.
 
 It's called once, after the run, which is why it takes the whole state rather
 than one pid at a time. Ids are handed out as processes register, so the mapping

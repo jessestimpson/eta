@@ -33,9 +33,10 @@ A harness is not the system under test. Your `gen_server`s and protocol code are
 that. The harness is the adapter that starts the system, declares which
 processes to schedule, drives it with a workload, and judges it.
 
-That distinction decides which modules include `eta.hrl` and use `?ETA_LOG`: the
-ones that ship, where emitting nothing in a release build matters. A harness
-never ships, so it can go either way, and calling `eta_log:label/1` and
+That distinction decides which modules include your `eta.hrl` wrapper and use
+`?ETA_LOG`: the ones that ship, where emitting nothing in a release build
+matters. A harness never ships, and only ever compiles under the simulation
+profile, so it can go either way, and calling `eta_log:label/1` and
 `eta_log:log/1` directly buys it something the macros can't. The macros are
 Erlang, and so is `eta_transform`, so **the harness is the one part of a
 simulated system you can write in Elixir.**

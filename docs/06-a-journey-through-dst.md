@@ -53,58 +53,105 @@ mix new abd
 Clear the Elixir scaffolding and make the directories we need:
 
 ```bash
-cd abd && rm -rf lib test/abd_test.exs && mkdir -p src test/support
+cd abd
+rm -rf lib test/abd_test.exs
+mkdir -p src include dst
+cp test/test_helper.exs dst/
 ```
 
-Then edit `mix.exs`. In `project/0`, add 2 keys:
+Simulations get their own build environment, `dst`, and we'll put all our
+eta test files in the `dst/` directory.
+`test/` stays untouched for ordinary tests.
+
+Then edit `mix.exs`. In `project/0`, add these keys:
 
 ```elixir
       erlc_paths: erlc_paths(Mix.env()),
       erlc_options: erlc_options(Mix.env()),
+      test_paths: test_paths(Mix.env()),
+      aliases: aliases(),
 ```
 
 Replace the commented-out examples in `deps/0` with:
 
 ```elixir
-      {:eta, path: "../eta", runtime: false}
+      {:eta, path: "../eta", only: :dst}
       # --- or ---
-      {:eta, git: "https://github.com/jessestimpson/eta.git", runtime: false}
+      {:eta, git: "https://github.com/jessestimpson/eta.git", only: :dst}
 ```
 
-and add 2 private function pairs at the bottom:
+Add a `cli/0` next to `project/0`:
+
+```elixir
+  def cli do
+    [preferred_envs: [dst: :dst]]
+  end
+```
+
+and the private functions at the bottom:
 
 ```elixir
   # The ABD register itself is ordinary Erlang in src/. The eta harness lives in
-  # test/support and only exists for the test env, so a release never sees it.
-  defp erlc_paths(:test), do: ["src", "test/support"]
+  # dst/ and only exists for the dst env
+  defp erlc_paths(:dst), do: ["src", "dst"]
   defp erlc_paths(_), do: ["src"]
 
   # The DST define is required for `eta` to engage
-  defp erlc_options(:test), do: [:debug_info, {:d, :DST}]
+  defp erlc_options(:dst), do: [:debug_info, {:d, :DST}]
   defp erlc_options(_), do: [:debug_info]
+
+  # `mix dst` runs dst/, `mix test` runs test/.
+  defp test_paths(:dst), do: ["dst"]
+  defp test_paths(_), do: ["test"]
+
+  defp aliases do
+    [dst: &dst/1]
+  end
+
+  defp dst(args) do
+    System.put_env("MIX_ENV", "dst")
+    Mix.Task.run("test", args)
+  end
+```
+
+Now the header that our own modules will include, `include/abd_eta.hrl`:
+
+```erlang
+-ifndef(ABD_ETA_HRL).
+-define(ABD_ETA_HRL, true).
+
+-ifdef(DST).
+-include_lib("eta/include/eta.hrl").
+-else.
+-define(ETA_LABEL(Label), ok).
+-define(ETA_LOG(Event), 0).
+-endif.
+
+-endif.
 ```
 
 Then:
 
 ```bash
-mix deps.get && MIX_ENV=test mix compile
+mix deps.get && MIX_ENV=dst mix compile
 ```
 
 If the compile fails, double-check your configuration.
 
 ### Project configuration details
 
-**`runtime: false` rather than `only: :test`.** `eta` requires the inclusion
-of an hrl file in the ABD code. For the preprocessor to find the hrl, the `eta`
-project must be findable in all compilations. The `DST` define is what disables
-all `eta` features in your production code. Your app must define `DST` where
-needed, usually for `MIX_ENV=test`.
+**The wrapper header is what makes `only: :dst` possible.** `eta.hrl` is
+already guards with the `DST` define and expands to no-ops without it, but the
+`-include_lib` line still has to resolve, which would mean `eta` has to be
+findable in a `MIX_ENV=prod` compilation. Defining your own project header
+allows prod compilation to succeed with `only: :test`, and keeps `eta`
+out of your deployed app.
 
-**`{:d, :DST}` for the whole test env, not a dedicated simulation profile.**
-`eta_time` falls back to the real `erlang` functions whenever no virtual clock
-is running, so a transformed module behaves normally outside a simulation.
-
-**No `mod:` in `application/0`.** ABD is just a simple library.
+**`{:d, :DST}` in its own environment, not the test env.** `mix test` and
+`mix dst` are kept separate from each other: ordinary
+tests exercise the modules you actually ship, and the simulation suite stays out
+of their way. [Setting up a project](02-setting-up.md) has the full argument,
+and the suggested rebar3 config.
 
 ## Step 3: the replica `gen_server`
 
@@ -114,7 +161,7 @@ is running, so a transformed module behaves normally outside a simulation.
 -module(abd_replica).
 -behaviour(gen_server).
 
--include_lib("eta/include/eta.hrl").
+-include("abd_eta.hrl").
 
 -export([start_link/1, stop/1, read/3, write/5, get/1]).
 -export([init/1, handle_call/3, handle_cast/2]).
@@ -167,7 +214,7 @@ store(_Ts, _Val, St) -> St.
 Let's try it out in the `iex` shell:
 
 ```bash
-MIX_ENV=test iex -S mix
+MIX_ENV=dst iex -S mix
 ```
 
 ```elixir
@@ -198,7 +245,7 @@ This is because the process will be suspended during the check and unable to
 respond to any incoming requests. `check/1` must read shared memory rather than
 do message passing.
 
-### The `eta.hrl` include
+### The `abd_eta.hrl` include
 
 Technically you can leave this out at this step, but if you do, remember to add it
 back in later, where it will be needed.
@@ -210,7 +257,7 @@ back in later, where it will be needed.
 ```erlang
 -module(abd_client).
 
--include_lib("eta/include/eta.hrl").
+-include("abd_eta.hrl").
 
 -export([read/1, write/3]).
 
@@ -310,7 +357,7 @@ behaviour implementation that `eta_run` will exercise. This module could
 be in Elixir, if you want. As written, it doesn't use Erlang compile-time
 features.
 
-`test/support/abd_harness.erl`:
+`dst/abd_harness.erl`:
 
 ```erlang
 -module(abd_harness).
@@ -403,7 +450,7 @@ backwards({_StartA, _FinishA, TsA}, {_StartB, _FinishB, TsB}) -> TsB < TsA.
 Compile:
 
 ```bash
-MIX_ENV=test mix compile
+MIX_ENV=dst mix compile
 ```
 
 RESULT: compiles clean.
@@ -466,7 +513,7 @@ hidden state of your system.
 Everything is in place. We're ready to do our first deterministic run.
 
 ```bash
-MIX_ENV=test iex -S mix
+MIX_ENV=dst iex -S mix
 ```
 
 ```elixir
@@ -533,7 +580,7 @@ here means the seed won't reproduce.
 
 ### Make it a permanent test
 
-Create `test/abd_test.exs`:
+Create `dst/abd_test.exs`:
 
 ```elixir
 defmodule AbdTest do
@@ -554,10 +601,17 @@ end
 ```
 
 ```bash
-mix test
+mix dst
 ```
 
 RESULT: green.
+
+Reminder: `mix dst` the custom entry point we defined above.
+
+is the entry point we wired up in step 2. It compiles with `DST`
+defined and runs `dst/`; plain `mix test` compiles without it and runs `test/`,
+so the suite that exercises the shipped modules and the suite that simulates
+them never share a build or a VM.
 
 `async: false` is required. `eta_time` keeps its state in named ETS tables,
 so exactly one virtual clock exists per node, and 2 simulations running
@@ -621,7 +675,7 @@ so we end up with a different trace.
 **`modules_loaded` tell you when this happens.** Start a *fresh* `iex` again.
 
 ```bash
-MIX_ENV=test iex -S mix
+MIX_ENV=dst iex -S mix
 ```
 
 ```elixir
@@ -657,7 +711,7 @@ RESULT: `1` and `[[1, 2, 3, 4, 5]]`.
 
 ### Add this assertion to our tests
 
-Add to `test/abd_test.exs`:
+Add to `dst/abd_test.exs`:
 
 ```elixir
 test "a seed names an execution" do
@@ -718,7 +772,7 @@ partial_write(Replicas, WriterId, Value, Targets) ->
     Ts.
 ```
 
-In `test/support/abd_harness.erl`, `generate/2` becomes:
+In `dst/abd_harness.erl`, `generate/2` becomes:
 
 ```erlang
 generate(#{next_op := N, replicas := Replicas}, Rand0) ->
@@ -797,7 +851,7 @@ read(Replicas, Mode) ->
 and add `read/2` added to the export list.
 
 The rest of the changes are to thread `mode` from `Config` down to the call.
-Three edits in `test/support/abd_harness.erl`.
+Three edits in `dst/abd_harness.erl`.
 
 `init/2`'s returned map gains a `mode` key:
 
@@ -1006,9 +1060,9 @@ And you will be the expert of the system that you're writing.
 
 ### What you add to your harness
 
-`test/support/abd_harness.erl` never ships, so it can go either way: include
-`eta.hrl` and use the macros, or call `eta_log` directly. Here we choose to
-call it directly.
+`dst/abd_harness.erl` never ships, and only ever compiles with `DST` defined, so
+it can go either way: include `abd_eta.hrl` and use the macros, or call
+`eta_log` directly. Here we choose to call it directly.
 
 First, one function that decides what every client is called. Each one calls it
 on itself, which we wire up in a moment:
@@ -1064,7 +1118,7 @@ Three files have changed since step 10, so start a **fresh shell** and rebuild
 `shrunk` from scratch.
 
 ```bash
-MIX_ENV=test iex -S mix
+MIX_ENV=dst iex -S mix
 ```
 
 ```elixir
@@ -1302,7 +1356,7 @@ That's why this throws rather than returning the partial result.
 
 ### The harness injects the new faults
 
-3 changes in `test/support/abd_harness.erl`. We'll add a new pause operation to
+3 changes in `dst/abd_harness.erl`. We'll add a new pause operation to
 `generate/2` and the other thresholds are increased to make room. Note: changing
 the generated workload like this means that a given seed, like the one from earlier,
 is unlikely to replay in the same way, because different operations will be selected
@@ -1406,7 +1460,7 @@ Feel free to run the `:eta_log` functions in your shell to inspect some traces.
 
 ## Step 14: pin the trace, not the seed
 
-After adding the pause operation, `mix test` went red. Seed 6 no longer does what
+After adding the pause operation, `mix dst` went red. Seed 6 no longer does what
 it used to do. This is expected; we changed how operations are generated.
 
 ```
@@ -1435,8 +1489,8 @@ r = :eta_run.run(:abd_harness, opts53)
 s = :eta_shrink.shrink(:abd_harness, r.trace, opts53)
 {s.original, s.shrunk, s.verified}
 
-File.mkdir_p!("test/fixtures")
-:eta_run.save_fixture("test/fixtures/inversion.eta", :abd_harness, s.trace, opts53)
+File.mkdir_p!("dst/fixtures")
+:eta_run.save_fixture("dst/fixtures/inversion.eta", :abd_harness, s.trace, opts53)
 ```
 
 RESULT: `{39, 19, true}`, then `{:ok, {:violation, %{property: :no_new_old_inversion}}}`.
@@ -1446,7 +1500,7 @@ Now we can load that fixture into a test.
 ```elixir
   test "the recorded inversion still reproduces" do
     assert %{outcome: {:violation, %{property: :no_new_old_inversion}}} =
-             :eta_run.replay_fixture("test/fixtures/inversion.eta")
+             :eta_run.replay_fixture("dst/fixtures/inversion.eta")
   end
 ```
 
@@ -1470,7 +1524,7 @@ which halts message passing during the `check/1` phase.
 One attribute on `src/abd_replica.erl`:
 
 ```erlang
--include_lib("eta/include/eta.hrl").
+-include("abd_eta.hrl").
 -eta_observe({st, [ts, val]}).
 ```
 
@@ -1480,7 +1534,7 @@ by the harness.
 
 ### Read it back out
 
-In `test/support/abd_harness.erl`, take the replicas in `check/1` and attach
+In `dst/abd_harness.erl`, take the replicas in `check/1` and attach
 their state to a violation:
 
 ```erlang

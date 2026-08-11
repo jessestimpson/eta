@@ -1,6 +1,16 @@
 %% eta — the compile-time contract for a system under simulation.
 %%
+%% Don't include this file directly from your own modules. Wrap it in a header
+%% of your own, so that a build without `DST` never has to resolve the
+%% `-include_lib` and `eta` can be scoped to the one profile that simulates:
+%%
+%%     %% include/myapp_eta.hrl
+%%     -ifdef(DST).
 %%     -include_lib("eta/include/eta.hrl").
+%%     -else.
+%%     -define(ETA_LABEL(Label), ok).
+%%     -define(ETA_LOG(Event), 0).
+%%     -endif.
 %%
 %% Everything here is conditional on the `DST` define, which the simulation
 %% build sets and a release build does not. That is the point: under a release
@@ -16,10 +26,13 @@
 %% Same shape as EUnit's `TEST`: one define promotes a set of macros from
 %% nothing into something, and the guideline becomes a contract.
 %%
-%% In Mix:
+%% In Mix, define it in an environment of its own, entered by `mix dst`:
 %%
-%%     defp erlc_options(:test), do: [:debug_info, {:d, :DST}]
+%%     defp erlc_options(:dst), do: [:debug_info, {:d, :DST}]
 %%     defp erlc_options(_), do: [:debug_info]
+%%
+%% and in rebar3, a `dst` profile run as `rebar3 as dst eunit`. See
+%% docs/02-setting-up.md.
 
 -ifndef(ETA_HRL).
 -define(ETA_HRL, true).

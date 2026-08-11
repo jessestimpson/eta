@@ -92,11 +92,31 @@ be the internal specification for the `eta` project itself.
 
 ## Installation
 
+`eta` suggests setting up a separate build profile called `dst`.
+
 ```elixir
 def deps do
-  [{:eta, "~> 0.1", only: :test}]
+  [{:eta, "~> 0.1", only: :dst}]
 end
 ```
+
+and in rebar3, a `dst` profile run as `rebar3 as dst eunit`.
+
+Your modules don't include `eta.hrl` directly. They include a wrapper of your
+own, `include/myapp_eta.hrl`, which is what keeps `eta` out of every other
+build:
+
+```erlang
+-ifdef(DST).
+-include_lib("eta/include/eta.hrl").
+-else.
+-define(ETA_LABEL(Label), ok).
+-define(ETA_LOG(Event), 0).
+-endif.
+```
+
+[Setting up a project](docs/02-setting-up.md) has the whole configuration for
+both build tools, and why it's shaped this way.
 
 ## Status
 
@@ -108,9 +128,9 @@ Early and under development.
   for keeping your code deployable to prod without disruptive changes. Elixir
   support may come later.
 - **One simulation per VM.** `eta_time` and `eta_log` keep state in named ETS
-  tables, so runs must be serial. Keep the tests `async: false`. In fact, we
-  suggest creating a `mix dst` alias that keeps the rest of your tests
-  separate from the simulation, although this isn't required.
+  tables, so runs must be serial. Keep the tests `async: false`. This is one of
+  the reasons we suggest running simulations from their own build profile, so
+  the constraint stays off your ordinary suite.
 - **Shrinking is bounded by positional step ids.** Deleting an operation
   renumbers every process created after it, so operations that contributed
   nothing often survive a shrink. This means that the shrunk replay can

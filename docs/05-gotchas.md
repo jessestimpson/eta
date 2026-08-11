@@ -186,8 +186,9 @@ transform it already names and gate it behind an attribute. That's why
 rewrite as *passes*, and why modules opt into the first with `-eta_observe(...)`.
 Those 2 used to be separate transforms and couldn't be used together.
 
-It's also why you include `eta.hrl` rather than naming the transform: the header
-carries the one attribute, so there's nothing to get wrong.
+It's also why you include `eta.hrl` — through your own wrapper header — rather
+than naming the transform: the header carries the one attribute, so there's
+nothing to get wrong.
 
 ### Mix doesn't recompile a module when its transform changes
 

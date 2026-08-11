@@ -36,41 +36,157 @@ system.
 
 ## Build configuration
 
-Every module that takes part in a simulation includes one header:
+2 decisions, and they're the ones to make before anything else: how a module
+opts in, and when that opt-in is switched on.
+
+### Wrap the header in one of your own
+
+Every module that takes part in a simulation includes one header. Don't include
+`eta.hrl` directly. Write a wrapper of your own, `include/myapp_eta.hrl`:
 
 ```erlang
+-ifndef(MYAPP_ETA_HRL).
+-define(MYAPP_ETA_HRL, true).
+
+-ifdef(DST).
 -include_lib("eta/include/eta.hrl").
+-else.
+-define(ETA_LABEL(Label), ok).
+-define(ETA_LOG(Event), 0).
+-endif.
+
+-endif.
+```
+
+and your modules include that:
+
+```erlang
+-include("myapp_eta.hrl").
 ```
 
 That's the whole opt-in. Under a simulation build it brings the parse transform
-and the `?ETA_LOG` and `?ETA_LABEL` macros. Under a release build it brings
-nothing at all, so a module carrying it has no relationship to this library and
-ships unchanged.
+and the `?ETA_LOG` and `?ETA_LABEL` macros. Otherwise it brings nothing at all,
+so a module carrying it has no relationship to this library and ships unchanged.
 
-The `DST` define is what decides which. In Mix:
+`eta.hrl` is already conditional on the `DST` define and already expands to
+nothing without it, so what the wrapper buys you is one thing: the *include
+itself* is conditional, so a build without `DST` never goes looking for `eta`.
+That is the difference between a dependency your project can build without and
+one that has to be findable in every compilation of every environment. With the
+wrapper you can scope `eta` to the single profile that runs simulations, and a
+release build doesn't have it in the tree at all.
+
+The `-else.` branch is not optional, and it's the reason the wrapper is a file
+rather than a line. `?ETA_LABEL` and `?ETA_LOG` are called from the modules you
+ship, so they have to expand to something when the real header isn't there.
+Match `eta.hrl`'s own definitions, above: `ok` and `0`. Neither one evaluates
+its argument, so anything you log must be free of side effects, and a variable
+used *only* inside one of these will be reported unused — bind it with a
+leading underscore.
+
+### Run simulations from their own build profile
+
+**In Mix, a `dst` environment and a `mix dst` to enter it.** In `project/0`:
 
 ```elixir
-defp erlc_options(:test), do: [:debug_info, {:d, :DST}]
-defp erlc_options(_), do: [:debug_info]
+      erlc_paths: erlc_paths(Mix.env()),
+      erlc_options: erlc_options(Mix.env()),
+      test_paths: test_paths(Mix.env()),
+      aliases: aliases(),
 ```
 
-and in rebar3, an equivalent profile carrying `{erl_opts, [{d, 'DST'}]}`.
+and:
 
-**That define is a contract, not a convention.** Forget it and the header
+```elixir
+  def cli do
+    [preferred_envs: [dst: :dst]]
+  end
+
+  defp deps do
+    [{:eta, "~> 0.1", only: :dst, runtime: false}]
+  end
+
+  # The harness and the simulation suite live in dst/, so the ordinary
+  # environments never compile a module that calls into a dependency they
+  # don't have.
+  defp erlc_paths(:dst), do: ["src", "dst"]
+  defp erlc_paths(_), do: ["src"]
+
+  defp erlc_options(:dst), do: [:debug_info, {:d, :DST}]
+  defp erlc_options(_), do: [:debug_info]
+
+  # `mix dst` runs dst/, `mix test` runs test/. Neither sees the other.
+  defp test_paths(:dst), do: ["dst"]
+  defp test_paths(_), do: ["test"]
+
+  defp aliases do
+    [dst: &dst/1]
+  end
+
+  # `mix test` refuses to run in an environment that isn't :test unless MIX_ENV
+  # says so explicitly. `preferred_envs` above has already put us in :dst;
+  # this states it in the environment too, which is both true and what that
+  # check is asking for.
+  defp dst(args) do
+    System.put_env("MIX_ENV", "dst")
+    Mix.Task.run("test", args)
+  end
+```
+
+`dst/` needs its own `test_helper.exs`, the same one `mix new` put in `test/`.
+
+**In rebar3, a `dst` profile, entered as `rebar3 as dst eunit`.**
+
+```erlang
+{profiles,
+ [{dst, [{deps, [{eta, {git, "https://github.com/jessestimpson/eta.git",
+                        {branch, "main"}}}]},
+         {erl_opts, [{d, 'DST'}]},
+         {extra_src_dirs, ["dst"]},
+         %% So that `rebar3 as dst eunit` needs no `--module`.
+         {eunit_tests, [{module, myapp_dst_tests}]},
+         %% `eta` is named again because the suite calls straight into
+         %% `eta_run`, and `plt_extra_apps` is what decides whether those
+         %% calls resolve or come back as unknown functions.
+         {dialyzer, [{plt_extra_apps, [eunit, eta]}]}
+        ]}
+ ]}.
+```
+
+There is no bare `rebar3 dst`. An entry point that switches profile would have
+to be `{alias, [{dst, [{as, "dst eunit"}]}]}`, and rebar3 refuses `as` inside an
+alias — *"Namespace 'as' is forbidden"* — including via `do`. Wrap it in a
+`Makefile` target if you want a short spelling. `REBAR_PROFILE=dst rebar3 eunit`
+is the other native one; setting that variable from `rebar.config.script` does
+not work, because profiles are resolved before the script is consulted.
+
+### Why this shape
+
+**The define is a contract, not a convention.** Forget it and the header
 silently contributes nothing: no transform, so your timers stay on the real
 clock, and no logging. This library made exactly that mistake in its own build,
 and its example module went untransformed for a while without anything
-complaining. Put the define in before anything else.
+complaining. Put the define in before anything else, and put it in exactly one
+profile so there's one place to check.
 
-2 more decisions worth copying.
+**A dedicated profile, not the whole test environment.** An earlier version of
+this page recommended the opposite, and the argument for it is real: `eta_time`
+falls back to the real `erlang` functions whenever no virtual clock is running,
+so a transformed module behaves outside a simulation exactly as it did before,
+and compiling your ordinary suite with the transform on demonstrates that
+continuously. We now think the separation is worth more:
 
-**Enable the transform for the whole test environment**, not a dedicated
-simulation profile. `eta_time` falls back to the real `erlang` functions
-whenever no virtual clock is running, so a transformed module behaves exactly as
-it did before outside a simulation. Compile your ordinary test suite with the
-transform on and every test you already have is continuously demonstrating that.
-A separate profile only demonstrates it for the tests you remember to run under
-it.
+- Only one simulation can run per VM, since `eta_time` and `eta_log` keep state
+  in named ETS tables. Simulation tests have to be `async: false`. Keeping them
+  in their own entry point means that constraint never reaches the suite you
+  run all day.
+- Your ordinary tests then exercise the modules you actually ship. A
+  transformed module is close to the shipped one, but it isn't it.
+- `eta` stays out of every build but this one, which is what the header
+  wrapper was for.
+- Toggling a define or editing a parse transform doesn't reliably recompile the
+  modules that depend on it ([page 5](05-gotchas.md)). Two environments means
+  two build directories, so the 2 builds can't hand each other a stale module.
 
 **Guard per module, not per application.** You won't want the transform
 everywhere, for reasons in "the transform boundary" below.
@@ -152,7 +268,7 @@ makes the full argument. The setup step is a second attribute on the modules
 whose state the invariants need:
 
 ```erlang
--include_lib("eta/include/eta.hrl").
+-include("myapp_eta.hrl").
 -eta_observe({state, [leader, epoch, applied_version]}).
 ```
 
