@@ -170,6 +170,62 @@ a reader will want is how you lose the line that mattered.
 
 ## Build-time hazards
 
+### `use GenServer` generates clauses the wrapper cannot reach
+
+Elixir's `use GenServer` generates default callback clauses via
+`defoverridable`. `Eta`'s `@before_compile` callback wraps the clauses you
+wrote via `Module.get_definition/2`, and the defaults `use GenServer` injected
+are a parallel set the wrapper does not see. The result is a module where
+some clauses route replies through `:eta_net` and others do not, depending
+on which one matched at runtime.
+
+The fix is to declare the behaviour directly instead of using `use GenServer`:
+
+```elixir
+defmodule MyServer do
+  use Eta
+  @behaviour :gen_server
+
+  def init(_), do: {:ok, %{}}
+  def handle_call(_, _, s), do: {:reply, :ok, s}
+  def handle_cast(_, s), do: {:noreply, s}
+  def handle_info(_, s), do: {:noreply, s}
+  def terminate(_, _), do: :ok
+  def code_change(_, s, _), do: {:ok, s}
+end
+```
+
+You write the same callbacks you would have written anyway, minus the
+`@impl true` attributes. Every clause you write is visible to the
+`@before_compile` wrapper.
+
+### `receive ... after` is not virtualized
+
+The parse transform rewrites `receive ... after` on Erlang modules. Elixir
+macros cannot rewrite language constructs, so a `receive ... after` timeout
+in an Elixir module runs on the real clock and hangs the simulation.
+
+Use `Eta.send_after/3` to send a message to yourself and match on it in a
+plain `receive` instead:
+
+```elixir
+def init(_) do
+  _ = Eta.send_after(self(), :tick, 50)
+  {:ok, %{}}
+end
+
+def handle_info(:tick, state) do
+  _ = Eta.send_after(self(), :tick, 50)
+  {:noreply, state}
+end
+```
+
+### `gen_statem` state timeouts are not virtualized
+
+The parse transform intercepts `{state_timeout, ...}` actions on Erlang
+modules before OTP sees them. Elixir macros cannot do this. Erlang modules
+using `gen_statem` should continue to use the parse transform via `eta.hrl`.
+
 ### Never give a module 2 parse transforms
 
 Mix doesn't reliably order a module that names more than one. With 2 transform
@@ -201,6 +257,18 @@ rebuild the Erlang modules that depend on it, which matters if you use a define
 to plant a defect deliberately. Run `mix compile --force` after changing either.
 Where a test's whole purpose is to exercise a transform, recompile its subject
 from source in `setup_all` so it can't exercise the stale one.
+
+**Elixir modules need Erlang compiled first.** If your project has Elixir
+modules that `use Eta`, `lib/eta.ex` calls `Code.ensure_loaded?(:eta_time)`
+at macro expansion time, so the `:eta` Erlang modules must be on the code path
+before any Elixir module that `use Eta` is compiled. Mix's default order
+compiles Elixir before Erlang, which fails. Add a compile alias:
+
+```elixir
+defp aliases do
+  [compile: ["compile.erlang", "compile.elixir", "compile.app"]]
+end
+```
 
 ## Scheduler hazards
 

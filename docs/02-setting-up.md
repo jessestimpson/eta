@@ -84,6 +84,117 @@ its argument, so anything you log must be free of side effects, and a variable
 used *only* inside one of these will be reported unused — bind it with a
 leading underscore.
 
+### In Elixir: `use Eta`
+
+Elixir doesn't have an include-file mechanism, and Elixir's macros cannot
+cleanly override Kernel functions like `send/2`, `spawn/1`, or
+`Process.send_after/3`. So instead of a parse transform, `use Eta` provides an
+**explicit set of macros** that route timer, spawn, and network calls through
+`eta`'s virtualized versions when `:eta` is a compile-time dependency, and
+through the Elixir stdlib otherwise. This API is a WIP and is subject to change.
+
+```elixir
+defmodule MyServer do
+  use Eta
+  @behaviour :gen_server
+
+  @eta_observe :all
+
+  def init(_) do
+    Eta.label(:my_server)
+    _ = Eta.send_after(self(), :tick, 50)
+    {:ok, %{count: 0}}
+  end
+
+  def handle_cast(:tick, state) do
+    Eta.log({:tick, state.count})
+    {:noreply, %{state | count: state.count + 1}}
+  end
+end
+```
+
+Each macro checks at compile time whether `:eta` is available
+(`Code.ensure_loaded?(:eta_time)`), and expands to either the `:eta_*` call or
+the stdlib equivalent. There is no runtime overhead. The same source compiles
+under both a DST build (where `:eta` is a dependency) and a release build
+(where it isn't), with no deprecation warnings and no parse transform.
+
+`Eta.label/1` and `Eta.log/1` are the Elixir equivalents of `?ETA_LABEL` and
+`?ETA_LOG`. They expand to `:eta_log.label/1` and `:eta_log.log/1` under a DST
+build, and to `:ok` and `0` otherwise.
+
+**The available macros:**
+
+| Macro | DST build | Release build |
+|---|---|---|
+| `Eta.send_after(dest, msg, ms)` | `:eta_time.send_after(ms, dest, msg)` | `Process.send_after(dest, msg, ms)` |
+| `Eta.cancel_timer(ref)` | `:eta_time.cancel_timer(ref)` | `Process.cancel_timer(ref)` |
+| `Eta.monotonic_time()` | `:eta_time.monotonic_time()` | `:erlang.monotonic_time()` |
+| `Eta.spawn(fun)` | `:eta_sched.spawn(fun)` | `Kernel.spawn(fun)` |
+| `Eta.spawn_link(fun)` | `:eta_sched.spawn_link(fun)` | `Kernel.spawn_link(fun)` |
+| `Eta.spawn_monitor(fun)` | `:eta_sched.spawn_monitor(fun)` | `Kernel.spawn_monitor(fun)` |
+| `Eta.send(dest, msg)` | `:eta_net.send(dest, msg)` | `Kernel.send(dest, msg)` |
+| `Eta.cast(server, msg)` | `:eta_net.cast(server, msg)` | `GenServer.cast(server, msg)` |
+| `Eta.call(server, req, timeout \\ 5000)` | `:eta_net.call(server, req, timeout)` | `GenServer.call(server, req, timeout)` |
+| `Eta.reply(from, reply)` | `:eta_net.reply(from, reply)` | `GenServer.reply(from, reply)` |
+| `Eta.monitor(pid)` | `:eta_net.monitor(:process, pid)` | `Process.monitor(pid)` |
+| `Eta.demonitor(ref)` | `:eta_net.demonitor(ref)` | `Process.demonitor(ref)` |
+| `Eta.start_link(mod, args, opts \\ [])` | `:eta_sched.start_link(mod, args, opts)` | `GenServer.start_link(mod, args, opts)` |
+| `Eta.start(mod, args, opts \\ [])` | `:eta_sched.start(mod, args, opts)` | `GenServer.start(mod, args, opts)` |
+| `Eta.label(value)` | `:eta_log.label(value)` | `:ok` |
+| `Eta.log(value)` | `:eta_log.log(value)` | `0` |
+
+**Use `@behaviour :gen_server` instead of `use GenServer`.** `use GenServer`
+generates default callback clauses; `Eta`'s `@before_compile` callback wraps
+the clauses you write, and defaults you didn't write are clutter. Declaring
+the behaviour directly gives the wrapper a clean set of clauses to work with:
+
+```elixir
+defmodule MyServer do
+  use Eta
+  @behaviour :gen_server
+
+  def init(_), do: {:ok, %{}}
+  def handle_call(_, _, s), do: {:reply, :ok, s}
+  def handle_cast(_, s), do: {:noreply, s}
+  def handle_info(_, s), do: {:noreply, s}
+  def terminate(_, _), do: :ok
+  def code_change(_, s, _), do: {:ok, s}
+end
+```
+
+**`@before_compile` wraps your callbacks.** When `@eta_observe` is set,
+`use Eta` installs a `@before_compile` callback that rewrites each
+`gen_server` callback body to publish its returned state to the process
+dictionary (where `:eta_observe.read/1` finds it), and to route `handle_call/3`
+replies through `:eta_net.reply/2`. This is the Elixir equivalent of the
+observe and reply-routing passes in `eta_transform`, done at the Elixir AST
+level via `Module.get_definition/2` rather than at the Erlang AST level.
+
+**`receive ... after` is not virtualized.** The parse transform rewrites this
+language construct; a macro cannot. A `receive ... after` timeout runs on the
+real clock. Use `Eta.send_after/3` to send a message to yourself and match on
+it in a plain `receive` instead.
+
+**`gen_statem` state timeouts are not virtualized.** The parse transform
+intercepts `{state_timeout, ...}` actions before OTP sees them; a macro
+cannot. Erlang modules using `gen_statem` should continue to use the parse
+transform via `eta.hrl`.
+
+For a project that wants the same source to compile with and without `eta`,
+the macros already handle it: each one checks `Code.ensure_loaded?(:eta_time)`
+at compile time. So you can `use Eta` unconditionally, and `:eta` only needs to
+be a dependency in your DST build's `mix.exs`.
+
+```elixir
+defp deps do
+  [{:eta, "~> 0.1", only: :dst, runtime: false}]
+end
+```
+
+In a DST build, the macros expand to `:eta_*` calls. In a release build, they
+expand to stdlib calls, and `:eta` is not a dependency.
+
 ### Run simulations from their own build profile
 
 **In Mix, a `dst` environment and a `mix dst` to enter it.** In `project/0`:
@@ -134,6 +245,21 @@ and:
 ```
 
 `dst/` needs its own `test_helper.exs`, the same one `mix new` put in `test/`.
+
+**Elixir modules that `use Eta` need Erlang compiled first.** `lib/eta.ex`
+calls `Code.ensure_loaded?(:eta_time)` at macro expansion time to decide
+whether `:eta` is available, so the Erlang transform modules must be on the
+code path before any Elixir module that `use Eta` is compiled. Add a compile
+alias to enforce the order:
+
+```elixir
+defp aliases do
+  [
+    compile: ["compile.erlang", "compile.elixir", "compile.app"],
+    dst: &dst/1
+  ]
+end
+```
 
 **In rebar3, a `dst` profile, entered as `rebar3 as dst eunit`.**
 
@@ -246,6 +372,14 @@ The transform rewrites qualified calls, and only qualified calls:
 | `erlang:spawn/1,3`, `spawn_link`, `proc_lib` equivalents | `eta_sched:*` |
 | `gen_server:start/3,4`, `start_link/3,4`, `start_monitor/3,4` | `eta_sched:*` |
 | the same six on `gen_statem` | `eta_sched:statem_*` |
+
+In Elixir, these rewrites are **explicit** rather than automatic. The `Eta.*`
+macros (table above) expand to the `:eta_*` calls when `:eta` is a
+compile-time dependency, and to the stdlib calls otherwise. A bare
+`Process.send_after/3` or `GenServer.cast/2` in an Elixir module is **not**
+rewritten — write `Eta.send_after/3` or `Eta.cast/2` instead. The trade-off
+is clarity: every virtualized call is visible at the call site, and the same
+source compiles with and without `:eta` as a dependency.
 
 A bare `monotonic_time()` is left alone, and has to be. None of these functions
 are auto-imported, so an unqualified call names something your own module

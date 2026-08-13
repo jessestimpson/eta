@@ -54,6 +54,34 @@ When a run fails, shrink it:
     eta_shrink:shrink(my_harness, Trace, #{seed => 7, max_ops => 25, preload => [my_app]}).
 ```
 
+Elixir is supported: `use Eta` in a module provides explicit macros
+(`Eta.send_after/3`, `Eta.cast/2`, `Eta.call/3`, `Eta.send/2`, etc.) that
+expand to `:eta_*` calls when `:eta` is a compile-time dependency and to
+stdlib calls otherwise — no parse_transform required.
+
+```elixir
+defmodule MyServer do
+  use Eta
+  @behaviour :gen_server
+
+  @eta_observe :all
+
+  def init(_) do
+    Eta.label(:my_server)
+    _ = Eta.send_after(self(), :tick, 50)
+    {:ok, %{count: 0}}
+  end
+
+  def handle_cast(:tick, state) do
+    Eta.log({:tick, state.count})
+    {:noreply, %{state | count: state.count + 1}}
+  end
+end
+```
+
+See [Setting up a project](docs/02-setting-up.md) for the Elixir build
+configuration and the list of supported macros.
+
 The library ships with a [two-phase commit implementation as an example](test/support/eta_2pc.erl),
 and includes an optional bug that will break an invariant for demonstration
 purposes. We also provide a [walkthrough that implements an ABD Qurom Register](docs/06-a-journey-through-dst.md)
@@ -124,9 +152,14 @@ Early and under development.
 
 ### Known gaps, roughly by size
 
-- **Limited Elixir support.** The Erlang `parse_transform` is the mechanism
-  for keeping your code deployable to prod without disruptive changes. Elixir
-  support may come later.
+- **Elixir support is best-effort.** `use Eta` provides explicit macros
+  (`Eta.send_after/3`, `Eta.cast/2`, etc.) that expand to `:eta_*` calls when
+  `:eta` is a dependency and to stdlib calls otherwise. A `@before_compile`
+  callback wraps `gen_server` callbacks to publish state and route replies.
+  Elixir support works and is tested, but continued development
+  focuses on Erlang, where the parse transform is the native mechanism.
+  Elixir-specific issues may take longer to address.
+  See [Setting up a project](docs/02-setting-up.md).
 - **One simulation per VM.** `eta_time` and `eta_log` keep state in named ETS
   tables, so runs must be serial. Keep the tests `async: false`. This is one of
   the reasons we suggest running simulations from their own build profile, so

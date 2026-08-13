@@ -8,7 +8,7 @@ defmodule Eta.MixProject do
       elixir: "~> 1.15",
       erlc_paths: erlc_paths(Mix.env()),
       erlc_options: erlc_options(Mix.env()),
-      elixirc_paths: [],
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       dialyzer: dialyzer(),
@@ -27,6 +27,12 @@ defmodule Eta.MixProject do
   # transform, so they have to compile in the same pass as `src`.
   defp erlc_paths(:test), do: ["src", "test/support"]
   defp erlc_paths(_), do: ["src"]
+
+  # `lib/` holds the Elixir entry point (`Eta`), and `test/support` holds Elixir
+  # SUTs alongside the Erlang ones. Both are test-only: a release build carries
+  # no Elixir code at all.
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: []
 
   # The `DST` define is the contract `include/eta.hrl` hangs on: with it, the
   # header brings the parse transform and the `?ETA_LOG` macros; without it, it
@@ -52,6 +58,7 @@ defmodule Eta.MixProject do
       links: %{"GitHub" => "https://github.com/jessestimpson/eta"},
       files: [
         "src",
+        "lib",
         "include",
         "assets",
         "mix.exs",
@@ -97,6 +104,12 @@ defmodule Eta.MixProject do
 
   defp aliases do
     [
+      # Erlang first, then Elixir: `lib/eta.ex` calls `Code.ensure_loaded?(:eta_time)`
+      # at macro expansion time to decide whether `:eta` is available, so the
+      # transform modules must be on the code path before any Elixir module that
+      # `use Eta` is compiled. `compile.app` generates the .app file and must be
+      # last.
+      compile: ["compile.erlang", "compile.elixir", "compile.app"],
       lint: [
         "format --check-formatted",
         "cmd rebar3 fmt --check",

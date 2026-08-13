@@ -207,6 +207,50 @@ defmodule DstRunTest do
     end
   end
 
+  describe "determinism under stress" do
+    # `one seed produces one trace` is the single-seed, trace-only case. The
+    # claim the library is named for is larger: every seed produces one *result*,
+    # and a drift in `steps`, `clock_ms`, `sched.timeouts`, `stray_timers` or
+    # `modules_loaded` is nondeterminism even when the trace happens to match.
+    # The sweep across seeds catches nondeterminism that is seed-dependent,
+    # which a single fixed seed cannot see.
+    test "every seed produces one full result, across many seeds" do
+      for seed <- 1..12 do
+        runs = for _ <- 1..3, do: run(seed)
+
+        assert length(Enum.uniq(runs)) == 1,
+               "seed #{seed} produced #{length(Enum.uniq(runs))} distinct results in 3 runs"
+
+        # Non-vacuity: a run that executed nothing satisfies "one result" trivially.
+        [one] = Enum.uniq(runs)
+        assert one.ops == 25, "seed #{seed} did not inject every operation"
+        assert one.steps > 50, "seed #{seed} ran suspiciously few steps"
+      end
+    end
+
+    test "a violation reproduces byte-identical, details and all" do
+      # A counterexample is only useful if it reproduces — not just the verdict
+      # but the `details` map a harness reads to diagnose it. The single-seed
+      # replay test checks `outcome == outcome`, which a shared reference
+      # satisfies; this checks that independent runs of the same failing seed
+      # produce the same violation down to every field, with nothing drifted by
+      # whatever wall-clock timing happened between them.
+      config = %{mode: :first_vote_wins}
+
+      seed =
+        Enum.find(1..60, fn s ->
+          match?({:violation, _}, run(s, config).outcome)
+        end)
+
+      assert seed, "no failing seed to stress"
+
+      runs = for _ <- 1..3, do: run(seed, config)
+
+      assert length(Enum.uniq(runs)) == 1,
+             "failing seed #{seed} produced #{length(Enum.uniq(runs))} distinct results"
+    end
+  end
+
   describe "the check contract" do
     test "an invariant that calls into a suspended process is reported, not hung" do
       # The trap `eta_harness` warns about, made concrete. `check/1` here does what an

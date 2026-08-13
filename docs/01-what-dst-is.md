@@ -117,10 +117,11 @@ like TLA+ and checking with TLC **can** make such a guarantee.
 It's not cheap. As we alluded above, you are responsible for rooting out
 all sources of nondeterminsm. `eta` will help you along the way, but there
 is real significant work in managing out the nondeterminism. Your
-Erlang modules will need to be written in a certain way for `eta` to
-engage its tooling. For example, the `eta_transform` parse transform
-is a critical part of `eta`'s tooling, and it means your code must
-adhere to its requirements.
+Erlang and Elixir modules will need to be written in a certain way for `eta`
+to engage its tooling. For example, the `eta_transform` parse transform
+is a critical part of `eta`'s tooling for Erlang, and it means your code must
+adhere to its requirements. In Erlang, you will include `eta.hrl` to activate
+the compile-time hooks. In Elixir, you will `use Eta`.
 
 It's not a fuzzer or property-based testing. You may choose to employ
 a fuzzer to generate more DST workloads, but the inputs are your
