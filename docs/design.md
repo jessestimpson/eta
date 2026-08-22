@@ -747,6 +747,13 @@ still a genuine repro; it is the *minimality* that is approximate. Closing it me
 remapping ids as entries are removed, which is a real extension rather than a
 tuning change.
 
+> **Later:** closed, and not by remapping. Each trace entry records the ids it
+> created and a replay is *given* them instead of recounting, so a deletion cannot
+> rename anything — `eta_sched:pin/2`. The leading-operation measurement above went
+> from 6 steps skipped to 0; over 30 failing 2PC seeds the mean result went from
+> 9.4 entries to 7.6, and the walkthrough's own example from 8 to 7 with both dead
+> operations now removed.
+
 #### What a multi-invariant system must supply
 
 The default "same failure" test is the violation's `property` when the system
@@ -1368,6 +1375,13 @@ target ("on the order of ten steps") is met in spirit at the scale of the worklo
 and the lever that reaches it is reducing the operation count, not ddmin. Making
 ddmin do that itself means remapping ids as entries are removed, still a real
 extension.
+
+> **Later:** the positional-id bound is closed — see the note in Phase 4. The
+> registry numbers here were measured under it and have not been re-measured
+> since; the 2PC ones have, and ddmin now removes operations there. Reducing the
+> operation count is still the lever for a process-heavy system, because a smaller
+> workload is a different axis from a shorter schedule and ddmin only searches the
+> second.
 
 **3 — Replays from the seed alone.** A failing seed reproduces its violation and its
 exact schedule across runs (measured 8/8 identical, and asserted 3/3 in the test).

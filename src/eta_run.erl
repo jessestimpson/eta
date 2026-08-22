@@ -48,6 +48,14 @@ which is what Phase 4 needs. A recorded step naming a process that is not runnab
 is reported as a divergence rather than skipped, because a "replay" that quietly
 does something else is worse than no replay.
 
+**An entry that created processes also records their ids**, as a third element:
+`{op, Op, [3, 4]}`. A replay hands those back to the scheduler rather than
+recounting, so deleting one entry cannot rename the processes another entry names
+— which is what lets `eta_shrink` delete an operation and have the rest of the
+trace still mean what it meant. Entries that created nobody keep the plain two
+element shape, so match with `action/1` rather than on the tuple. See
+`eta_sched:pin/2`.
+
 **All three of the driver's actions are entries**, letting time pass included. A
 trace missing the clock advances is not a trace of a system that has timers: replay
 walks only what it is given, so the clock never moves, nothing ever becomes
@@ -66,22 +74,32 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
 
 -export([run/2, replay/3, spawn_op/1, preload/1]).
 
+%% Reading a trace entry. See `action/1`.
+-export([action/1, created/1]).
+
 %% Reading a result. See `summary/1` and `audit/1`.
 -export([summary/1, audit/1]).
 
 %% Trace fixtures — a failure pinned to disk. See `save_fixture/4`.
 -export([save_fixture/4, load_fixture/1, replay_fixture/1, check_fixture/1]).
 
--export_type([entry/0, outcome/0, result/0, fixture/0]).
+-export_type([entry/0, created/0, outcome/0, result/0, fixture/0]).
 
 -type entry() ::
     {op, eta_harness:op()}
+    | {op, eta_harness:op(), created()}
     | {step, eta_sched:id()}
+    | {step, eta_sched:id(), created()}
     | {clock, integer()}
+    | {clock, integer(), created()}
     %% How the run ended, recorded so a replay can put a `check_final/2` in the
     %% same position it was in. Always last, and only on a run that ended
     %% normally.
     | {final, eta_harness:settled()}.
+%% The processes an entry created, in adoption order. Present only when the entry
+%% created somebody, which most do not — a trace of `{step, 3, []}` lines is one
+%% nobody wants to read. See `eta_sched:pin/2` for what it is for.
+-type created() :: [eta_sched:id()].
 -type outcome() ::
     ok
     | {violation, eta_harness:violation()}
@@ -574,10 +592,19 @@ drive(Mod, Opts, Source) ->
             check_every = maps:get(check_every, Opts, 1),
             lenient = maps:get(lenient, Opts, false)
         },
+        %% Startup's own processes belong to no entry, and are the one set whose
+        %% ids a shrink can never disturb — nothing deletes `init/2`. Dropping
+        %% them here keeps them from being attributed to whatever runs first.
+        _ = eta_sched:take_adopted(Sched),
         {Outcome, R1} =
             case Source of
-                generate -> loop(R);
-                {replay, Trace} -> replay_loop(R, Trace)
+                generate ->
+                    loop(R);
+                {replay, Trace} ->
+                    %% A recorded run counts its ids; a replay is told them. See
+                    %% `eta_sched:pin/2`.
+                    ok = eta_sched:pin_mode(Sched, pinned(Trace)),
+                    replay_loop(R, Trace)
             end,
         finish(Outcome, R1)
     after
@@ -738,12 +765,16 @@ roll(R = #r{rand = Rand}) ->
 %% sort. On a timer-driven system it made `eta_shrink` a no-op: the shrinker replays
 %% original trace to classify it, got a clean run, and reported "nothing to shrink"
 %% for a failure that had just happened.
-idle(R = #r{ops_left = OpsLeft, trace = Trace}) ->
+idle(R = #r{ops_left = OpsLeft, sched = Sched, trace = Trace}) ->
     case eta_time:advance_to_next(schedulable(R#r.sched)) of
         true ->
             Now = eta_time:now_ms(),
             _ = eta_log:log({clock, Now}),
-            loop(spend(R#r{trace = [{clock, Now} | Trace]}));
+            %% A timer firing can start a process — `eta_sched` adopts one that
+            %% appears between steps rather than leaving it unsupervised — so a
+            %% clock entry carries its creations like any other.
+            Created = eta_sched:take_adopted(Sched),
+            loop(spend(R#r{trace = [entry(clock, Now, Created) | Trace]}));
         false when OpsLeft > 0 ->
             %% `quiet_p` chose to let time pass and there was no time to pass.
             after_action(do_op(R));
@@ -784,8 +815,10 @@ do_final(Mod, Settled, Sut, R) ->
 %% as "the scheduler picked r2, and here is what r2 then did".
 do_step(R = #r{sched = Sched, trace = Trace, steps = Steps}, Id) ->
     _ = eta_log:log({step, Id}),
-    {_Outcome, _} = eta_sched:step(Sched, Id),
-    spend(R#r{trace = [{step, Id} | Trace], steps = Steps + 1}).
+    %% `step_adopting/2` rather than a step and a separate question about what it
+    %% created: one round trip, for the reason that function documents.
+    {_Outcome, Created, _} = eta_sched:step_adopting(Sched, Id),
+    spend(R#r{trace = [entry(step, Id, Created) | Trace], steps = Steps + 1}).
 
 do_op(R) ->
     #r{mod = Mod, sut = Sut, rand = Rand} = R,
@@ -799,13 +832,18 @@ apply_op(R, Op) ->
     %% An operation is issued by spawning; pick up whatever it created. Already
     %% known pids are ignored, so re-registering the whole set is correct.
     %% Registering is also what lets them run: a gated child gets its token from
-    %% the scheduler, and `register/2` is the route when the parent — here, the
+    %% the scheduler, and registering is the route when the parent — here, the
     %% driver — is not traced. See `spawn_op/1`.
-    Sched1 = eta_sched:register(Sched, Mod:processes(Sut1)),
+    %%
+    %% `register_adopting/2` because *who* it created is recorded too, so that a
+    %% replay can give those processes the same ids without recounting — the whole
+    %% reason deleting an operation no longer renames the survivors. See
+    %% `eta_sched:pin/2`.
+    {Sched1, Created} = eta_sched:register_adopting(Sched, Mod:processes(Sut1)),
     spend(R#r{
         sut = Sut1,
         sched = Sched1,
-        trace = [{op, Op} | Trace],
+        trace = [entry(op, Op, Created) | Trace],
         ops = Ops + 1,
         ops_left = R#r.ops_left - 1
     }).
@@ -833,7 +871,20 @@ replay_loop(R, []) ->
     {ok, R};
 replay_loop(R = #r{budget = 0}, _) ->
     {{error, step_budget_exhausted}, R};
-replay_loop(R = #r{sched = Sched, lenient = Lenient, skipped = Skipped}, [{step, Id} | Rest]) ->
+%% Every entry starts by telling the scheduler which ids the processes this entry
+%% creates are to be given. That is what stops a deletion elsewhere in the trace
+%% from renaming them: an id means "the process the trace called 7", not "the
+%% seventh process this replay happened to adopt". See `eta_sched:pin/2`.
+replay_loop(R = #r{sched = Sched}, [Entry | Rest]) ->
+    ok = pin(Sched, created(Entry)),
+    replay_entry(R, action(Entry), Rest).
+
+%% Most entries create nobody, and the scheduler empties the supply as it closes
+%% each entry, so for those there is nothing to say and no message worth sending.
+pin(_Sched, []) -> ok;
+pin(Sched, Created) -> eta_sched:pin(Sched, Created).
+
+replay_entry(R = #r{sched = Sched, lenient = Lenient, skipped = Skipped}, {step, Id}, Rest) ->
     case lists:member(Id, eta_sched:runnable(Sched)) of
         true ->
             replay_after(do_step(R, Id), Rest);
@@ -850,13 +901,13 @@ replay_loop(R = #r{sched = Sched, lenient = Lenient, skipped = Skipped}, [{step,
             %% it beats continuing, which would produce a "replay" that is not one.
             {{error, {diverged, Id, eta_sched:runnable(Sched)}}, R}
     end;
-replay_loop(R, [{op, Op} | Rest]) ->
+replay_entry(R, {op, Op}, Rest) ->
     replay_after(apply_op(R, Op), Rest);
 %% The recorded ending. Replayed rather than re-derived, so a `check_final/2`
 %% sees the same `Settled` it saw in the run being reproduced — otherwise a
 %% harness that trusts `quiescent` and not `settle_budget` could answer
 %% differently for the same schedule. Last entry either way, so nothing follows.
-replay_loop(R = #r{mod = Mod, sut = Sut, trace = Trace}, [{final, Settled} | _Rest]) ->
+replay_entry(R = #r{mod = Mod, sut = Sut, trace = Trace}, {final, Settled}, _Rest) ->
     do_final(Mod, Settled, Sut, R#r{trace = [{final, Settled} | Trace]});
 %% Time passed here. The recorded `Ms` is what the clock read *after* the advance,
 %% and a strict replay holds the replay to it: landing somewhere else means the timer
@@ -864,7 +915,7 @@ replay_loop(R = #r{mod = Mod, sut = Sut, trace = Trace}, [{final, Settled} | _Re
 %% the steps line up. Lenient replay takes whatever advance is available, for the same
 %% reason it skips an unrunnable step — a shrink candidate has had entries removed,
 %% so its wheel is legitimately not the original's.
-replay_loop(R = #r{lenient = Lenient, skipped = Skipped, trace = Trace}, [{clock, Ms} | Rest]) ->
+replay_entry(R = #r{lenient = Lenient, skipped = Skipped, trace = Trace}, {clock, Ms}, Rest) ->
     %% The same schedulability rule `idle/1` used to record the entry. Replaying
     %% under a laxer one would advance to a deadline the generating run stepped
     %% over, so a trace from a system carrying a stray timer would not replay.
@@ -874,7 +925,10 @@ replay_loop(R = #r{lenient = Lenient, skipped = Skipped, trace = Trace}, [{clock
             case Lenient orelse Now =:= Ms of
                 true ->
                     _ = eta_log:log({clock, Now}),
-                    replay_after(spend(R#r{trace = [{clock, Now} | Trace]}), Rest);
+                    Created = eta_sched:take_adopted(R#r.sched),
+                    replay_after(
+                        spend(R#r{trace = [entry(clock, Now, Created) | Trace]}), Rest
+                    );
                 false ->
                     {{error, {clock_diverged, Ms, Now}}, R}
             end;
@@ -892,6 +946,59 @@ replay_after(R = #r{mod = Mod, sut = Sut}, Rest) ->
         {violation, _} = V -> {V, R};
         {error, _} = E -> {E, R}
     end.
+
+%% ---------------------------------------------------------------------------
+%% Entries
+%% ---------------------------------------------------------------------------
+
+%% An entry carries a third element only when it created somebody. Most entries
+%% create nobody, and a trace whose every line reads `{step, 3, []}` costs the one
+%% thing a trace is read for. The two shapes mean the same thing everywhere except
+%% `pinned/1`, which is asking a question about the trace as a whole.
+-spec entry(op | step | clock, term(), created()) -> entry().
+entry(Tag, Payload, []) -> {Tag, Payload};
+entry(Tag, Payload, Created) -> {Tag, Payload, Created}.
+
+-if(?DOCATTRS).
+-doc """
+What an entry did, without who it created: `{op, Op}`, `{step, Id}`,
+`{clock, Ms}` or `{final, Settled}`.
+
+Match on this rather than on the entry, because an entry that created processes
+carries a third element and one that did not does not:
+
+```erlang
+Ops = [Op || E <- Trace, {op, Op} <- [eta_run:action(E)]].
+```
+""".
+-endif.
+-spec action(entry()) -> tuple().
+action({Tag, Payload, _Created}) -> {Tag, Payload};
+action(Entry) -> Entry.
+
+-if(?DOCATTRS).
+-doc """
+The processes an entry created, oldest first, and `[]` for the entries that
+created none.
+
+This is what makes a shrunk trace mean the same thing as the trace it came from —
+see `eta_sched:pin/2`. Reading it is for diagnosis; nothing needs to write it.
+""".
+-endif.
+-spec created(entry()) -> created().
+created({_Tag, _Payload, Created}) -> Created;
+created(_Entry) -> [].
+
+%% Whether this trace knows who created whom, decided once for the whole trace
+%% rather than per entry. An entry with no created-ids is ambiguous alone: it
+%% means "created nobody" in a recorded trace and "recorded before there was such
+%% a thing" in one written by hand or by an older build. Treating the second as the
+%% first would give every process in such a trace a `{fresh, _}` id and nothing
+%% would replay, so the presence of *any* creation is what turns pinning on. A
+%% trace that created nothing after startup replays identically either way.
+-spec pinned([entry()]) -> boolean().
+pinned(Trace) ->
+    lists:any(fun(Entry) -> tuple_size(Entry) =:= 3 end, Trace).
 
 %% ---------------------------------------------------------------------------
 %% Invariants

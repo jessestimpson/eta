@@ -357,16 +357,15 @@ because the failure happened early. On a larger system a first trace runs to
 #{outcome := {violation, _}, trace := Trace} =
     eta_run:run(eta_2pc, Opts),
 
-#{trace := Minimal, original := 26, shrunk := 8, verified := true} =
+#{trace := Minimal, original := 26, shrunk := 7, verified := true} =
     eta_shrink:shrink(eta_2pc, Trace, Opts).
 ```
 
-26 entries down to 8, in 142 candidate replays and 24 msec:
+26 entries down to 7, in 74 candidate replays:
 
 ```erlang
-[{op,   {run_tx, 2, [{1, yes}, {2, yes}, {3, yes}]}},
- {op,   {run_tx, 3, [{1, yes}, {2, yes}, {3, no}]}},
- {step, 5},
+[{op,   {run_tx, 5, [{1, no}, {2, yes}, {3, stall}]}, [8]},
+ {step, 8},
  {step, 0},
  {step, 2},
  {step, 0},
@@ -374,11 +373,16 @@ because the failure happened early. On a larger system a first trace runs to
  {step, 1}]
 ```
 
-If that means little to you, that's the right reaction. **A trace is a scheduler
-artifact, not an explanation.** `{step, 5}` records which process the scheduler
-chose and says nothing about what that process did, and the ids are anonymous
-positions assigned in registration order. Turning one into a story means
-reconstructing every mailbox state by hand.
+6 of the 7 operations are gone, including the 4 that ran before this one. The
+`[8]` on the operation is the id of the client process it spawned, which is
+there so that deleting any *other* operation can't renumber it — see
+[the shrinking hazards](05-gotchas.md#shrinking-hazards) for what that used to
+cost.
+
+If the rest means little to you, that's the right reaction. **A trace is a
+scheduler artifact, not an explanation.** `{step, 3}` records which process the
+scheduler chose and says nothing about what that process did. Turning one into a
+story means reconstructing every mailbox state by hand.
 
 What shrinking gives you is a trace short enough to be worth narrating.
 `eta_log` is what narrates it.
@@ -394,30 +398,38 @@ eta_log:analyze().
 ```
 
 ```
-   30  $eta           {op,{run_tx,5,[{1,no},{2,yes},{3,stall}]}}
-   39  participant-2  {voted,5,yes}
-   42  coordinator    {decided,5,commit}
-   53  participant-1  {voted,5,no}
-   55  participant-1  {decided,5,commit,aborted}
+    1  $eta           {op,{run_tx,5,[{1,no},{2,yes},{3,stall}]}}
+    2  client-1       {step,8}
+    3  coordinator    {step,0}
+    4  coordinator    {prepare_sent,5}
+    5  participant-2  {step,2}
+    6  participant-2  {voted,5,yes}
+    7  coordinator    {step,0}
+    8  coordinator    {decided,5,commit}
+    9  participant-3  {step,3}
+   10  participant-3  {stalling,5}
+   11  participant-3  {decided,5,commit,committed}
+   12  participant-1  {step,1}
+   13  participant-1  {voted,5,no}
+   14  participant-1  {decided,5,commit,aborted}
 ```
 
-Line 42 is the bug: the coordinator decided on one vote. Line 53 is the `no`
-arriving too late, and line 55 is the participant refusing, which is what makes
-the disagreement visible.
+Line 8 is the bug: the coordinator decided `commit` having heard one vote, on
+line 6. Line 13 is participant 1's `no` arriving after the decision, and line 14
+is it refusing to commit, which is what makes the disagreement visible.
 
 The events come from `?ETA_LOG` calls in the participant and coordinator, about
 one per protocol decision. `eta_log:analyze(#{until => N})` stops the output
 where the story does, which matters because everything after the run proper is
 the scheduler releasing the system during teardown.
 
-### What the shrinker couldn't remove
+### What the shrinker can't remove
 
-Transaction 2 contributes nothing, and its survival shows the shrinker's one
-real limitation. Step ids are positional, so removing that leading operation
-renumbers every process created after it, the surviving `{step, Id}` entries
-stop naming what they named, the candidate runs clean, and the removal is
-reverted as unsafe. The trace is still a genuine reproduction. It's the
-minimality that's approximate.
+It deletes whole entries and never simplifies one. This transaction still runs
+against 3 participants because that's the operation the generator produced; a
+minimal *workload* is a separate axis, and the shrinker doesn't search it. It
+also can't go below what the system needs to reach the violation, which is the
+right answer and the reason the surviving operation survives.
 
 2 things about how the shrinker works matter when you read a result.
 

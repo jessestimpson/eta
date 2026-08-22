@@ -622,22 +622,6 @@ make them milder.
 
 ## Shrinking hazards
 
-### Step ids are positional, which bounds what can be removed
-
-The scheduler assigns ids in registration order, so deleting an operation
-renumbers every process created after it and the surviving `{step, Id}` entries
-stop naming what they named.
-
-How much that costs depends on how many processes your system creates. Against
-two-phase commit, delta debugging goes from 26 entries to 8. Against the
-registry, it removes between 0 and 3 entries out of 70 to 85, and never removes
-an operation at all.
-
-So on a process-heavy system, what makes a reproduction readable is a smaller
-*workload* rather than a better shrinker. Search over `max_ops` as well as over
-seeds. A registry defect that produces an 80-entry trace under 12 operations
-still reproduces under 3, and that trace is 38 entries.
-
 ### Give your violations a property key
 
 `eta_shrink`'s default test for "the same failure" is the violation's `property`

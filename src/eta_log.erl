@@ -431,9 +431,15 @@ name(Label, _What, _Labels) -> format(Label).
 
 label_for(Id, Labels) ->
     case maps:get(Id, Labels, undefined) of
-        undefined -> <<"p", (integer_to_binary(Id))/binary>>;
+        undefined -> unnamed(Id);
         Name -> format(Name)
     end.
+
+%% A process nobody named. `{fresh, N}` is one a pinned replay adopted that its
+%% trace did not account for — see `eta_sched:pin/2` — and the `?` is the point:
+%% it is a process the trace cannot explain, and a line reading `p?0` says so.
+unnamed(Id) when is_integer(Id) -> <<"p", (integer_to_binary(Id))/binary>>;
+unnamed({fresh, N}) -> <<"p?", (integer_to_binary(N))/binary>>.
 
 %% Names are ordinary terms, from `label/1` or from a harness's `labels/1`, and
 %% rendering them is this module's job rather than the caller's. A harness

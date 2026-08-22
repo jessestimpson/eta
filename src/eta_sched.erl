@@ -144,11 +144,16 @@ releasing, not after.
     new/0,
     new/1,
     register/2,
+    register_adopting/2,
     release/1,
     ids/1,
     procs/1,
     runnable/1,
+    pin/2,
+    pin_mode/2,
+    take_adopted/1,
     step/2,
+    step_adopting/2,
     run/1,
     run/2,
     run/3,
@@ -255,7 +260,11 @@ releasing, not after.
 %% What releases a gated child once the scheduler owns it.
 -define(GO, '$eta_sched_go').
 
--type id() :: non_neg_integer().
+%% A plain integer for a process the scheduler named itself, counting in adoption
+%% order. `{fresh, N}` for one adopted during a *pinned* replay that its trace did
+%% not account for — a separate space, so that a process the trace never named can
+%% never be mistaken for one it did. See `pin/2`.
+-type id() :: non_neg_integer() | {fresh, non_neg_integer()}.
 -type outcome() :: progress | no_progress | exited.
 -opaque sched() :: {eta_sched, pid()}.
 
@@ -274,6 +283,8 @@ releasing, not after.
     rand :: rand:state(),
     %% id => pid, and the reverse. Ids are stable across runs (assignment order is
     %% a function of the schedule), pids are not — so choices are recorded as ids.
+    %% Stable across *edits* to a trace only under `pin/2`, which is what shrinking
+    %% needs and why it exists.
     procs = #{} :: #{id() => pid()},
     ids = #{} :: #{pid() => id()},
     next_id = 0 :: id(),
@@ -283,6 +294,13 @@ releasing, not after.
     %% Children spawned through `spawn/1` and friends, which start blocked. Tracked
     %% so `release/1` can let go of any that never got their token.
     gated = #{} :: #{pid() => true},
+    %% Id assignment when a trace is driving. `supply` is what the entry now
+    %% executing is expected to create, `adopted` is what it actually created, and
+    %% `pinning` says which well an unexpected adoption draws from. See `pin/2`.
+    supply = [] :: [id()],
+    adopted = [] :: [id()],
+    pinning = false :: boolean(),
+    fresh = 0 :: non_neg_integer(),
     choices = [] :: [id()],
     adopted_late = 0 :: non_neg_integer(),
     %% Steps that ended without the process reaching a receive. See
@@ -991,7 +1009,10 @@ own_ancestors() ->
 %% ---------------------------------------------------------------------------
 
 -if(?DOCATTRS).
--doc "Every known process id, ascending. Ids are assigned in registration order.".
+-doc """
+Every known process id, ascending. Ids are assigned in registration order, or
+taken from the trace when one is driving — see `pin/2`.
+""".
 -endif.
 -spec ids(sched()) -> [id()].
 ids(S) ->
@@ -1057,6 +1078,100 @@ stats(S) ->
 -spec choices(sched()) -> [id()].
 choices(S) ->
     call(S, choices).
+
+%% ---------------------------------------------------------------------------
+%% Pinned ids
+%% ---------------------------------------------------------------------------
+
+-if(?DOCATTRS).
+-doc """
+Hands the scheduler the ids to give the next processes it adopts.
+
+Ids are otherwise assigned by counting, and a counter is positional: it makes an
+id mean "the Nth process this run created", so deleting the operation that created
+the third one renumbers every process after it. That is survivable in a run and
+fatal in a shrink, where `eta_shrink` deletes entries and replays what is left —
+the surviving `{step, Id}` entries stop naming what they named, the replay skips
+them, and the shrinker concludes the deletion mattered when all that happened was
+arithmetic.
+
+So a replay does not recount. `eta_run` records, on each trace entry, the ids that
+entry created, and hands them back here before replaying it. An id then means
+"the process the trace called 7", which no deletion elsewhere can change.
+
+`Ids` is consumed in adoption order and is *not* an obligation: leftovers are
+discarded when the entry closes, which is what removing an operation looks like
+from here — the processes it would have created never arrive, and nothing else
+moves. An entry that creates nobody therefore need not call this at all; the
+supply is already empty.
+
+Only meaningful under `pin_mode/2`; a generating run has nothing to pin.
+""".
+-endif.
+-spec pin(sched(), [id()]) -> ok.
+pin({eta_sched, Pid}, Ids) ->
+    %% A cast, because there is nothing to wait for and this runs once per trace
+    %% entry that creates anything. Ordering is still guaranteed: the caller's next
+    %% `step/2`, and any trace event a caller's operation provokes, arrive behind
+    %% it in the same mailbox.
+    gen_server:cast(Pid, {pin, Ids}).
+
+-if(?DOCATTRS).
+-doc """
+Whether ids come from the trace (`true`) or from the counter (`false`, the
+default).
+
+The mode is per run rather than per entry because an entry that pins nothing is
+ambiguous on its own: it means "this one created nobody" in a recorded trace and
+"this trace predates pinning" in one that has no id information at all. `eta_run`
+decides once, by looking at the trace it was given.
+
+Under `true`, a process adopted with nothing left to pin gets a `{fresh, _}` id
+rather than the next integer, so it cannot collide with an id a later entry is
+still going to hand out.
+""".
+-endif.
+-spec pin_mode(sched(), boolean()) -> ok.
+pin_mode(S, Pinning) when is_boolean(Pinning) ->
+    call(S, {pin_mode, Pinning}).
+
+-if(?DOCATTRS).
+-doc """
+The ids adopted since the last call, oldest first, and clears the record.
+
+This is the recording half of `pin/2`: what a run writes into its trace so that a
+later replay can give the same processes the same names. Reading it *takes* it,
+because the question is always "since when" and the answer is always "since I last
+asked".
+""".
+-endif.
+-spec take_adopted(sched()) -> [id()].
+take_adopted(S) ->
+    call(S, take_adopted).
+
+-if(?DOCATTRS).
+-doc """
+`register/2` and `take_adopted/1`, in one round trip.
+
+Two calls are not two calls' worth of latency here, they are two *drains*: the
+second waits behind every trace event the first one's work produced, which is time
+the caller spent doing nothing, and how much of it depends on how many processes
+the system has. The driver asks this after every operation and `step_adopting/2`
+after every step, so a trace costs one round trip per entry rather than two.
+""".
+-endif.
+-spec register_adopting(sched(), pid() | [pid()]) -> {sched(), [id()]}.
+register_adopting(S, Pids) ->
+    {ok, Adopted} = call(S, {register_adopting, Pids}),
+    {S, Adopted}.
+
+-if(?DOCATTRS).
+-doc "`step/2` and `take_adopted/1`, in one round trip. See `register_adopting/2`.".
+-endif.
+-spec step_adopting(sched(), id()) -> {outcome(), [id()], sched()}.
+step_adopting(S, Id) ->
+    {Outcome, Adopted} = call(S, {step_adopting, Id}),
+    {Outcome, Adopted, S}.
 
 %% ---------------------------------------------------------------------------
 %% Stepping and driving
@@ -1169,6 +1284,12 @@ init(Opts) ->
 
 handle_call({register, Pids}, _From, St) ->
     {reply, ok, do_register(St, Pids)};
+%% The same work, closing out the trace entry it belongs to on the way back. A
+%% separate tag rather than a flag on the reply, so that `register/2` cannot
+%% quietly consume a record its caller was going to ask for.
+handle_call({register_adopting, Pids}, _From, St) ->
+    {Adopted, St1} = close_entry(do_register(St, Pids)),
+    {reply, {ok, Adopted}, St1};
 handle_call(release, _From, St) ->
     {reply, ok, do_release(St)};
 handle_call(ids, _From, St = #st{procs = Procs}) ->
@@ -1179,6 +1300,11 @@ handle_call(runnable, _From, St) ->
     {reply, runnable_ids(St), St};
 handle_call(choices, _From, St = #st{choices = Choices}) ->
     {reply, lists:reverse(Choices), St};
+handle_call({pin_mode, Pinning}, _From, St) ->
+    {reply, ok, St#st{pinning = Pinning}};
+handle_call(take_adopted, _From, St) ->
+    {Adopted, St1} = close_entry(St),
+    {reply, Adopted, St1};
 handle_call(stats, _From, St) ->
     #st{
         steps = Steps,
@@ -1186,7 +1312,8 @@ handle_call(stats, _From, St) ->
         exited = Exited,
         adopted_late = Late,
         timeouts = Timeouts,
-        cold_code = Cold
+        cold_code = Cold,
+        fresh = Fresh
     } = St,
     Reply = #{
         steps => Steps,
@@ -1194,18 +1321,29 @@ handle_call(stats, _From, St) ->
         exited => maps:size(Exited),
         adopted_late => Late,
         timeouts => Timeouts,
-        cold_code => Cold
+        cold_code => Cold,
+        %% Processes a pinned replay adopted that its trace did not account for.
+        %% Zero on a generating run, and on a faithful replay. See `pin/2`.
+        unpinned => Fresh
     },
     {reply, Reply, St};
 handle_call({step, Id}, _From, St) ->
     {Outcome, St1} = do_step(St, Id),
     {reply, Outcome, St1};
+handle_call({step_adopting, Id}, _From, St) ->
+    {Outcome, St1} = do_step(St, Id),
+    {Adopted, St2} = close_entry(St1),
+    {reply, {Outcome, Adopted}, St2};
 handle_call({run, MaxSteps, OnIdle}, _From, St) ->
     {reply, ok, do_run(St, MaxSteps, OnIdle)};
 handle_call({replay, Choices}, _From, St) ->
     {Result, St1} = do_replay(St, Choices),
     {reply, Result, St1}.
 
+handle_cast({pin, Ids}, St) ->
+    %% An overwrite rather than an append: the previous entry's leftovers are
+    %% already gone, dropped by `close_entry/1`. See `pin/2`.
+    {noreply, St#st{supply = Ids}};
 handle_cast(_Msg, St) ->
     {noreply, St}.
 
@@ -1289,13 +1427,17 @@ is_gated(Pid) ->
 
 %% A child that died before it could be suspended is still adopted, as exited.
 %%
-%% Skipping it looks harmless — there is nothing left to schedule — and is not: ids
-%% are assigned in adoption order, so whether a child is skipped decides whether
-%% every process after it keeps its id. A registry's OTP-spawned commit workers
-%% are short enough to lose that race, and were observed adopted in one run
-%% and gone in the next. Adopting either way makes id assignment independent of
-%% liveness, which is the property; a dead process is never runnable, so the id
-%% costs nothing else.
+%% Skipping it looks harmless — there is nothing left to schedule — and is not: an
+%% unpinned id is assigned by counting adoptions, so whether a child is skipped
+%% decides whether every process after it keeps its id. A registry's OTP-spawned
+%% commit workers are short enough to lose that race, and were observed adopted in
+%% one run and gone in the next. Adopting either way makes id assignment
+%% independent of liveness, which is the property; a dead process is never
+%% runnable, so the id costs nothing else.
+%%
+%% `pin/2` makes this irrelevant to a *replay*, which is told its ids rather than
+%% counting them. It is still load-bearing for the run being recorded, which is
+%% where the ids come from.
 %%
 %% Honest about the effect: this changed **nothing measurable** on the registry —
 %% 8 distinct traces across 20 runs, with and without. The dominant cause is what
@@ -1307,13 +1449,42 @@ adopt_exited(St, Child) ->
     Id = maps:get(Child, St1#st.ids),
     St1#st{exited = (St1#st.exited)#{Id => true}}.
 
+%% Closing out a trace entry: hand back what it adopted, and drop whatever it did
+%% not use of what was pinned for it.
+%%
+%% Reading the record takes it, because the question is always "since when" and
+%% the answer is always "since I last asked". Three replies carry it — `step`,
+%% `register` and `take_adopted` — because making the caller ask separately costs
+%% it a second drain of this process's mailbox. See `register_adopting/2`.
+%%
+%% Clearing the supply here rather than at the next `pin/2` is what lets a caller
+%% skip the `pin/2` entirely for an entry that created nobody: the supply is empty
+%% at every entry boundary because whatever closed the last entry emptied it.
+-spec close_entry(#st{}) -> {[id()], #st{}}.
+close_entry(St = #st{adopted = Adopted}) ->
+    {lists:reverse(Adopted), St#st{adopted = [], supply = []}}.
+
 -spec adopt(#st{}, pid()) -> #st{}.
-adopt(St = #st{procs = Procs, ids = Ids, next_id = Id}, Pid) ->
+adopt(St0, Pid) ->
+    {Id, St = #st{procs = Procs, ids = Ids, adopted = Adopted}} = mint(St0),
     St#st{
         procs = Procs#{Id => Pid},
         ids = Ids#{Pid => Id},
-        next_id = Id + 1
+        adopted = [Id | Adopted]
     }.
+
+%% Where an id comes from. A trace that pinned one is answered from the supply; a
+%% generating run counts. The third clause is the interesting one: a *pinned*
+%% replay that adopts a process its trace did not account for must not take the
+%% next integer, because that integer may be one a later entry is still going to
+%% pin. See `pin/2`.
+-spec mint(#st{}) -> {id(), #st{}}.
+mint(St = #st{supply = [Id | Rest]}) ->
+    {Id, St#st{supply = Rest}};
+mint(St = #st{pinning = false, next_id = Id}) ->
+    {Id, St#st{next_id = Id + 1}};
+mint(St = #st{pinning = true, fresh = N}) ->
+    {{fresh, N}, St#st{fresh = N + 1}}.
 
 do_release(St = #st{procs = Procs, gated = Gated}) ->
     %% Anything still waiting for its token would block forever otherwise.

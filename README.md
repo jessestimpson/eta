@@ -131,10 +131,6 @@ Early and under development.
   tables, so runs must be serial. Keep the tests `async: false`. This is one of
   the reasons we suggest running simulations from their own build profile, so
   the constraint stays off your ordinary suite.
-- **Shrinking is bounded by positional step ids.** Deleting an operation
-  renumbers every process created after it, so operations that contributed
-  nothing often survive a shrink. This means that the shrunk replay can
-  still be pretty large.
 
 ## AI full disclosure
 

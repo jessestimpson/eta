@@ -58,15 +58,19 @@ defmodule DstShrinkTest do
       {seed, original} = failing_run()
       result = @shrink.shrink(@sut, original.trace, Map.put(@opts, :seed, seed))
 
+      # `action/1` rather than matching the entry: an entry that created processes
+      # carries their ids as a third element, and an op almost always creates one.
+      actions = Enum.map(result.trace, &:eta_run.action/1)
+
       votes =
-        for {:op, {:run_tx, _tx, plan}} <- result.trace,
+        for {:op, {:run_tx, _tx, plan}} <- actions,
             {_index, vote} <- plan,
             do: vote
 
       assert :no in votes,
              "the shrunk trace has no dissenting vote, so it cannot violate atomicity"
 
-      steps = Enum.count(result.trace, &match?({:step, _}, &1))
+      steps = Enum.count(actions, &match?({:step, _}, &1))
       assert steps > 0, "the trace has no scheduling decisions left in it"
     end
 
@@ -74,9 +78,11 @@ defmodule DstShrinkTest do
     test "it is meaningfully smaller across the failing population, not on one seed" do
       # Asserting a reduction on a single seed measures the seed as much as the
       # shrinker. Over every failing seed in a range: measured 30/30 verified,
-      # mean 43 entries in and 9 out, with the *worst* seed only reaching 73% of
-      # its original — that one is the positional-id limit in the moduledoc, and a
-      # bound tight enough to fail on it would be asserting the limitation away.
+      # mean 43 entries in and 7.6 out — 9.4 out before ids were pinned. The
+      # *worst* seed still only reaches 73% of its original, and a bound tight
+      # enough to fail on it would be asserting away the limit that is left:
+      # deleting an operation strands the steps of the processes it created, and
+      # a seed whose original is 11 entries has little else to give up.
       results =
         for seed <- 1..20,
             r = @run.run(@sut, Map.put(@opts, :seed, seed)),

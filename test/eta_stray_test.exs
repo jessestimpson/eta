@@ -39,7 +39,9 @@ defmodule DstStrayTest do
     :eta_run.run(:eta_stray_harness, Map.merge(@opts, %{seed: seed, config: %{stray: stray}}))
   end
 
-  defp clocks(trace), do: for({:clock, ms} <- trace, do: ms)
+  # Through `action/1`: an entry that created processes carries their ids as a
+  # third element, and a clock advance that starts one would otherwise vanish here.
+  defp clocks(trace), do: for({:clock, ms} <- Enum.map(trace, &:eta_run.action/1), do: ms)
 
   describe "the control" do
     test "a clean run advances the clock only on heartbeats" do
@@ -76,7 +78,7 @@ defmodule DstStrayTest do
       test "never becomes the deadline the clock advances to" do
         strayed = run(1, @mode)
 
-        refute {:clock, @deadline} in strayed.trace,
+        refute @deadline in clocks(strayed.trace),
                "the clock advanced to a deadline whose owner can never take a step"
       end
 

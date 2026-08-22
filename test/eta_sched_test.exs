@@ -439,6 +439,117 @@ defmodule DstSchedTest do
     end
   end
 
+  describe "pinned ids" do
+    # An id is a name for a process, and it used to be a *positional* name — "the
+    # Nth process this run adopted". That makes deleting an entry from a trace
+    # rename every process created after it, which is invisible in a run and
+    # ruinous in a shrink. `pin/2` takes the names from the trace instead. Tested
+    # here on the scheduler alone; `DstRunTest` tests what it buys.
+
+    # A process that spawns children on demand and goes back to waiting, so one
+    # scheduler can be given more than one round of adoptions.
+    defp spawner(parent) do
+      spawn(fn -> spawn_loop(parent) end)
+    end
+
+    defp spawn_loop(parent) do
+      receive do
+        {:spawn_child, n} ->
+          for i <- 1..n do
+            send(parent, {:child, i, spawn(fn -> receive do: (:stop -> :ok) end)})
+          end
+
+          spawn_loop(parent)
+      end
+    end
+
+    defp collect(n) do
+      for _ <- 1..n do
+        assert_receive {:child, _i, pid}, 1_000
+        pid
+      end
+    end
+
+    defp teardown(sched, pids, trace) do
+      @sched.release(sched)
+      for p <- pids, do: Process.exit(p, :kill)
+      :ets.delete(trace)
+    end
+
+    test "a pinned adoption takes the id it was given, and unused ids are dropped" do
+      trace = Trace.new()
+      spawner = spawner(self())
+      Process.sleep(20)
+      sched = @sched.new(%{seed: 5}) |> @sched.register([spawner])
+
+      # Registration adopted the spawner. Startup belongs to no trace entry, which
+      # is why a driver takes it out of the way before pinning anything.
+      assert @sched.take_adopted(sched) == [0]
+      assert @sched.take_adopted(sched) == [], "reading the record did not clear it"
+
+      :ok = @sched.pin_mode(sched, true)
+      :ok = @sched.pin(sched, [41, 42])
+      send(spawner, {:spawn_child, 2})
+      {_outcome, sched} = @sched.step(sched, 0)
+
+      assert @sched.take_adopted(sched) == [41, 42]
+      assert @sched.ids(sched) == [0, 41, 42]
+      first = collect(2)
+
+      # `step_adopting/2` answers the same question inside the step's own reply,
+      # which is how the driver asks it — one round trip per trace entry.
+      :ok = @sched.pin(sched, [43])
+      send(spawner, {:spawn_child, 1})
+      {_outcome, [43], sched} = @sched.step_adopting(sched, 0)
+      assert @sched.take_adopted(sched) == [], "the step's reply already took it"
+
+      # Pinning two and creating one leaves an id unspent. It is dropped rather
+      # than carried forward — that is what deleting an operation looks like from
+      # here, and a supply that queued up would mean one deletion shifting every
+      # id behind it, which is the whole thing being fixed.
+      :ok = @sched.pin(sched, [50, 51])
+      send(spawner, {:spawn_child, 1})
+      {_outcome, sched} = @sched.step(sched, 0)
+      assert @sched.take_adopted(sched) == [50]
+
+      :ok = @sched.pin(sched, [60])
+      send(spawner, {:spawn_child, 1})
+      {_outcome, sched} = @sched.step(sched, 0)
+
+      assert @sched.take_adopted(sched) == [60], "the unspent id was carried forward"
+      assert @sched.stats(sched).unpinned == 0
+
+      teardown(sched, [spawner | first ++ collect(3)], trace)
+    end
+
+    test "a process the trace did not account for gets an id out of a space of its own" do
+      trace = Trace.new()
+      spawner = spawner(self())
+      Process.sleep(20)
+      sched = @sched.new(%{seed: 5}) |> @sched.register([spawner])
+      _ = @sched.take_adopted(sched)
+
+      :ok = @sched.pin_mode(sched, true)
+      :ok = @sched.pin(sched, [41])
+      send(spawner, {:spawn_child, 2})
+      {_outcome, sched} = @sched.step(sched, 0)
+
+      # Not id 1. A pinned replay that handed out the next integer could hand out
+      # one a later entry is still going to pin, and then two processes would
+      # answer to the same name — the failure pinning exists to make impossible.
+      assert @sched.take_adopted(sched) == [41, {:fresh, 0}]
+      assert @sched.stats(sched).unpinned == 1
+
+      # And the id it did not take is still available to pin.
+      :ok = @sched.pin(sched, [1])
+      send(spawner, {:spawn_child, 1})
+      {_outcome, sched} = @sched.step(sched, 0)
+      assert @sched.take_adopted(sched) == [1]
+
+      teardown(sched, [spawner | collect(3)], trace)
+    end
+  end
+
   describe "cold code" do
     # The failure this catches is the one `eta_run`'s docs used to end with
     # "nothing catches it": a process waiting on `code_server` is, to the

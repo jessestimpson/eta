@@ -66,8 +66,10 @@ everybody else. `{step, 8}` names a position, not a process, and says nothing
 about what that process did. Reading one means reconstructing every mailbox
 state by hand.
 
-What shrinking gives you is a trace short enough to be worth narrating.
-`eta_log` is what narrates it, and the order matters:
+Pinning ids fixed which process an entry names, and that is not the same as
+saying what it did — `{step, 8}` is a stable name and still a number. What
+shrinking gives you is a trace short enough to be worth narrating. `eta_log` is
+what narrates it, and the order matters:
 
 ```erlang
 #{trace := Minimal} = eta_shrink:shrink(Mod, Trace, Opts),
@@ -82,19 +84,36 @@ puts your failure in the log and nothing else.
 
 It cannot shrink below what the system needs to reach the violation at all, and it
 does not try to simplify the *contents* of an operation (a smaller name, fewer
-participants). That is a separate axis and a plausible extension.
+participants). That is a separate axis and the one now worth doing next.
 
-**Step ids are positional, and that bounds how far operations can be removed.**
-`eta_sched` assigns ids in registration order, so deleting an operation renumbers
-every process created after it and the surviving `{step, Id}` entries stop naming
-what they named. Measured on a shrunk 2PC trace: removing the leading — and
-entirely irrelevant — operation left the run clean with six steps skipped, because
-those six no longer referred to the client that mattered. So a leading operation
-can survive shrinking despite contributing nothing, and did in that example.
+## Ids used to be positional, and that used to bound the whole search
 
-The trace is still a genuine repro; it is the *minimality* that is approximate, and
-knowing which is which matters when reading one. Closing it means remapping ids as
-entries are removed, which is a real extension rather than a tuning change.
+An id named a process by counting — "the Nth process this run adopted" — so
+deleting an operation renumbered every process created after it and the surviving
+`{step, Id}` entries stopped naming what they named. The oracle then read a clean
+run and concluded the removal mattered, when all that had happened was arithmetic.
+It was the single largest thing holding results back, and it is closed:
+`eta_run` records on each entry the ids that entry created, and `eta_sched:pin/2`
+hands them back on replay instead of recounting. An id now means "the process the
+trace called 7", which no deletion elsewhere can change.
+
+Measured by deleting a trace's leading operation and counting how many of the steps
+behind it still ran — 76/105, 84/96 and 73/107 on three 2PC seeds before, 101/105,
+94/96 and 100/107 after. End to end over 30 failing 2PC seeds: mean result 9.4
+entries down to 7.6, the worst seed from 22 entries to 7, and the `max_tests`
+budget went from binding on one seed to binding on none, the hungriest search now
+using 336 of its 500.
+
+Not every seed improved — one went from 7 entries to 8. ddmin's path through the
+partitions depends on the oracle's answers, so answering more of them correctly
+can still land somewhere marginally worse; nothing about that is unsound, and the
+result is verified either way.
+
+**What remains is the real bound, and it is smaller.** Removing an operation still
+strands the steps belonging to the processes it created, because those processes
+genuinely never exist — no naming scheme fixes that, and it is the correct
+behaviour. So minimality is still approximate; it is now approximate for a reason
+that is about causality rather than about counting.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -142,9 +161,11 @@ Shrinks `Trace` to the shortest prefix-free subsequence that still violates.
   because it looks like progress.
 
 - `max_tests` (500) — bound on candidate replays. Shrinking is a search, and on a
-  large trace it is the expensive part of a run. The default is **binding** on some
-  traces: over 30 failing 2PC seeds, several exhausted it, meaning more reduction
-  was available and not taken. Raise it when a result looks larger than it should.
+  large trace it is the expensive part of a run. It used to be **binding**, back
+  when a deletion could renumber the trace and the search spent its budget
+  relearning that; over the same 30 failing 2PC seeds the hungriest now finishes in
+  336 candidates. Still worth raising when a result looks larger than it should —
+  a system with more processes than 2PC has more schedule to search.
 
 Returns the minimal trace *as executed*, verified to replay strictly. `verified =>
 false` means the search found something smaller but it did not survive strict

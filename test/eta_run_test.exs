@@ -207,6 +207,93 @@ defmodule DstRunTest do
     end
   end
 
+  describe "pinned ids" do
+    # What `eta_sched:pin/2` exists for. An id used to mean "the Nth process this
+    # run adopted", so deleting the operation that created the first one shifted
+    # every id behind it and the surviving `{step, Id}` entries named strangers.
+    # That is invisible in a run and ruinous in a shrink, which does nothing but
+    # delete entries and replay what is left.
+
+    # Ops keyed to the ids they created. Each `eta_2pc` op carries its own
+    # transaction, so the op term is a key rather than a bucket — asserted below
+    # rather than assumed.
+    defp ops_created(trace) do
+      for e <- trace,
+          {:op, op} <- [@run.action(e)],
+          @run.created(e) != [],
+          into: %{},
+          do: {op, @run.created(e)}
+    end
+
+    defp steps(trace), do: Enum.count(trace, &match?({:step, _}, @run.action(&1)))
+
+    test "deleting an operation does not rename the processes the rest of the trace names" do
+      for seed <- [3, 7, 9] do
+        original = run(seed)
+
+        {before, [leading | rest]} =
+          Enum.split_while(original.trace, &(!match?({:op, _}, @run.action(&1))))
+
+        # Non-vacuity: the deleted operation has to have created somebody, or
+        # there was never anything to renumber.
+        assert @run.created(leading) != []
+
+        kept = ops_created(rest)
+        assert map_size(kept) == Enum.count(rest, &match?({:op, _}, @run.action(&1)))
+
+        executed =
+          @run.replay(
+            @sut,
+            before ++ rest,
+            Map.merge(@opts, %{seed: seed, lenient: true})
+          )
+
+        got = ops_created(executed.trace)
+        common = for op <- Map.keys(got), Map.has_key?(kept, op), do: op
+        assert common != [], "no operation survived the deletion, so nothing was tested"
+
+        for op <- common do
+          assert got[op] == kept[op],
+                 "seed #{seed}: #{inspect(op)} created #{inspect(got[op])} with the " <>
+                   "leading operation gone and #{inspect(kept[op])} with it there"
+        end
+
+        # And the consequence, which is the whole point: the surviving schedule
+        # still applies. Measured on these three seeds, steps that still ran of
+        # the steps behind the deleted operation: 76/105, 84/96 and 73/107 before
+        # ids were pinned, 101/105, 94/96 and 100/107 after.
+        assert steps(executed.trace) * 10 >= steps(rest) * 9,
+               "seed #{seed}: #{steps(executed.trace)} of #{steps(rest)} steps still ran"
+      end
+    end
+
+    test "a trace carrying no ids replays as one recorded before pinning did" do
+      # A trace with no record of who created whom — a hand-written one, or one
+      # from a build before entries carried ids. It cannot be pinned, there being
+      # nothing to pin, so it falls back to counting, and counting is what
+      # recorded it.
+      original = run(3)
+      legacy = Enum.map(original.trace, &@run.action/1)
+
+      replayed = @run.replay(@sut, legacy, Map.merge(@opts, %{seed: 3}))
+
+      assert replayed.outcome == original.outcome
+      assert Enum.map(replayed.trace, &@run.action/1) == legacy
+      assert replayed.skipped == 0
+    end
+
+    test "a strict replay reproduces the ids as well as the schedule" do
+      original = run(9)
+      replayed = @run.replay(@sut, original.trace, Map.merge(@opts, %{seed: 9}))
+
+      # `==` on the whole trace covers this, but not visibly: state the id half
+      # on its own so a failure says which half broke.
+      assert ops_created(replayed.trace) == ops_created(original.trace)
+      assert replayed.trace == original.trace
+      assert replayed.sched.unpinned == 0, "the replay adopted a process its trace did not name"
+    end
+  end
+
   describe "the check contract" do
     test "an invariant that calls into a suspended process is reported, not hung" do
       # The trap `eta_harness` warns about, made concrete. `check/1` here does what an
