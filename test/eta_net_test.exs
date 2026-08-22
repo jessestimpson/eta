@@ -1226,19 +1226,81 @@ defmodule EtaNetTest do
       assert %{noconnection: 0} = @net.stats()
     end
 
-    test "does not fire when it was established after the cut", %{a: a, b: b} do
-      # A synthetic DOWN marks the moment a link failed. A monitor created while
-      # the link is already down has no such moment behind it, so nothing is
-      # retroactively severed — and the next real failure of that link fires it.
+    test "created across a cut that is already in force fires noconnection at once",
+         %{a: a, b: b} do
+      # Not a replay of the old failure — nothing here is retroactive. It reports
+      # that the monitor could not be established, which is a fact about the
+      # topology now, and the BIF answers an unreachable node the same way. A
+      # system that monitors a peer to learn it is unreachable waits forever
+      # otherwise, and the run looks healthy while it does.
       :ok = @net.partition(:na, :nb)
+
       mref = monitor_from(a, b)
 
-      assert taken(a) == []
+      assert taken(a) == [{:DOWN, mref, :process, b, :noconnection}]
+      assert %{noconnection: 1} = @net.stats(), "the immediate DOWN went uncounted"
+    end
 
-      :ok = @net.heal_partition(:na, :nb)
+    test "created across a cut reports the name as Object, as the BIF does", %{a: a, b: b} do
+      # The shape the bug was found in: a system monitors {Name, Node} to find
+      # out whether that node is reachable at all.
+      :ok = @net.register_name(:nb, :srv, b)
       :ok = @net.partition(:na, :nb)
 
+      mref = monitor_from(a, {:srv, :nb})
+
+      assert taken(a) == [{:DOWN, mref, :process, {:srv, :nb}, :noconnection}]
+    end
+
+    test "created after a heal does not fire, and is armed for the next failure",
+         %{a: a, b: b} do
+      # The healed link is usable again, so this monitor establishes normally —
+      # and the terminal rule is about the monitor that already fired, not about
+      # the link.
+      :ok = @net.partition(:na, :nb)
+      :ok = @net.heal_partition(:na, :nb)
+
+      mref = monitor_from(a, b)
+      assert taken(a) == []
+
+      :ok = @net.partition(:na, :nb)
       assert taken(a) == [{:DOWN, mref, :process, b, :noconnection}]
+    end
+
+    test "created across a cut to a target on its own side does not fire", %{a: a} do
+      a2 = sink()
+      :ok = @net.place(:na, [a2])
+      :ok = @net.partition(:na, :nb)
+
+      _mref = monitor_from(a, a2)
+
+      assert taken(a) == []
+      assert %{noconnection: 0} = @net.stats()
+    end
+
+    test "created across a one-way cut does not fire", %{a: a, b: b} do
+      # `cut/2` is a channel that swallows traffic while both ends still believe
+      # the link is up, and it signals nothing. An end that believes the link is
+      # up would not observe a monitor failing to establish, so this one does not.
+      :ok = @net.cut(:na, :nb)
+
+      _mref = monitor_from(a, b)
+
+      assert taken(a) == []
+      assert %{noconnection: 0} = @net.stats()
+    end
+
+    test "created across a process-level cut does not fire", %{a: a, b: b} do
+      # Same rule, and the reason a pid cut never fires a monitor anywhere else
+      # here: it is a message fault, not a lost connection. Both directions, so
+      # that the failure cannot be blamed on the cut being one-way.
+      :ok = @net.cut(a, b)
+      :ok = @net.cut(b, a)
+
+      _mref = monitor_from(a, b)
+
+      assert taken(a) == []
+      assert %{noconnection: 0} = @net.stats()
     end
 
     test "fires only on the side that learns", %{a: a, b: b} do

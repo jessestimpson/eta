@@ -1184,16 +1184,40 @@ Exactly once, then it is gone, as a real one is:
   reason, reported by `eta_sched`. See `notify_exit/2`.
 - `{'DOWN', Ref, process, Object, noproc}` immediately, if the target is already
   dead when the monitor is created.
+- `{'DOWN', Ref, process, Object, noconnection}` immediately, if the link between
+  watcher and target is already down when the monitor is created.
 
 `Object` follows `erlang:monitor/2`: the pid for a pid, `{Name, node()}` for a
 registered name. `{tag, Tag}` in the options replaces `'DOWN'`, as it does for the
 BIF.
 
+The last two are one rule: **a monitor that cannot be established says so at
+once**, rather than never. The BIF answers both that way, and code that waits for
+a DOWN it will not otherwise get depends on it — an agent that monitors a peer to
+find out it is unreachable waits forever otherwise, and the run looks healthy
+while it does.
+
 **A `noconnection` DOWN is terminal.** Real Erlang does not re-arm a monitor
 after one, and neither does this: `heal_partition/3` resurrects nothing, and a
-system that wants to keep watching must monitor again. By the same rule a monitor
-created *while* a link is already cut is not retroactively severed — the DOWN
-marks the moment the link failed, and it has already passed.
+system that wants to keep watching must monitor again. The immediate
+`noconnection` above is not an exception to that, because it is not the old
+failure being replayed. Nothing here is retroactive. It reports the topology
+*now*, which is the same thing the BIF reports when it is asked to monitor across
+a connection it cannot make.
+
+**"Already down" means both directions cut at the node level** — the state
+`partition/3` leaves behind, and the only one that models a lost connection: real
+distribution has no one-way link failure, since either end's tick timing out
+tears the whole connection down. A one-way `cut/2`, and a `cut/2` between two
+*processes*, leave the link up by definition; a monitor created across one is
+established and fires nothing, which is the whole point of that fault. See
+`cut/2`.
+
+One approximation, and it is visible only through `learns`: this reads the
+topology, not who has noticed it. `partition/3` with `learns => a` leaves side B
+believing its peer is reachable, and a monitor B creates afterwards still gets
+the immediate `noconnection` — the cut is in the table, and B's ignorance of it
+is not.
 """.
 -endif.
 -spec monitor(process | port | time_offset, term()) -> reference().
@@ -1265,11 +1289,54 @@ simulate_monitor(Watcher, Target, Item, Opts) ->
     %% `eta_sched` reports every exit it sees, and every process that can be a
     %% target here is one it owns — `simulated_pair/2` requires both ends placed —
     %% so that report is the authority. Reading it asks the target for nothing.
-    case target_dead(Target) of
-        true -> fire(Mon, noproc);
+    case cannot_establish(Watcher, Target) of
+        {true, Reason} -> fire(Mon, Reason);
         false -> ok
     end,
     Ref.
+
+%% Why this monitor cannot be set up at all, if it cannot. Both answers are the
+%% same rule — the BIF reports "could not establish" at once rather than never —
+%% and both are facts about right now rather than events being replayed. See
+%% `monitor/2`.
+%%
+%% The link is asked about first, because that is the order reality has them in:
+%% across a severed connection the watcher cannot learn *anything* about the
+%% target, its having exited included, so `noconnection` is what it is told.
+cannot_establish(Watcher, Target) ->
+    case link_down(Watcher, Target) of
+        true ->
+            {true, noconnection};
+        false ->
+            case target_dead(Target) of
+                true -> {true, noproc};
+                false -> false
+            end
+    end.
+
+%% Whether the connection between two processes' nodes is down.
+%%
+%% Both directions, and node-level only. That is exactly the state `partition/3`
+%% leaves behind, and it is what a lost link *is*: real distribution has no
+%% one-way connection failure. A `cut/2` — one direction, or between two
+%% processes rather than two nodes — is documented as a channel that swallows
+%% traffic while both ends still believe the link is up, and a monitor that could
+%% not be established is precisely a thing an end that believes the link is up
+%% would not observe. So a cut fires nothing here, as it fires nothing anywhere
+%% else in this module.
+%%
+%% Attached processes are subject to it, for the reason `simulated_pair/2` gives:
+%% they are behind the same wire as everything else on their node, and `node_of/1`
+%% locates them like anything else.
+%%
+%% `kill_node/2` is not covered, because it records no cut — it kills. A monitor
+%% created on something it killed therefore answers `noproc` where real
+%% distribution would answer `noconnection` for a node that is not there. Both are
+%% immediate, so nothing waits on a DOWN that never comes, which is the failure
+%% this predicate exists to prevent; the reason differs, and closing that needs a
+%% record of which nodes are dead rather than merely empty.
+link_down(A, B) ->
+    node_cut(A, B) andalso node_cut(B, A).
 
 %% Whether a monitor's target has already exited.
 %%
