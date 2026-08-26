@@ -4,7 +4,7 @@
 
 Deterministic simulation testing for the BEAM.
 
-Pronounced like the Greek letter η, **AY-tuh**, not usually spelled out as E-T-A.
+(Said like the Greek letter η, **AY-tuh** or **EE-tuh**.)
 
 When your project's tests run, `eta` transforms your code via an Erlang
 `parse_transform` so that it can be driven by a special deterministic scheduler
@@ -39,8 +39,8 @@ This all happens at test time; the code that gets deployed to prod is untouched.
 
 ## Getting Started
 
-A system under test provides 6 callbacks (see `eta_harness`), and a run is one
-call:
+A system under test provides some **strictly deterministic** callbacks (see `eta_harness`), and a run is one
+call, with a seed. In this example the seed is `7`:
 
 ```erlang
 #{outcome := Outcome, trace := Trace} =
@@ -54,21 +54,15 @@ When a run fails, shrink it:
     eta_shrink:shrink(my_harness, Trace, #{seed => 7, max_ops => 25, preload => [my_app]}).
 ```
 
-The library ships with a [two-phase commit implementation as an example](test/support/eta_2pc.erl),
-and includes an optional bug that will break an invariant for demonstration
-purposes. We also provide a [walkthrough that implements an ABD Qurom Register](docs/06-a-journey-through-dst.md)
-and demonstrates the creation of a project from scratch.
+The seed produces the same trace each time, and the shrink reduces the size of that trace.
 
-A third example, [leader election by heartbeat lease](test/support/eta_elect.erl),
-is the one whose correctness is a statement about time: every deadline it has is
-a `gen_statem` state timeout. Its planted bug is a member that grants a vote it
-has already given away, and it does nothing at all until a cut link lets two
-members reach the same term — which is the case for injecting faults, written as
-three tests.
+`eta` includes some simple distributed systems in order to illustrate DST:
+
+1. A [two-phase commit implementation](test/support/eta_2pc.erl), which is used in `eta`'s own tests.
+2. An [ABD Qurom Register](docs/06-a-journey-through-dst.md), that is written as an end-to-end walkthrough.
+3. A [leader election by heartbeat lease](test/support/eta_elect.erl), for which correctness relies heavily on the clock, unlike the first two examples.
 
 ## Documentation
-
-The walkthrough is the manual, in 6 parts:
 
 1. [What DST is](docs/01-what-dst-is.md). Discusses the kinds of bugs we're
    looking for, how the technique works, and how your project implementation
@@ -92,7 +86,7 @@ be the internal specification for the `eta` project itself.
 
 ## Installation
 
-`eta` suggests setting up a separate build profile called `dst`.
+We suggest setting up a separate build profile called `dst`.
 
 ```elixir
 def deps do
@@ -100,7 +94,7 @@ def deps do
 end
 ```
 
-and in rebar3, a `dst` profile run as `rebar3 as dst eunit`.
+and in rebar3, a `dst` profile can run as `rebar3 as dst eunit`.
 
 Your modules don't include `eta.hrl` directly. They include a wrapper of your
 own, `include/myapp_eta.hrl`, which is what keeps `eta` out of every other
@@ -116,7 +110,7 @@ build:
 ```
 
 [Setting up a project](docs/02-setting-up.md) has the whole configuration for
-both build tools, and why it's shaped this way.
+both build tools, and the reasons for the design choices.
 
 ## Status
 
@@ -144,10 +138,8 @@ Early and under development.
 
 ## Etymology
 
-The name is short for **étalon**, the reference artifact a measurement is read
-against. Here that artifact is the seed: it names an execution, and every rerun
-is compared to it. `eta` is also what the library computes on every idle step,
-since the discrete-event loop does nothing but advance to the next deadline.
+The name is short for [**étalon**](https://en.wikipedia.org/wiki/Standard_(metrology)).
+You may also think of it as the **E**rlang **T**race [**A**ugur](https://en.wikipedia.org/wiki/Augur).
 
 ---
 
