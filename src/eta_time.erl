@@ -91,6 +91,11 @@ concurrently in the same node.
     disarm_after/2
 ]).
 
+%% What eta_transform rewrites `timer:sleep/1` to.
+-export([
+    sleep/1
+]).
+
 %% The same thing with a caller-chosen message — what `eta_statem` arms a
 %% `gen_statem` state time-out with.
 -export([
@@ -478,6 +483,42 @@ flush_after(Ref) ->
 
 -if(?DOCATTRS).
 -doc """
+What `eta_transform` rewrites `timer:sleep/1` to.
+
+A sleep is `receive after T -> ok end` inside OTP's `timer` module, where no
+transform of user code reaches — so the call site is rewritten instead, to
+this: the `after` rewrite applied to a receive with no other clauses. Arm
+through `arm_after/2`, wait for the delivery. Under a run the sleeper is
+correctly unrunnable until the virtual clock delivers the wakeup, so a
+60-second sleep costs microseconds and ends at a point the schedule chose.
+With no clock running, `arm_after/2` falls back to `erlang:send_after/3` and
+this is a real sleep.
+
+No disarm: the receive has one clause and always consumes the message.
+`infinity` arms nothing, so the receive blocks forever — which is
+`timer:sleep(infinity)` exactly. Exempt from `drop_p` like every self-armed
+deadline, and subject to `skew_ms` like every deadline; see `arm_after/2`.
+
+The one place this must not run is the driver's own process. The clock
+advances only to deadlines of processes the scheduler can step, so a sleep on
+the driver arms a deadline nothing will ever reach. That is the existing
+boundary rule — `execute/2` and `check/1` must not execute transformed
+blocking code — applied to one more form of blocking.
+""".
+-endif.
+-spec sleep(timeout()) -> ok.
+sleep(Timeout) when Timeout =:= infinity; is_integer(Timeout), Timeout >= 0 ->
+    Ref = make_ref(),
+    _ = arm_after(Timeout, Ref),
+    receive
+        {'$eta_after', Ref} -> ok
+    end;
+sleep(_Bad) ->
+    %% What the `receive ... after` inside `timer:sleep/1` raises on a bad value.
+    error(timeout_value).
+
+-if(?DOCATTRS).
+-doc """
 Arms a deadline a process sets for **itself**, delivered as `Msg`.
 
 `arm_after/2` with the message chosen by the caller instead of fixed, and the
@@ -544,8 +585,9 @@ Skew is applied at creation rather than at firing, so the deadline remains
 meaningful to `read_timer/1` and `cancel_timer/1`.
 
 **`drop_p` reaches `send_after/3` and `start_timer/3` only.** A deadline armed
-through `arm_after/2` — a rewritten `receive ... after`, or `eta_net:call/3`'s
-timeout — is skewed but never dropped; see `arm_after/2` for why. `skew_ms`
+through `arm_after/2` — a rewritten `receive ... after`, a rewritten
+`timer:sleep/1`, or `eta_net:call/3`'s timeout — is skewed but never dropped;
+see `arm_after/2` for why. `skew_ms`
 applies to everything, which is what makes it the knob for the tie between two
 timeouts written with the same number.
 """.

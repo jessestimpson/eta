@@ -206,6 +206,75 @@ defmodule DstTimeTest do
   end
 
   # ---------------------------------------------------------------------------
+  # timer:sleep/1
+  # ---------------------------------------------------------------------------
+
+  describe "timer:sleep/1" do
+    # `timer:sleep(T)` is `receive after T -> ok end` inside OTP's `timer`
+    # module, where the transform cannot reach — so the call site is rewritten
+    # to `eta_time:sleep/1` instead. These pin the three properties that make
+    # that rewrite safe: virtual under a clock, real without one, and resolved
+    # by the scheduler's own event loop with no special handling.
+
+    test "a 60s sleep resolves by advancing the clock, not by waiting" do
+      :ok = @time.start(%{start_ms: 0})
+      trace = new_trace()
+
+      {micros, _} =
+        :timer.tc(fn ->
+          @sut.sleeper(trace, 60_000)
+          Process.sleep(20)
+
+          assert @time.pending() == 1, "the sleep did not arm a virtual deadline"
+          assert @time.next_deadline() == 60_000
+          assert events(trace) == []
+
+          @time.advance_to_next()
+          Process.sleep(20)
+        end)
+
+      assert events(trace) == [{:slept, 60_000}],
+             "the sleeper observed the wrong elapsed time: #{inspect(events(trace))}"
+
+      assert micros < 1_000_000, "a virtual 60s sleep cost #{div(micros, 1000)}ms of real time"
+      :ets.delete(trace)
+    end
+
+    test "with no clock running, the rewritten sleep is a real sleep" do
+      refute @time.running()
+
+      t0 = System.monotonic_time(:millisecond)
+      assert @sut.nap(120) == :ok
+      elapsed = System.monotonic_time(:millisecond) - t0
+
+      assert elapsed >= 100, "the sleep did not actually elapse (#{elapsed}ms)"
+    end
+
+    test "the event loop resolves a sleeper with no special handling" do
+      :ok = @time.start(%{start_ms: 0})
+      trace = new_trace()
+
+      pid = @sut.sleeper(trace, 60_000)
+      Process.sleep(20)
+      assert @time.pending() == 1
+
+      sched = @sched.new(%{seed: 1}) |> @sched.register([pid])
+      sched = @sched.run(sched, 100, fn -> @time.advance_to_next() end)
+      steps = @sched.stats(sched).steps
+      @sched.release(sched)
+
+      assert events(trace) == [{:slept, 60_000}]
+      assert steps > 0, "the scheduler never stepped the woken sleeper"
+      :ets.delete(trace)
+    end
+
+    test "a bad timeout raises what timer:sleep/1 raises" do
+      assert catch_error(@time.sleep(-1)) == :timeout_value
+      assert catch_error(@time.sleep(:soon)) == :timeout_value
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Exit criterion — no wall-clock waiting
   # ---------------------------------------------------------------------------
 

@@ -13,7 +13,7 @@
 %% rewrite lived in a second `parse_transform`, since Mix cannot reliably order a
 %% module that names two.
 
--export([start/2, start_periodic/3, elapsed/1, both/2]).
+-export([start/2, start_periodic/3, elapsed/1, both/2, sleeper/2, nap/1]).
 
 %% A process that sets a one-shot timer and records when it fires, according to
 %% the clock it can see.
@@ -71,6 +71,22 @@ periodic(Trace, IntervalMs, Count) ->
 %% and not merely that timers fire.
 elapsed(Since) ->
     erlang:monotonic_time(millisecond) - Since.
+
+%% A process that sleeps, then reports the elapsed time on the clock it can
+%% see. `timer:sleep/1` is rewritten to `eta_time:sleep/1` by the call pass, so
+%% under a run this parks on a virtual deadline instead of the wall clock.
+sleeper(Trace, SleepMs) ->
+    spawn(fun() ->
+        Started = erlang:monotonic_time(millisecond),
+        ok = timer:sleep(SleepMs),
+        Now = erlang:monotonic_time(millisecond),
+        ets:insert(Trace, {erlang:unique_integer([monotonic]), {slept, Now - Started}})
+    end).
+
+%% The rewritten sleep in the caller's own process — for the inertness test,
+%% where no clock is running and it must behave as a real sleep.
+nap(SleepMs) ->
+    timer:sleep(SleepMs).
 
 %% Every source of real time in one function. `erlang:monotonic_time/1` is
 %% rewritten by the call pass, and the `receive ... after` by the timeout pass.
