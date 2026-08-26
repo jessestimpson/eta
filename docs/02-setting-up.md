@@ -1,9 +1,10 @@
 # Setting up a project
 
 This page covers the build configuration, the work of removing nondeterminism
-from your own system, and how to tell whether any of it worked. For a hands-on
-version of the same material, [A Journey Through DST](06-a-journey-through-dst.md)
-builds a project from an empty directory.
+from your own system, and how to tell whether any of it is working. If you'd
+rather learn by doing, [A Journey Through DST](06-a-journey-through-dst.md)
+builds a project from an empty directory and covers the same material along
+the way.
 
 ## AI disclosure
 
@@ -17,32 +18,33 @@ correct.
     |
     +-- eta_sched  runs one process at a time, choosing from the seeded RNG
     +-- eta_time   virtual clock; timers fire when the driver says so
-    +-- eta_log    what your system did, on the same timeline
+    +-- eta_log    a record of what your system did, on the same timeline
     +-- your harness   six callbacks (eta_harness)
 ```
 
-`eta_transform` is the other piece, a parse transform applied to the modules that
-make up the system under test. It rewrites their timer, clock and spawn calls to
-point at `eta_time` and `eta_sched` instead of `erlang`, and changes nothing
-else. You never name it directly; a module opts in by including one header.
+`eta_transform` is the other piece: a parse transform applied to the modules
+that make up the system under test. It rewrites their timer, clock, and spawn
+calls to point at `eta_time` and `eta_sched` instead of `erlang`, and changes
+nothing else. You never name it directly. A module opts in by including one
+header.
 
 `eta_run` owns the seed. Every choice comes from a single `rand` state seeded
-from it: which process to step, whether to inject a client operation or let the
-system make progress, and whatever your workload generator draws. At each
-iteration the driver does exactly one of 3 things. It steps a runnable process
-until it blocks, injects the next generated operation, or advances the clock to
-the next timer deadline. Then it checks your invariants against the frozen
-system.
+from it: which process to step, whether to inject a client operation or let
+the system make progress, and whatever your workload generator draws. At each
+iteration the driver does exactly 1 of 3 things: step a runnable process until
+it blocks, inject the next generated operation, or advance the clock to the
+next timer deadline. Then it checks your invariants against the frozen system.
 
 ## Build configuration
 
-2 decisions, and they're the ones to make before anything else: how a module
-opts in, and when that opt-in is switched on.
+There are 2 decisions to make before anything else: how a module opts in, and
+when that opt-in is switched on.
 
 ### Wrap the header in one of your own
 
-Every module that takes part in a simulation includes one header. Don't include
-`eta.hrl` directly. Write a wrapper of your own, `include/myapp_eta.hrl`:
+Every module that takes part in a simulation includes one header. Don't
+include `eta.hrl` directly. Write a wrapper of your own,
+`include/myapp_eta.hrl`:
 
 ```erlang
 -ifndef(MYAPP_ETA_HRL).
@@ -64,29 +66,28 @@ and your modules include that:
 -include("myapp_eta.hrl").
 ```
 
-That's the whole opt-in. Under a simulation build it brings the parse transform
-and the `?ETA_LOG` and `?ETA_LABEL` macros. Otherwise it brings nothing at all,
-so a module carrying it has no relationship to this library and ships unchanged.
+That's the whole opt-in. Under a simulation build the header brings in the
+parse transform and the `?ETA_LOG` and `?ETA_LABEL` macros. In any other
+build it brings nothing at all, and the module ships unchanged.
 
-`eta.hrl` is already conditional on the `DST` define and already expands to
-nothing without it, so what the wrapper buys you is one thing: the *include
-itself* is conditional, so a build without `DST` never goes looking for `eta`.
-That is the difference between a dependency your project can build without and
-one that has to be findable in every compilation of every environment. With the
-wrapper you can scope `eta` to the single profile that runs simulations, and a
-release build doesn't have it in the tree at all.
+Why the wrapper? `eta.hrl` is already guarded by the `DST` define and expands
+to nothing without it, but the `-include_lib` line still has to resolve. That
+would mean `eta` has to be findable in every compilation, including your
+release build. The wrapper makes the include itself conditional, so you can
+scope `eta` to the single profile that runs simulations and keep it out of
+your deployed app entirely.
 
-The `-else.` branch is not optional, and it's the reason the wrapper is a file
-rather than a line. `?ETA_LABEL` and `?ETA_LOG` are called from the modules you
-ship, so they have to expand to something when the real header isn't there.
-Match `eta.hrl`'s own definitions, above: `ok` and `0`. Neither one evaluates
-its argument, so anything you log must be free of side effects, and a variable
-used *only* inside one of these will be reported unused — bind it with a
-leading underscore.
+Don't skip the `-else.` branch. `?ETA_LABEL` and `?ETA_LOG` are called from
+modules you ship, so they have to expand to something when the real header
+isn't there. Match `eta.hrl`'s own definitions: `ok` and `0`. Neither macro
+evaluates its argument in this form, so anything you log must be free of side
+effects, and a variable used only inside one of these will be reported as
+unused. Bind it with a leading underscore.
 
 ### Run simulations from their own build profile
 
-**In Mix, a `dst` environment and a `mix dst` to enter it.** In `project/0`:
+**In Mix, a `dst` environment and a `mix dst` alias to enter it.** In
+`project/0`:
 
 ```elixir
       erlc_paths: erlc_paths(Mix.env()),
@@ -123,10 +124,9 @@ and:
     [dst: &dst/1]
   end
 
-  # `mix test` refuses to run in an environment that isn't :test unless MIX_ENV
-  # says so explicitly. `preferred_envs` above has already put us in :dst;
-  # this states it in the environment too, which is both true and what that
-  # check is asking for.
+  # `mix test` refuses to run in an environment that isn't :test unless
+  # MIX_ENV says so explicitly. `preferred_envs` above has already put us in
+  # :dst; this states it in the environment too.
   defp dst(args) do
     System.put_env("MIX_ENV", "dst")
     Mix.Task.run("test", args)
@@ -153,85 +153,72 @@ and:
  ]}.
 ```
 
-There is no bare `rebar3 dst`. An entry point that switches profile would have
-to be `{alias, [{dst, [{as, "dst eunit"}]}]}`, and rebar3 refuses `as` inside an
-alias — *"Namespace 'as' is forbidden"* — including via `do`. Wrap it in a
-`Makefile` target if you want a short spelling. `REBAR_PROFILE=dst rebar3 eunit`
-is the other native one; setting that variable from `rebar.config.script` does
-not work, because profiles are resolved before the script is consulted.
+There is no bare `rebar3 dst` equivalent. rebar3 refuses `as` inside an alias
+("Namespace 'as' is forbidden"), including via `do`, and setting
+`REBAR_PROFILE=dst` from `rebar.config.script` doesn't work because profiles
+are resolved before the script is consulted. `REBAR_PROFILE=dst rebar3 eunit`
+does work from the command line, or wrap `rebar3 as dst eunit` in a
+`Makefile` target if you want a short spelling.
 
 ### Why this shape
 
-**The define is a contract, not a convention.** Forget it and the header
-silently contributes nothing: no transform, so your timers stay on the real
-clock, and no logging. This library made exactly that mistake in its own build,
-and its example module went untransformed for a while without anything
-complaining. Put the define in before anything else, and put it in exactly one
-profile so there's one place to check.
+**Don't forget the `DST` define.** Without it, the header silently contributes
+nothing: no transform, so your timers stay on the real clock, and no logging.
+We made exactly this mistake in `eta`'s own build, and an example module went
+untransformed for a while without anything complaining. Put the define in
+before anything else, and put it in exactly one profile so there's one place
+to check.
 
-**A dedicated profile, not the whole test environment.** An earlier version of
-this page recommended the opposite, and the argument for it is real: `eta_time`
-falls back to the real `erlang` functions whenever no virtual clock is running,
-so a transformed module behaves outside a simulation exactly as it did before,
-and compiling your ordinary suite with the transform on demonstrates that
-continuously. We now think the separation is worth more:
+**Why a dedicated profile instead of the test environment?** There's a real
+argument for reusing `:test`: `eta_time` falls back to the real `erlang`
+functions whenever no virtual clock is running, so a transformed module
+behaves normally outside a simulation, and compiling your ordinary suite with
+the transform on demonstrates that continuously. We think the separation is
+worth more:
 
-- Only one simulation can run per VM, since `eta_time` and `eta_log` keep state
-  in named ETS tables. Simulation tests have to be `async: false`. Keeping them
-  in their own entry point means that constraint never reaches the suite you
-  run all day.
-- Your ordinary tests then exercise the modules you actually ship. A
-  transformed module is close to the shipped one, but it isn't it.
-- `eta` stays out of every build but this one, which is what the header
-  wrapper was for.
-- Toggling a define or editing a parse transform doesn't reliably recompile the
-  modules that depend on it ([page 5](05-gotchas.md)). Two environments means
-  two build directories, so the 2 builds can't hand each other a stale module.
+- Only one simulation can run per VM, because `eta_time` and `eta_log` keep
+  state in named ETS tables. Simulation tests have to be `async: false`.
+  Keeping them in their own entry point means that constraint never reaches
+  the suite you run all day.
+- Your ordinary tests exercise the modules you actually ship. A transformed
+  module is close to the shipped one, but it isn't the same module.
+- `eta` stays out of every build except the simulation one, which is what the
+  wrapper header was for.
 
 **Guard per module, not per application.** You won't want the transform
-everywhere, for reasons in "the transform boundary" below.
+everywhere. See "the transform boundary" below.
 
 ## Find the nondeterminism you can't schedule
 
-Before any of the framework matters, take an inventory of everything your system
-touches that the scheduler doesn't own. Ports, NIFs, sockets, timers inside
-dependencies, and anything that talks to a service over a network.
+Before any of the framework matters, take an inventory of everything your
+system touches that the scheduler doesn't own: ports, NIFs, sockets, timers
+inside dependencies, and anything that talks to a service over a network.
 
-For `dgen_registry` that was the database. Its transactions expire on the *real*
-clock, so a process suspended mid-transaction dies with `tooslow`: the scheduler
-freezes the process and the database gives up on it. Our only option was to
-build a substitute that could meet the determinism requirements, a pure-Erlang
-in-memory implementation of the same backend behaviour.
+For [`dgen_registry`](https://github.com/foundationdb-beam/dgen/blob/main/src/dgen_registry.erl) that was the database. Its transactions expire on the
+*real* clock, so a process suspended mid-transaction dies with `tooslow`: the
+scheduler freezes the process and the database gives up on it. Our only
+option was to build a substitute that could meet the determinism
+requirements, a pure-Erlang in-memory implementation of the same backend
+behaviour.
 
-That is the expensive part of adopting DST, and it's work only you can do.
+This is the expensive part of adopting DST, and it's work only you can do.
 Estimate it before you commit.
 
 ## The transform boundary
 
-Not every module should be transformed, and where you draw the line is a design
-decision you'll live with.
+Not every module should be transformed, and where you draw the line is a
+design decision you'll live with. Transform the modules that *are* the
+system, the ones whose timers, spawns, and clock reads belong under the
+schedule's control.
 
-Transform the modules that *are* the system, the ones whose timers, spawns and
-clock reads belong under the schedule's control. For the registry that's 6
-modules: the member, elector and connector processes, plus the generic server,
-queue and transaction machinery underneath them.
+Your system is likely to have a client-facing interface. It is best practice to
+avoid transforming such modules, as they will be driven by the harness, and
+may include real-clock timeouts, for example.
 
-Leave client-facing modules alone if they hold polling loops. The registry's
-public API module has a function that waits for the local node to become ready
-by polling with `timer:sleep/1`. Under a frozen clock that loop never
-terminates, so the module stays outside the boundary on purpose.
+## Qualify your module calls
 
-That costs you something. An untransformed client's `gen_server:call` timeout is
-on the real clock, so when it fires is decided by wall clock rather than by the
-schedule. Our workaround is to configure it high enough that it can't fire
-during a run, which means the behaviour it guards isn't exercised at all. That's
-an acknowledged gap, not a solved problem. Write it down somewhere, or somebody
-will "fix" the boundary by transforming one more module and spend a day on the
-resulting hang.
-
-## Qualify your time calls
-
-The transform rewrites qualified calls, and only qualified calls:
+Qualify your calls with the module name itself; don't rely on imports. The
+parse transform will only rewrite fully module-qualified calling conventions:
 
 | From | To |
 |---|---|
@@ -243,29 +230,23 @@ The transform rewrites qualified calls, and only qualified calls:
 | `erlang:system_time/0,1` | `eta_time:system_time/0,1` |
 | `erlang:timestamp/0` | `eta_time:timestamp/0` |
 | `os:system_time/0,1`, `os:timestamp/0` | `eta_time:*` |
+| `timer:sleep/1` | `eta_time:sleep/1` |
 | `erlang:spawn/1,3`, `spawn_link`, `proc_lib` equivalents | `eta_sched:*` |
 | `gen_server:start/3,4`, `start_link/3,4`, `start_monitor/3,4` | `eta_sched:*` |
 | the same six on `gen_statem` | `eta_sched:statem_*` |
 
-A bare `monotonic_time()` is left alone, and has to be. None of these functions
-are auto-imported, so an unqualified call names something your own module
-defines, and rewriting it would break the module. Code that wants to be
-simulated has to qualify its time calls, which is the prevailing style anyway.
-
-`timer:sleep/1` isn't rewritten either, deliberately, and a process that sleeps
-under simulation hangs forever. [Page 5](05-gotchas.md) has why.
-
 The spawn rewrites matter more than they look. A child spawned with a plain
-`erlang:spawn` runs briefly on the real scheduler before anything suspends it.
-`eta_sched:spawn/1` starts it blocked on a token instead, so there's no window
-at all.
+`erlang:spawn` runs briefly on the real scheduler before anything suspends
+it. `eta_sched:spawn/1` starts it blocked on a token instead, so there's no
+window at all.
 
 ## Make your state readable
 
 Invariants run against a system in which every process is suspended, so an
-invariant can't call into one. [Writing a system under test](04-writing-a-system-under-test.md)
-makes the full argument. The setup step is a second attribute on the modules
-whose state the invariants need:
+invariant can't call into one.
+[Writing a system under test](04-writing-a-system-under-test.md) makes the
+full argument. The setup step is a second attribute on the modules whose
+state the invariants need:
 
 ```erlang
 -include("myapp_eta.hrl").
@@ -273,31 +254,30 @@ whose state the invariants need:
 ```
 
 The transform republishes those fields into the process dictionary on every
-`gen_server` or `gen_statem` callback return, and `eta_observe:read/1` reads them back from
-outside. That works while the process is suspended, in a couple of microseconds,
-whatever the mailbox depth:
+`gen_server` or `gen_statem` callback return, and `eta_observe:read/1` reads
+them back from outside. That works while the process is suspended, in a
+couple of microseconds, whatever the mailbox depth:
 
 ```erlang
 #{leader := L, epoch := E} = eta_observe:read(my_server).
 ```
 
-Publishing on every return is what makes staleness impossible. There's no
-assignment site anybody can forget.
+Because the fields are republished on every return, they can never be stale.
+There's no assignment site anybody can forget.
 
-The attribute takes 2 forms and neither of them guesses. `{RecordName, Fields}`
-publishes those fields as a map, and naming the record is what lets a field that
-doesn't exist be a compile error rather than a silently wrong offset. `all`
-publishes whatever the callback returned, whatever its shape, which is usually
-the wrong trade since `read/1` copies what was published and runs after every
-step.
+The attribute takes 2 forms. `{RecordName, Fields}` publishes those fields as
+a map, and naming the record means a field that doesn't exist is a compile
+error rather than a silently wrong offset. `all` publishes whatever the
+callback returned, whatever its shape. Prefer the first form: `read/1` copies
+what was published, and it runs after every step.
 
 It's an ordinary module attribute the compiler ignores, so it's inert without
 the transform.
 
 ## A first run
 
-With a system under test written, which is the [next page](03-two-phase-commit.md),
-a run is one call:
+With a system under test written, which is the
+[next page](03-two-phase-commit.md), a run is one call:
 
 ```erlang
 #{outcome := Outcome, trace := Trace, steps := Steps} =
@@ -319,73 +299,66 @@ The options you're likely to touch:
 | `preload` | `[]` | Applications to load before the run starts. **Name yours.** |
 | `log` | `true` | Collect a `eta_log` record of the run |
 
-3 of those deserve more.
-
-**`preload` is the one to set on your first run.** Loading a module on demand is
-a synchronous call into `code_server`, which the scheduler doesn't own, so a
+**Set `preload` on your very first run.** Loading a module on demand is a
+synchronous call into `code_server`, which the scheduler doesn't own, so a
 scheduled process that reaches cold code blocks on something outside the
 schedule. Name your own application. The failure it prevents is on
 [page 5](05-gotchas.md), and it's worse than it sounds.
 
-**`settle_steps` is what lets a system with periodic timers finish.** A
-heartbeat means "nothing runnable and nothing pending" never happens, so without
-a bounded settle phase every run ends by exhausting the step budget and gets
-reported as an error. It isn't dead time either: it's the only part of a run
-where the invariants are checked with no client traffic at all.
+**`settle_steps` is what lets a system with periodic timers finish.** With a
+heartbeat, "nothing runnable and nothing pending" never happens, so without a
+bounded settle phase every run ends by exhausting the step budget and gets
+reported as an error. The settle phase is also useful in its own right: it's
+the only part of a run where the invariants are checked with no client
+traffic at all.
 
-**`quiet_p` is the probability of letting the clock advance rather than
-injecting work when nothing is runnable.** The obvious driver always injects
-there, which puts a whole class of defect out of reach, because the system is
-never left alone with only its own timers for company. It's less a tuning knob
-than the thing that makes those bugs reachable at all.
+**`quiet_p` is the chance of letting the clock advance instead of injecting
+work when nothing is runnable.** A driver that always injects there would put
+a whole class of defect out of reach, because the system would never be left
+alone with only its own timers. This option is what makes those bugs
+reachable at all.
 
-## Checking that any of this works
+## Verifying your system is well-configured
 
-3 measurements, in order of how much they tell you.
-
-**The run's own accounting.**
+**Assert the run's own accounting.**
 
 ```erlang
 ok = eta_run:audit(eta_run:run(my_harness, Opts)).
 ```
 
-Several fields in a result mean "part of this interleaving was decided by wall
-clock rather than by the schedule", and a run with any of them set is one whose
-seed won't reproduce. `audit/1` checks them, and keeps checking them as more get
-added:
+`eta_run:audit/1` asserts a handful of measurements, and it is useful to
+run it in your test suite.
 
 - `modules_loaded` - code loaded mid-run, so a scheduled process called into
   `code_server`. Fix with `preload`.
 - `sched.cold_code` - a process still *waiting* on `code_server` when the run
-  ended, so what looked like quiescence wasn't. Same fix, and each entry names
-  the line that reached the cold module.
+  ended, so what looked like quiescence wasn't. Same fix, and each entry
+  names the line that reached the cold module.
 - `sched.adopted_late` - processes that ran before the scheduler owned them.
   Fix by spawning through `eta_run:spawn_op/1`.
-- `sched.timeouts` - steps that ended without the process reaching a receive, so
-  it was suspended wherever it happened to be.
-- `stray_timers` - timers held by a process the scheduler doesn't own, or that
-  has died. See [page 5](05-gotchas.md).
+- `sched.timeouts` - steps that ended without the process reaching a receive,
+  so it was suspended wherever it happened to be.
+- `stray_timers` - timers held by a process the scheduler doesn't own, or
+  that has died. See [page 5](05-gotchas.md).
 
-It answers `{suspect, Reasons}` rather than an error, because the run happened
-and its violation, if any, is real. What you can't do is trust the seed to give
-it back. Assert on it next to your invariants.
+It answers `{suspect, Reasons}` rather than an error, because the run did
+happen and its violation, if any, is real. What you can't do is trust the
+seed to give it back. Assert on it next to your invariants.
 
-
-
-**That a seed reproduces itself.** This is the single most valuable assertion in
-the whole setup.
+**Check if a seed reproduces itself.** This is the single most valuable assertion
+in the whole setup.
 
 ```erlang
 Traces = [maps:get(trace, eta_run:run(my_harness, Opts#{seed => 3})) || _ <- lists:seq(1, 5)],
 1 = length(lists:usort(Traces)).
 ```
 
-Run it early, on several seeds, and again whenever you touch anything. When it
-fails, pay attention to *which* runs differ rather than how many distinct traces
-came out. A grouping of `[[1], [2,3,4,5]]` means something very specific and
-very fixable, as [page 5](05-gotchas.md) explains.
+Run it early, on several seeds, and again whenever you touch anything. When
+it fails, pay attention to *which* runs differ rather than how many distinct
+traces came out. A grouping of `[[1], [2,3,4,5]]` means something very
+specific and very fixable, as [page 5](05-gotchas.md) explains.
 
-**That a recorded trace replays.**
+**Confirm that a recorded trace replays.**
 
 ```erlang
 Original = eta_run:run(my_harness, Opts),
@@ -393,25 +366,25 @@ Replayed = eta_run:replay(my_harness, maps:get(trace, Original), Opts),
 0 = maps:get(skipped, Replayed).
 ```
 
-That's a different claim from the second one. It exercises `replay/3` rather
-than `run/2`, and conflating the 2 let a real bug live in this framework for
-months. Test both.
+This is a different claim from the second one. It exercises `replay/3` rather
+than `run/2`.
 
 ## Reading a result
 
-Don't print one whole. A 20-operation run produces a few hundred trace entries,
-so a shell renders the schedule and elides the fields you wanted underneath it.
+Don't print one whole. Even the small two-phase commit example produces a
+123-entry trace from a 25-operation run, so a shell renders the schedule and
+elides the fields you wanted underneath it.
 
 ```erlang
-#{outcome := ok, steps := 97, trace_length := 213} =
-    eta_run:summary(eta_run:run(my_harness, Opts)).
+#{outcome := ok, steps := 96, trace_length := 123} =
+    eta_run:summary(eta_run:run(eta_2pc, #{seed => 7, max_ops => 25, max_steps => 20000})).
 ```
 
-The trace is for later, once you have a failure worth shrinking, and even then
-it isn't what you read. `{step, 8}` records which process the scheduler chose
-and says nothing about what that process did. `eta_log` records what your
-*system* did on the same timeline, with your processes named. That's the thing
-to read, and [page 3](03-two-phase-commit.md) shows one.
+The trace is for later, once you have a failure worth shrinking, and even
+then it isn't what you read. `{step, 8}` records which process the scheduler
+chose and says nothing about what that process did. `eta_log` records what
+your *system* did on the same timeline, with your processes named. That's the
+thing to read, and [page 3](03-two-phase-commit.md) shows one.
 
 ## Next
 

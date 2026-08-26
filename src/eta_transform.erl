@@ -131,6 +131,7 @@ simulation.
 | `erlang:timestamp/0` | `eta_time:timestamp/0` |
 | `os:system_time/0,1` | `eta_time:system_time/0,1` |
 | `os:timestamp/0` | `eta_time:timestamp/0` |
+| `timer:sleep/1` | `eta_time:sleep/1` |
 
 ## Sending
 
@@ -229,10 +230,12 @@ defines itself — rewriting it would break the module. Code that wants to be
 simulated must therefore qualify its time calls, which is the prevailing style
 anyway.
 
-`timer:sleep/1` is deliberately **not** rewritten. Sleeping is not a timer; a
-process that sleeps is neither runnable nor blocked on a receive, so it cannot be
-scheduled. Code under simulation should not sleep at all, and silently virtualising
-it would hide that rather than surface it.
+`timer:sleep/1` **is** rewritten, to `eta_time:sleep/1`. It went unrewritten for
+a while on the argument that code under simulation should not sleep and a hang
+would surface the smell — but the hang is not reliably loud (a sleeper is simply
+never runnable, so a run can end at what looks like quiescence), and a sleep is
+`receive after T -> ok end` one module away, the exact dependence the `after`
+pass exists to virtualise. A sleep in an *untransformed* module still hangs.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -264,6 +267,10 @@ it would hide that rather than surface it.
     {os, system_time, 0} => eta_time,
     {os, system_time, 1} => eta_time,
     {os, timestamp, 0} => eta_time,
+    %% A sleep is `receive after T -> ok end` inside OTP's `timer` module, where
+    %% no transform of user code reaches — so the call site is rewritten instead.
+    %% See `eta_time:sleep/1`, including why it must not run on the driver.
+    {timer, sleep, 1} => eta_time,
     %% Spawning. A child spawned plainly runs on the real scheduler until
     %% `set_on_spawn` adoption catches it; `eta_sched:spawn/1` starts it blocked
     %% instead, so there is no window. See `eta_sched:spawn/1`.

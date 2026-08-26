@@ -338,7 +338,9 @@ would virtualise a sleep too. Whether it *should* is a separate question, and th
 answer differs on either side of the transform boundary: a sleep inside the SUT
 wants a virtual timer, while a sleep in the driver — `dgen_registry:await_ready/2`
 — wants to pump the scheduler instead, since the driver is the process that has to
-advance the clock. Not built; recorded so the reasoning is not rediscovered.
+advance the clock. *Since built:* `timer:sleep/1` now rewrites to
+`eta_time:sleep/1` — `arm_after/2` plus a one-clause receive — which settles the
+SUT side. A sleep in the driver stays real by the transform boundary, as before.
 
 #### Wiring a real system in: what it takes
 
@@ -1543,8 +1545,8 @@ The version to avoid is the middle one: per-run tables behind a single global
 - Should the virtual clock also drive `dgen_transaction`'s commit worker, or should
   the sim backend simply complete commits synchronously under the scheduler?
 - `dgen_mem` has no retry backoff where FoundationDB backs off exponentially with
-  jitter. A real `timer:sleep/1` is the wrong answer — a sleeping process is
-  neither runnable nor blocked on a receive, so `eta_sched` cannot step it — so a
-  backoff worth having is one the scheduler drives. Left out until a workload is
-  observed to need it; the timeouts that prompted the question turned out to be the
-  watch-anchoring bug instead.
+  jitter. A backoff worth having is one the scheduler drives — which
+  `timer:sleep/1` in a transformed module now is, since it rewrites to
+  `eta_time:sleep/1`. Left out until a workload is observed to need it; the
+  timeouts that prompted the question turned out to be the watch-anchoring bug
+  instead.

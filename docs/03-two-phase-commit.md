@@ -1,12 +1,13 @@
 # A worked example: two-phase commit
 
 `eta` ships with a small two-phase commit implementation as an example system
-under test. It lives in `test/support/eta_2pc*.erl`: about 170 lines of protocol
-plus 150 of harness, with a bug planted in it that only an unlucky interleaving
-reveals.
+under test. It lives in `test/support/eta_2pc*.erl`: about 170 lines of
+protocol plus 150 of harness, with a bug planted in it that only an unlucky
+interleaving reveals.
 
-This page reads that example. If you'd rather build something from scratch,
-[A Journey Through DST](06-a-journey-through-dst.md) does that instead.
+This page reads through that example. If you'd rather build something from
+scratch, [A Journey Through DST](06-a-journey-through-dst.md) does that
+instead.
 
 ## AI disclosure
 
@@ -15,18 +16,18 @@ correct.
 
 ## The protocol
 
-A coordinator wants a group of participants to agree on a transaction. It asks
-each one to *prepare*, and each votes `yes` or `no`. If every vote is `yes` the
-coordinator decides `commit`, otherwise `abort`, and it tells everyone. The
-property that has to hold is **atomicity**: no 2 participants may reach opposite
-conclusions about the same transaction.
+A coordinator wants a group of participants to agree on a transaction. It
+asks each one to *prepare*, and each votes `yes` or `no`. If every vote is
+`yes` the coordinator decides `commit`, otherwise `abort`, and it tells
+everyone. The property that has to hold is **atomicity**: no 2 participants
+may reach opposite conclusions about the same transaction.
 
 3 processes vote, 1 decides, and a client waits for the answer.
 
 ## The participants
 
-A participant is an ordinary `gen_server` with no timers, so it needs no parse
-transform at all:
+A participant is an ordinary `gen_server` with no timers, so it needs no
+parse transform at all:
 
 ```erlang
 handle_cast({prepare, TxId, Coordinator}, St = #{tab := Tab, index := Index}) ->
@@ -40,25 +41,25 @@ handle_cast({prepare, TxId, Coordinator}, St = #{tab := Tab, index := Index}) ->
     end;
 ```
 
-A participant's *plan*, meaning what it will vote for a given transaction, isn't
-decided by the participant. The driver writes it into a shared ETS table before
-the transaction starts and the participant looks it up, which makes the workload
-part of the seeded, replayable state rather than something each process invents
-for itself.
+A participant's *plan*, meaning what it will vote for a given transaction,
+isn't decided by the participant. The driver writes it into a shared ETS
+table before the transaction starts and the participant looks it up. This
+makes the workload part of the seeded, replayable state rather than something
+each process invents for itself.
 
-`stall` means the participant never votes. That case exists to put the virtual
-clock on the critical path: with one participant silent, the only thing that can
-resolve the transaction is the coordinator's prepare timeout.
+`stall` means the participant never votes. That case exists to put the
+virtual clock on the critical path: with one participant silent, the only
+thing that can resolve the transaction is the coordinator's prepare timeout.
 
 Everything the participant decides also goes into that table rather than into
 its `gen_server` state, because the atomicity invariant has to read it while
-every one of these processes is suspended. `eta_observe` would also make that
-readable, and choosing between the 2 comes up on every system. Our rule of
-thumb: **if the system already keeps the state somewhere readable, read it
-there. If the state exists only inside a process, publish it.** The table wins
-here because the driver has to write plans into it anyway, and because an
-accumulating history is the wrong shape for `eta_observe`, which publishes a
-snapshot of current fields.
+every one of these processes is suspended. `eta_observe` could also make that
+state readable, and the choice between the 2 comes up on every system. Our
+rule of thumb: **if the system already keeps the state somewhere readable,
+read it there. If the state exists only inside a process, publish it.** The
+table wins here because the driver has to write plans into it anyway, and
+because an accumulating history is the wrong shape for `eta_observe`, which
+publishes a snapshot of current fields.
 
 ## The coordinator, and the timer
 
@@ -78,23 +79,23 @@ handle_call({run_tx, TxId}, From, St) ->
 ```
 
 Under a simulation build the header brings the parse transform, so that
-`erlang:send_after/3` becomes `eta_time:send_after/3`. Under a release build it
-brings nothing and the line ships as written.
+`erlang:send_after/3` becomes `eta_time:send_after/3`. Under a release build
+it brings nothing and the line ships as written.
 
 This module lives inside `eta`'s own test suite, so it includes `eta.hrl`
-directly. In your project, include a wrapper header of your own instead, so that
-builds without `DST` don't need `eta` on the path at all.
+directly. In your project, include a wrapper header of your own instead, so
+that builds without `DST` don't need `eta` on the path at all.
 [Setting up a project](02-setting-up.md) has it.
 
 30 seconds is long enough that the timeout never fires by accident and short
-enough to be interesting, and it costs nothing because it's virtual. When every
-participant has stalled and no process is runnable, the driver advances the
-clock straight to that deadline and the run continues.
+enough to be interesting, and it costs nothing because it's virtual. When
+every participant has stalled and no process is runnable, the driver advances
+the clock straight to that deadline and the run continues.
 
 ## The planted bug
 
-The coordinator has a second mode, selectable by config, in which it decides on
-the first vote to *arrive* rather than waiting for all of them:
+The coordinator has a second mode, selectable by config, in which it decides
+on the first vote to *arrive* rather than waiting for all of them:
 
 ```erlang
 on_vote(TxId, _Index, Vote, _Tx, St = #{mode := first_vote_wins}) ->
@@ -106,11 +107,11 @@ on_vote(TxId, _Index, Vote, _Tx, St = #{mode := first_vote_wins}) ->
     {noreply, decide(TxId, Decision, St)};
 ```
 
-Most of the time this behaves correctly. If a `no` arrives first the transaction
-aborts. If every vote is `yes` it commits. Either way everybody agrees. The
-defect is visible only when a `yes` wins the race and a `no` arrives afterwards,
-and even then only because a participant that voted `no` refuses to commit
-regardless of what it's told:
+Most of the time this behaves correctly. If a `no` arrives first the
+transaction aborts. If every vote is `yes` it commits. Either way everybody
+agrees. The defect is visible only when a `yes` wins the race and a `no`
+arrives afterwards, and even then only because a participant that voted `no`
+refuses to commit regardless of what it's told:
 
 ```erlang
 Final =
@@ -123,17 +124,21 @@ Final =
 
 That refusal converts a wrong decision into a *visible* atomicity violation.
 Without it the coordinator would be quietly wrong and every participant would
-agree with it, which is a nastier class of bug and one this example doesn't try
-to model.
+agree with it, which is a nastier class of bug and one this example doesn't
+try to model.
 
 So reaching the defect needs at least one `no` vote in a transaction, plus a
-schedule in which a `yes`-voting participant is stepped before the `no`-voting
-one. The generator draws `no` about a fifth of the time per participant. The
-rest is the scheduler's job.
+schedule in which a `yes`-voting participant is stepped before the
+`no`-voting one. The generator draws `no` about a fifth of the time per
+participant. The rest is the scheduler's job.
 
 ## The harness
 
-6 required callbacks, `init/2` through `terminate/1`, and one optional.
+6 required callbacks, `init/2` through `terminate/1`, and 2 optional. This
+example uses one of the optional ones, `labels/1`. The other, `check_final/2`,
+is for invariants that only hold once the system has stopped being driven;
+two-phase commit doesn't need it, and
+[page 4](04-writing-a-system-under-test.md) covers it.
 
 ### init/2
 
@@ -150,15 +155,16 @@ init(Seed, Config) ->
            clients => [], next_tx => 1, plan => maps:get(plan, Config, random)}}.
 ```
 
-The table is `public` because 3 different kinds of process touch it: the driver
-writes plans, the participants write their states, and the invariant reads all
-of it.
+The table is `public` because 3 different kinds of process touch it: the
+driver writes plans, the participants write their states, and the invariant
+reads all of it.
 
 **`init/2` has to return with the system quiescent.** Not merely started, and
-not merely ready, but idle. Anything still in flight when the driver takes over
-ran on the real scheduler, outside the schedule. For two-phase commit that's
-free, since `start_link` returns once `init/1` has run. For a real cluster it
-isn't, and [page 4](04-writing-a-system-under-test.md) covers what it takes.
+not merely ready, but idle. Anything still in flight when the driver takes
+over ran on the real scheduler, outside the schedule. For two-phase commit
+that's free, since `start_link` returns once `init/1` has run. For a real
+cluster it isn't, and [page 4](04-writing-a-system-under-test.md) covers what
+it takes.
 
 ### processes/1
 
@@ -168,13 +174,13 @@ processes(#{coordinator := C, participants := Ps, clients := Clients}) ->
 ```
 
 The driver consults this after every operation, so processes an operation
-creates get picked up. Pids it already knows are ignored, so returning the whole
-set every time is both correct and expected.
+creates get picked up. Pids it already knows are ignored, so returning the
+whole set every time is both correct and expected.
 
-**The order is part of the contract.** `eta_sched` assigns ids in registration
-order and the trace records ids, so a list that comes out differently between
-runs makes the same seed pick different processes. The resulting trace
-difference looks exactly like a scheduling bug.
+**The order is part of the contract.** `eta_sched` assigns ids in
+registration order and the trace records ids, so a list that comes out
+differently between runs makes the same seed pick different processes. The
+resulting trace difference looks exactly like a scheduling bug.
 
 ### generate/2
 
@@ -195,16 +201,17 @@ vote_for(Roll) when Roll < 0.90 -> no;
 vote_for(_Roll) -> stall.
 ```
 
-Draw from the `rand` state you're handed and return the advanced state. Drawing
-entropy from anywhere else, like `rand:uniform/1`, `erlang:unique_integer/0` or
-the clock, breaks replay silently.
+Draw from the `rand` state you're handed and return the advanced state.
+Drawing entropy from anywhere else, like `rand:uniform/1`,
+`erlang:unique_integer/0`, or the clock, breaks replay silently.
 
-Votes are mostly `yes` so that transactions usually commit and the interesting
-cases stay rare enough that the scheduler has to go looking for them.
+Votes are mostly `yes` so that transactions usually commit and the
+interesting cases stay rare enough that the scheduler has to go looking for
+them.
 
 A `plan` config option pins the votes to a fixed list, which is how a test
-isolates the schedule as the only variable. Same votes, different seed, and any
-change in outcome is the interleaving.
+isolates the schedule as the only variable. Same votes, different seed, and
+any change in outcome is the interleaving.
 
 ### execute/2
 
@@ -220,21 +227,22 @@ execute({run_tx, TxId, Plan}, Sut = #{tab := Tab, coordinator := Coordinator}) -
     Sut#{clients := [Client | maps:get(clients, Sut)], next_tx := TxId + 1}.
 ```
 
-**`execute/2` must not block.** Every process the scheduler owns is suspended,
-so a synchronous call from the driver into one of them is never answered.
-Operations are issued by spawning a process to perform them, which is the right
-model anyway: the client is part of the concurrent system, and the next
-`processes/1` call picks it up and interleaves it like everything else.
+**`execute/2` must not block.** Every process the scheduler owns is
+suspended, so a synchronous call from the driver into one of them is never
+answered. Operations are issued by spawning a process to perform them, which
+is the right model anyway: the client is part of the concurrent system, and
+the next `processes/1` call picks it up and interleaves it like everything
+else.
 
 The spawn goes through `eta_run:spawn_op/1` rather than `spawn/1`. The driver
-isn't traced, so a process it creates isn't adopted until the driver registers
-it, and in that window the new process runs free. 2 clients created by
-operations injected close together race each other to the coordinator's mailbox,
-and the order they arrive in is decided by wall clock. `spawn_op/1` parks the
-process on a handshake until registration is done.
+isn't traced, so a process it creates isn't adopted until the driver
+registers it, and in that window the new process runs free. 2 clients created
+by operations injected close together race each other to the coordinator's
+mailbox, and the order they arrive in is decided by wall clock. `spawn_op/1`
+parks the process on a handshake until registration is done.
 
-Note `infinity` on the call. A client under simulation should never be waiting
-on the real clock.
+Note the `infinity` on the call. A client under simulation should never be
+waiting on the real clock.
 
 ### check/1
 
@@ -255,17 +263,17 @@ first_violation([TxId | Rest], Tab) ->
     end.
 ```
 
-Nothing in there sends a message or waits for anything. It's an `ets:tab2list`
-and some list operations. An invariant that calls into a suspended process
-either hangs or, worse, gets a plausible answer from an API that swallowed its
-own timeout, and then passes while checking nothing.
+Nothing in there sends a message or waits for anything. It's an
+`ets:tab2list` and some list operations. An invariant that calls into a
+suspended process either hangs or, worse, gets a plausible answer from an API
+that swallowed its own timeout, and then passes while checking nothing.
 
-**Give the violation a `property` key.** `eta_shrink` uses it to tell "the same
-failure" from "a different failure that also happens to be a failure". Without
-it, a shrinker with more than one invariant to choose from will reduce one bug
-into another and report the result as progress.
+**Give the violation a `property` key.** `eta_shrink` uses it to tell "the
+same failure" from "a different failure that also happens to be a failure".
+Without it, a shrinker with more than one invariant to choose from can reduce
+one bug into another and report the result as progress.
 
-### labels/1, the optional one
+### labels/1, an optional one
 
 ```erlang
 labels(#{coordinator := C, participants := Ps, clients := Clients}) ->
@@ -276,23 +284,21 @@ labels(#{coordinator := C, participants := Ps, clients := Clients}) ->
     ).
 ```
 
-Without a name a step reads `p3`; with one, `participant-2`. Names are ordinary
-terms; `eta_log` renders `{participant, 2}` as `participant-2`.
+Without a name a step reads `p3`; with one, `participant-2`. Names are
+ordinary terms; `eta_log` renders `{participant, 2}` as `participant-2`.
 
-Note what's doing the work here and what isn't. The coordinator and the
-participants call `?ETA_LABEL` in their own `init/1`, and a self-reported label
-wins, so this callback isn't what names them.
-
-**The clients are the reason it exists.** They're anonymous funs handed to
-`eta_run:spawn_op/1`, with no module to put a `?ETA_LABEL` in, so the harness is
-the only thing that knows one of them is transaction 3. That's the general
-shape: reach for `labels/1` when the process can't name itself, whether it's a
-fun like this, something from a library you don't own, or a module you
-deliberately kept the header out of.
+The coordinator and the participants already call `?ETA_LABEL` in their own
+`init/1`, and a self-reported label wins, so this callback isn't what names
+them. **The clients are the reason it exists.** They're anonymous funs handed
+to `eta_run:spawn_op/1`, with no module to put a `?ETA_LABEL` in, so the
+harness is the only thing that knows one of them is transaction 3. That's the
+general shape: reach for `labels/1` when the process can't name itself,
+whether it's a fun like this, something from a library you don't own, or a
+module you deliberately kept the header out of.
 
 It's called once, after the run, which is why it takes the whole state rather
-than one pid at a time. Ids are handed out as processes register, so the mapping
-can't exist before the run is over.
+than one pid at a time. Ids are handed out as processes register, so the
+mapping can't exist before the run is over.
 
 ### terminate/1
 
@@ -305,10 +311,10 @@ terminate(Sut = #{coordinator := C, participants := Ps, tab := Tab}) ->
     ok.
 ```
 
-Clients first, and by killing rather than asking. By the time `terminate/1` runs
-the driver has released the scheduler, so anything still in flight is running
-again, and a client that reaches its `ets:insert` after the table has been
-deleted crashes with a `badarg` that has nothing to do with the run.
+Clients first, and by killing rather than asking. By the time `terminate/1`
+runs the driver has released the scheduler, so anything still in flight is
+running again, and a client that reaches its `ets:insert` after the table has
+been deleted crashes with a `badarg` that has nothing to do with the run.
 
 ## Running it
 
@@ -341,17 +347,17 @@ Seed 1 fails after 19 steps:
 ```
 
 Participant 1 voted `no` and refused to commit. Participant 3 committed. The
-coordinator had already decided `commit` on participant 2's `yes`, which is why
-participant 2 is still at `{prepared, yes}`; the decision hasn't reached it yet.
-The run stopped after 7 of its 25 operations, because `eta_run` ends on the
-first violation.
+coordinator had already decided `commit` on participant 2's `yes`, which is
+why participant 2 is still at `{prepared, yes}`; the decision hasn't reached
+it yet. The run stopped after 7 of its 25 operations, because `eta_run` ends
+on the first violation.
 
 ## Making the failure readable
 
-The trace is everything the driver did, in order: `{step, Id}`, `{op, Op}` and
-`{clock, Ms}` entries. For this failure it's 26 of them, which is small only
-because the failure happened early. On a larger system a first trace runs to
-1000s.
+The trace is everything the driver did, in order: `{step, Id}`, `{op, Op}`,
+and `{clock, Ms}` entries. For this failure it's 26 of them, which is small
+only because the failure happened early. On a larger system a first trace
+runs to 1000s.
 
 ```erlang
 #{outcome := {violation, _}, trace := Trace} =
@@ -374,23 +380,23 @@ because the failure happened early. On a larger system a first trace runs to
 ```
 
 6 of the 7 operations are gone, including the 4 that ran before this one. The
-`[8]` on the operation is the id of the client process it spawned, which is
-there so that deleting any *other* operation can't renumber it — see
-[the shrinking hazards](05-gotchas.md#shrinking-hazards) for what that used to
-cost.
+`[8]` on the operation is the id of the client process it spawned. It's
+recorded so that deleting any *other* operation can't renumber it; see
+[the shrinking hazards](05-gotchas.md#shrinking-hazards) for what that used
+to cost.
 
-If the rest means little to you, that's the right reaction. **A trace is a
-scheduler artifact, not an explanation.** `{step, 3}` records which process the
-scheduler chose and says nothing about what that process did. Turning one into a
-story means reconstructing every mailbox state by hand.
+If the rest means little to you, that's the right reaction. A trace is a
+scheduler artifact, not an explanation. `{step, 3}` records which process the
+scheduler chose and says nothing about what that process did. Turning one
+into a story means reconstructing every mailbox state by hand.
 
 What shrinking gives you is a trace short enough to be worth narrating.
 `eta_log` is what narrates it.
 
 ### Reading it
 
-`eta_run` writes its own decisions into the same log your system writes to, so
-replaying the shrunk trace and printing gives you one timeline:
+`eta_run` writes its own decisions into the same log your system writes to,
+so replaying the shrunk trace and printing gives you one timeline:
 
 ```erlang
 eta_run:replay(eta_2pc, Minimal, Opts),
@@ -415,40 +421,42 @@ eta_log:analyze().
 ```
 
 Line 8 is the bug: the coordinator decided `commit` having heard one vote, on
-line 6. Line 13 is participant 1's `no` arriving after the decision, and line 14
-is it refusing to commit, which is what makes the disagreement visible.
+line 6. Line 13 is participant 1's `no` arriving after the decision, and line
+14 is it refusing to commit, which is what makes the disagreement visible.
 
-The events come from `?ETA_LOG` calls in the participant and coordinator, about
-one per protocol decision. `eta_log:analyze(#{until => N})` stops the output
-where the story does, which matters because everything after the run proper is
-the scheduler releasing the system during teardown.
+The events come from `?ETA_LOG` calls in the participant and coordinator,
+about one per protocol decision. `eta_log:analyze(#{until => N})` stops the
+output where the story does, which matters because everything after the run
+proper is the scheduler releasing the system during teardown.
 
 ### What the shrinker can't remove
 
-It deletes whole entries and never simplifies one. This transaction still runs
-against 3 participants because that's the operation the generator produced; a
-minimal *workload* is a separate axis, and the shrinker doesn't search it. It
-also can't go below what the system needs to reach the violation, which is the
-right answer and the reason the surviving operation survives.
+It deletes whole entries and never simplifies one. This transaction still
+runs against 3 participants because that's the operation the generator
+produced; a minimal *workload* is a separate axis, and the shrinker doesn't
+search it. It also can't go below what the system needs to reach the
+violation, which is the right answer and the reason the surviving operation
+survives.
 
 2 things about how the shrinker works matter when you read a result.
 
-**Its oracle has 3 answers rather than 2.** Replaying a candidate gives the same
-violation, a clean run, or a *divergence*, meaning the candidate isn't a valid
-schedule and is evidence of nothing. Treating divergence as "did not fail"
-produces a shrinker that appears to work while quietly reverting safe removals.
+**Replaying a candidate has 3 possible results, not 2.** It gives the same
+violation, a clean run, or a *divergence*, meaning the candidate isn't a
+valid schedule and is evidence of nothing. A shrinker that treated divergence
+as "did not fail" would appear to work while quietly reverting safe removals.
 
-**The result is re-recorded before it's verified.** Candidates replay leniently,
-skipping entries, so a surviving candidate is a recipe rather than an artifact.
-`shrink/3` finishes by replaying what the run actually executed, under strict
-rules. If that doesn't reproduce you get `verified => false` and the original
-trace back.
+**The result is re-recorded before it's verified.** Candidates replay
+leniently, skipping entries, so a surviving candidate is a recipe rather than
+an artifact. `shrink/3` finishes by replaying what the run actually executed,
+under strict rules. If that doesn't reproduce you get `verified => false` and
+the original trace back.
 
 ## What this example leaves out
 
-No faults are injected. No message loss, no crashes, no partitions. Two-phase
-commit here is purely a scheduling exercise. Fault injection is a separate axis
-with a reproducibility trap of its own, described on [page 5](05-gotchas.md).
+No faults are injected. No message loss, no crashes, no partitions.
+Two-phase commit here is purely a scheduling exercise. Fault injection is a
+separate axis with a reproducibility trap of its own, described on
+[page 5](05-gotchas.md).
 
 ## Next
 
