@@ -2,11 +2,11 @@
   <title>eta</title>
   <style>
     .ink    { fill: #16181d; }
-    .accent { fill: #c2762b; }
+    .accent { fill: #0f766e; }
     .plate  { fill: none; stroke: #16181d; opacity: .13; }
     @media (prefers-color-scheme: dark) {
       .ink    { fill: #eceff4; }
-      .accent { fill: #e8a860; }
+      .accent { fill: #2dd4bf; }
       .plate  { stroke: #eceff4; opacity: .17; }
     }
   </style>
