@@ -8,7 +8,7 @@ defmodule Eta.MixProject do
       elixir: "~> 1.15",
       erlc_paths: erlc_paths(Mix.env()),
       erlc_options: erlc_options(Mix.env()),
-      elixirc_paths: [],
+      elixirc_paths: ["lib"],
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       dialyzer: dialyzer(),
@@ -22,9 +22,10 @@ defmodule Eta.MixProject do
     ]
   end
 
-  # The library is pure Erlang. `test/support` holds the systems under test the
-  # suite drives, which are Erlang too — including two that carry the parse
-  # transform, so they have to compile in the same pass as `src`.
+  # The simulation machinery is pure Erlang. `test/support` holds the systems
+  # under test the suite drives, which are Erlang too — including two that carry
+  # the parse transform, so they have to compile in the same pass as `src`.
+  # `lib` is the Elixir-facing surface: `use Eta` and the `:eta` Mix compiler.
   defp erlc_paths(:test), do: ["src", "test/support"]
   defp erlc_paths(_), do: ["src"]
 
@@ -52,6 +53,7 @@ defmodule Eta.MixProject do
       links: %{"GitHub" => "https://github.com/jessestimpson/eta"},
       files: [
         "src",
+        "lib",
         "include",
         "assets",
         "mix.exs",
@@ -91,7 +93,9 @@ defmodule Eta.MixProject do
   defp dialyzer do
     [
       plt_local_path: "priv/plts",
-      plt_core_path: "priv/plts"
+      plt_core_path: "priv/plts",
+      # `Mix.Tasks.Compile.Eta` calls into Mix, which is not in the core PLT.
+      plt_add_apps: [:mix]
     ]
   end
 
