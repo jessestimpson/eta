@@ -15,10 +15,12 @@ defmodule DstElixirSutTest do
   (`Eta.send/2` for `send/2`, and so on) that asked every call site to opt
   in. This port keeps their behaviour and their harnesses while returning the
   call sites to the stdlib — the diff between the two versions of
-  `EtaElixir.Worker` is the argument for the mechanism. The `:gen_server`-
-  qualified calls are the one surviving non-idiom, because the rewrite tables
-  carry no `'Elixir.*'` entries yet; moving those to `GenServer.*` is the
-  acceptance test for that table.
+  `EtaElixir.Worker` is the argument for the mechanism. With the
+  `'Elixir.GenServer'` table entries in place, the SUTs are idiomatic all the
+  way down: `EtaElixir.Counter` is a `use GenServer` module (covering the
+  `-behaviour('Elixir.GenServer')` gate on the reply pass), and
+  `EtaElixir.Worker` keeps `@behaviour :gen_server` so the raw declaration
+  stays covered too.
 
   Fixtures compile at run time, the `DstAfterTest` freshness argument again:
   Mix does not track the transform as a dependency of what it rewrites, and a
@@ -229,6 +231,20 @@ defmodule DstElixirSutTest do
       assert %{helper: helper, mon_ref: mon_ref} = observed
       assert is_pid(helper), "helper is not a pid: #{inspect(helper)}"
       assert is_reference(mon_ref), "mon_ref is not a reference: #{inspect(mon_ref)}"
+
+      GenServer.stop(pid)
+    end
+
+    test "a named start goes through the shim's option translation" do
+      # `GenServer.start_link(mod, arg, name: atom)` pops the name inside
+      # Elixir's stdlib — the reason the starts rewrite to Eta.GenServer
+      # rather than straight to eta_sched. A registered name proves the
+      # translation ran.
+      name = :"eta_elixir_named_#{System.unique_integer([:positive])}"
+      {:ok, pid} = EtaElixir.Worker.start_named(name)
+
+      assert Process.whereis(name) == pid
+      assert {:ok, _} = EtaElixir.Worker.health(name)
 
       GenServer.stop(pid)
     end

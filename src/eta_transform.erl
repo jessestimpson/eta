@@ -247,6 +247,22 @@ never runnable, so a run can end at what looks like quiescence), and a sleep is
 `receive after T -> ok end` one module away, the exact dependence the `after`
 pass exists to virtualise. A sleep in an *untransformed* module still hangs.
 
+## Elixir
+
+This transform runs unchanged on Elixir modules — `Eta.Beam` feeds it the
+abstract format the Elixir compiler produced — and most of the coverage comes
+free: Elixir inlines `send/2`, `spawn/1`, `Process.send_after/3` (arguments
+reordered), `Process.monitor/1` and friends down to the exact `erlang` calls the
+tables above match, and `receive do ... after` compiles to the form the `after`
+pass rewrites. The `'Elixir.*'` entries in the tables cover what does *not*
+inline: `GenServer`'s clients share `eta_net`'s targets (same wire protocol),
+its starts go through `Eta.GenServer` (which reproduces the `name:` option
+translation `GenServer.do_start/4` performs out of reach), its broadcasts raise
+as unsupported, and `-behaviour('Elixir.GenServer')` — what `use GenServer`
+declares — gates the reply pass exactly as `gen_server` does. Calls that still
+delegate inside the Elixir stdlib (`Task`, `Agent`, `Process.sleep/1`, the
+calendar functions) are not covered yet and pass through untouched.
+
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
@@ -393,7 +409,17 @@ pass exists to virtualise. A sleep in an *untransformed* module still hangs.
     %% rewrite above does not reach. See `eta_fsm`.
     {gen_fsm, send_event_after, 2} => {eta_fsm, send_event_after},
     {gen_fsm, start_timer, 2} => {eta_fsm, start_timer},
-    {gen_fsm, cancel_timer, 1} => {eta_fsm, cancel_timer}
+    {gen_fsm, cancel_timer, 1} => {eta_fsm, cancel_timer},
+    %% Elixir's `GenServer` starts. Its `do_start/4` pops the `name` option out
+    %% of the options list and builds the `gen`-style server name *inside* the
+    %% Elixir stdlib, where no transform reaches — so the call site is rewritten
+    %% to a shim that reproduces that translation ahead of `eta_sched`'s gated
+    %% starts. See `Eta.GenServer` (lib/eta/gen_server.ex). Elixir has no
+    %% `GenServer.start_monitor`.
+    {'Elixir.GenServer', start_link, 2} => {'Elixir.Eta.GenServer', start_link},
+    {'Elixir.GenServer', start_link, 3} => {'Elixir.Eta.GenServer', start_link},
+    {'Elixir.GenServer', start, 2} => {'Elixir.Eta.GenServer', start},
+    {'Elixir.GenServer', start, 3} => {'Elixir.Eta.GenServer', start}
 }).
 
 -if(?DOCATTRS).
@@ -553,7 +579,17 @@ rewrite(Node, _Locals) ->
     %% through `statem_return_pass/1` below rather than through
     %% `handle_call_pass/1`.
     {gen_statem, call, 2} => {eta_net, call},
-    {gen_statem, call, 3} => {eta_net, call}
+    {gen_statem, call, 3} => {eta_net, call},
+    %% Elixir's `GenServer` clients speak `gen_server`'s wire protocol — the
+    %% requests and replies are byte-identical — so they share `eta_net`'s
+    %% targets, and the reply leg comes from `handle_call_pass/1` exactly as it
+    %% does for `gen_server`. What the substitution changes is only the exit
+    %% reason's second element on a failed call: `{gen_server, call, ...}`
+    %% where Elixir's own wrapper would have said `{GenServer, :call, ...}`.
+    {'Elixir.GenServer', call, 2} => {eta_net, call},
+    {'Elixir.GenServer', call, 3} => {eta_net, call},
+    {'Elixir.GenServer', cast, 2} => {eta_net, cast},
+    {'Elixir.GenServer', reply, 2} => {eta_net, reply}
 }).
 
 %% Client-side messaging `eta_net` does not implement yet.
@@ -613,6 +649,15 @@ rewrite(Node, _Locals) ->
     {gen_fsm, sync_send_event, 3},
     {gen_fsm, sync_send_all_state_event, 2},
     {gen_fsm, sync_send_all_state_event, 3},
+    %% Elixir's `GenServer` broadcasts: distribution again. Its asynchronous
+    %% interface is not here because Elixir does not wrap it — an Elixir module
+    %% wanting `send_request` writes `:gen_server.send_request(...)`, which the
+    %% entries above already catch.
+    {'Elixir.GenServer', abcast, 2},
+    {'Elixir.GenServer', abcast, 3},
+    {'Elixir.GenServer', multi_call, 2},
+    {'Elixir.GenServer', multi_call, 3},
+    {'Elixir.GenServer', multi_call, 4},
     %% `gen_event` the same: a handler's reply is produced inside the event
     %% manager, out of reach.
     {gen_event, notify, 2},
@@ -723,8 +768,13 @@ handle_call_pass(Forms) ->
             insert_before_eof([wrap_handle_call(F) || F <- Forms], [reply_fun(Anno)])
     end.
 
+%% `'Elixir.GenServer'` is what `use GenServer` declares, and it is the same
+%% contract: Elixir's GenServer is a veneer over `gen`, and its callbacks return
+%% the same three reply-carrying shapes `reply_fun/1` matches.
 is_gen_server([{attribute, _, behaviour, gen_server} | _]) -> true;
 is_gen_server([{attribute, _, behavior, gen_server} | _]) -> true;
+is_gen_server([{attribute, _, behaviour, 'Elixir.GenServer'} | _]) -> true;
+is_gen_server([{attribute, _, behavior, 'Elixir.GenServer'} | _]) -> true;
 is_gen_server([_ | Rest]) -> is_gen_server(Rest);
 is_gen_server([]) -> false.
 

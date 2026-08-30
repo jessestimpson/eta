@@ -3,7 +3,7 @@ defmodule EtaElixir.Worker do
   A GenServer worker that exercises the full rewritten stdlib surface.
 
   Unlike `EtaElixir.Counter`, which only uses `Process.send_after/3`, `send/2`
-  and the `:gen_server` cast/call/start functions, this module also exercises:
+  and the basic GenServer client functions, this module also exercises:
 
   - `spawn_link/1` — spawns a linked helper process
   - `spawn/1` — spawns an unlinked worker for async replies
@@ -11,18 +11,20 @@ defmodule EtaElixir.Worker do
   - `Process.demonitor/1` — demonitors on detach
   - `Process.cancel_timer/1` — cancels the old tick timer on each tick
   - `System.monotonic_time/0` — records a timestamp on each tick
-  - `:gen_server.reply/2` — async reply from a spawned worker
-  - `:gen_server.start/3` — unlinked GenServer start
+  - `GenServer.reply/2` — async reply from a spawned worker
+  - `GenServer.start/2` — unlinked GenServer start
+  - `GenServer.start_link/3` with `name:` — the shim's option translation
   - `handle_continue/2` — deferred initialization
   - `handle_call/3` with guards — `when state.alive`
   - `{:stop, :normal, :ok, state}` return from `handle_call/3`
   - `handle_info({:DOWN, ...}, ...)` — monitor notification
 
-  Every one of these is written plainly. The Elixir compiler inlines the
+  Every call is written plainly: the Elixir compiler inlines the
   `Process`/`System`/`Kernel` forms to the `:erlang` MFAs the rewrite tables
-  match — argument reorder included — so the beam rewrite covers them without
-  a facade. Only the `:gen_server`-qualified calls are non-idiomatic, for the
-  reason `EtaElixir.Counter`'s moduledoc gives.
+  match, and the `'Elixir.GenServer'` entries cover the rest. The one
+  deliberate non-idiom is `@behaviour :gen_server` in place of
+  `use GenServer` — `EtaElixir.Counter` covers that gate, and this module
+  keeps the raw declaration covered.
   """
 
   use Eta
@@ -37,27 +39,31 @@ defmodule EtaElixir.Worker do
   # -----------------------------------------------------------------------
 
   def start_link(opts \\ []) do
-    :gen_server.start_link(__MODULE__, opts, [])
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  def start_named(name, opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
   def start(opts \\ []) do
-    :gen_server.start(__MODULE__, opts, [])
+    GenServer.start(__MODULE__, opts)
   end
 
   def health(server) do
-    :gen_server.call(server, :health, 5000)
+    GenServer.call(server, :health, 5000)
   end
 
   def measure(server) do
-    :gen_server.call(server, :measure, 5000)
+    GenServer.call(server, :measure, 5000)
   end
 
   def detach(server) do
-    :gen_server.call(server, :detach, 5000)
+    GenServer.call(server, :detach, 5000)
   end
 
   def stop(server) do
-    :gen_server.call(server, :stop, 5000)
+    GenServer.call(server, :stop, 5000)
   end
 
   # -----------------------------------------------------------------------
@@ -96,12 +102,12 @@ defmodule EtaElixir.Worker do
   end
 
   # Async reply: spawn a worker that replies later. The reply travels through
-  # `eta_net`, because the rewrite covers `:gen_server.reply/2` wherever it is
+  # `eta_net`, because the rewrite covers `GenServer.reply/2` wherever it is
   # called from — including a process the callback spawned.
   def handle_call(:measure, from, state) do
     spawn(fn ->
       result = {:measured, System.monotonic_time()}
-      :gen_server.reply(from, result)
+      GenServer.reply(from, result)
     end)
 
     {:noreply, state}
@@ -156,7 +162,7 @@ defmodule EtaElixir.Worker do
         :ok
 
       {:work, from} ->
-        :gen_server.reply(from, {:worker_result, n})
+        GenServer.reply(from, {:worker_result, n})
         helper_loop(n + 1)
     end
   end

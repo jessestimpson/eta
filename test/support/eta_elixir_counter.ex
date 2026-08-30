@@ -2,39 +2,41 @@ defmodule EtaElixir.Counter do
   @moduledoc """
   A simple GenServer counter — the Elixir SUT for `eta`.
 
-  Written as ordinary Elixir: `Process.send_after/3`, `send/2`,
-  `:gen_server.cast/2` — no facade, no renamed call sites. The beam rewrite
-  (`Eta.Beam`) points them at `eta_time` and `eta_net` after compilation, the
-  same substitution `eta_transform` makes for the Erlang SUTs.
+  Written as fully idiomatic Elixir: `use GenServer`, `GenServer.start_link/2`,
+  `GenServer.cast/2`, `GenServer.call/3`, `Process.send_after/3`, `send/2` —
+  no facade, no renamed call sites, no `:gen_server` qualification. The beam
+  rewrite (`Eta.Beam`) points all of it at `eta_sched`, `eta_net` and
+  `eta_time` after compilation, the same substitution `eta_transform` makes
+  for the Erlang SUTs.
 
-  The one non-idiom is `:gen_server` rather than `GenServer`: the rewrite
-  tables carry the Erlang MFAs today and no `'Elixir.*'` entries yet, so the
-  SUT calls the layer the tables match. When the `'Elixir.*'` table lands,
-  this module switching to `GenServer.call/2` and friends is its acceptance
-  test.
+  `use GenServer` matters beyond idiom: it declares
+  `-behaviour('Elixir.GenServer')`, which is the attribute the transform's
+  reply pass must recognise for `handle_call/3` routing — so this module is
+  the coverage for that gate, while `EtaElixir.Worker` keeps the raw
+  `@behaviour :gen_server` form to cover the other. Its injected default
+  callbacks are transformed along with everything else, because the rewrite
+  works on post-expansion abstract format.
 
-  `@eta_observe :all` publishes the state on every callback return, and the
-  transform's `handle_call` pass routes replies through `eta_net` — both keyed
-  off the persisted attributes `use Eta` registers.
+  `@eta_observe :all` publishes the state on every callback return.
   """
 
   use Eta
-  @behaviour :gen_server
+  use GenServer
 
   @eta_observe :all
 
   @tick_ms 50
 
   def start_link(opts \\ []) do
-    :gen_server.start_link(__MODULE__, opts, [])
+    GenServer.start_link(__MODULE__, opts)
   end
 
   def increment(server) do
-    :gen_server.cast(server, :increment)
+    GenServer.cast(server, :increment)
   end
 
   def get(server) do
-    :gen_server.call(server, :get, 5000)
+    GenServer.call(server, :get, 5000)
   end
 
   def send_tick(server) do

@@ -44,6 +44,7 @@ defmodule DstElixirTest do
       _ref = Process.monitor(pid)
       spawn(fn -> :ok end)
       GenServer.cast(pid, :poke)
+      Task.async(fn -> :ok end)
     end
 
     def wait(timeout) do
@@ -154,12 +155,18 @@ defmodule DstElixirTest do
              "timer:sleep/1 survived the rewrite"
     end
 
-    test "the Elixir stdlib delegations are still the named gap", %{dir: dir} do
-      # `GenServer.cast/2` delegates inside Elixir's stdlib, where no transform
-      # of user code reaches, and the rewrite tables carry no 'Elixir.*'
-      # entries yet. This is the prototype's boundary, pinned so the table
-      # work has a test to flip when it lands.
-      assert :"Elixir.GenServer" in calls(dir, EtaElixirSut)
+    test "GenServer is covered; Task is still the named gap", %{dir: dir} do
+      called = calls(dir, EtaElixirSut)
+
+      # `GenServer.cast/2` used to be the pinned gap. The 'Elixir.GenServer'
+      # table entries cover it now — the cast lands on eta_net with the rest.
+      refute :"Elixir.GenServer" in called,
+             "a GenServer client call survived the rewrite"
+
+      # `Task.async/1` still delegates inside Elixir's stdlib, where no
+      # transform of user code reaches. Pinned so the Task work has a test to
+      # flip when it lands.
+      assert :"Elixir.Task" in called
     end
 
     test "a module that did not opt in is untouched", %{

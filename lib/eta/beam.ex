@@ -29,11 +29,12 @@ defmodule Eta.Beam do
 
   ## Prototype boundaries, deliberately
 
-  - **No `'Elixir.*'` entries exist in the rewrite tables yet**, so calls that
-    delegate inside Elixir's stdlib — `Process.sleep/1`, `System.*`,
-    `GenServer.*`, `Task.*`, `DateTime.utc_now/0` — pass through untouched.
-    This module is the delivery mechanism; that table is separate work, and it
-    is the same work under any mechanism.
+  - **The `'Elixir.*'` rewrite tables cover `GenServer` and nothing else
+    yet.** Calls that delegate inside the rest of Elixir's stdlib —
+    `Process.sleep/1`, the unit-argument `System.*` forms, `Task.*`,
+    `Agent.*`, `DateTime.utc_now/0` — pass through untouched. This module is
+    the delivery mechanism; that table grows separately, and it is the same
+    work under any mechanism.
   - The rewritten beam is compiled fresh from forms, so the Elixir-specific
     chunks (`Docs`, `ExCk`) are dropped. Harmless in a `:dst` profile, whose
     beams exist to be simulated, not documented.
