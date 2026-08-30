@@ -45,6 +45,13 @@ defmodule DstElixirTest do
       spawn(fn -> :ok end)
       GenServer.cast(pid, :poke)
       Task.async(fn -> :ok end)
+      Process.sleep(1)
+    end
+
+    def clocks do
+      {System.monotonic_time(:millisecond), System.system_time(:millisecond),
+       System.os_time(:millisecond), DateTime.utc_now(), NaiveDateTime.utc_now(),
+       Date.utc_today(), Time.utc_now()}
     end
 
     def wait(timeout) do
@@ -169,6 +176,22 @@ defmodule DstElixirTest do
       assert :"Elixir.Task" in called
     end
 
+    test "the clock reads that do not inline land on the shims", %{dir: dir} do
+      called = calls(dir, EtaElixirSut)
+
+      # `Process.sleep/1`, the unit-argument `System` forms, and the calendar
+      # constructors are all real functions inside Elixir's stdlib. Rewritten,
+      # nothing in the module reaches them any more...
+      for gone <- ~w(Process System DateTime NaiveDateTime Date Time)a do
+        refute :"Elixir.#{gone}" in called,
+               "a clock read still delegates into Elixir.#{gone}"
+      end
+
+      # ...and the shims that replace them are called instead.
+      assert :"Elixir.Eta.System" in called
+      assert :"Elixir.Eta.Calendar" in called
+    end
+
     test "a module that did not opt in is untouched", %{
       dir: dir,
       pass1: pass1,
@@ -247,6 +270,43 @@ defmodule DstElixirTest do
 
       assert elapsed < 1_000,
              "a virtual 60s timeout cost #{elapsed}ms of real time"
+    end
+
+    test "the clock reads freeze until the clock moves" do
+      # Seven reads through five different stdlib surfaces, one virtual clock.
+      {mono1, sys1, os1, dt1, naive1, date1, time1} = EtaElixirSut.clocks()
+
+      # Real time passes; virtual time does not.
+      Process.sleep(30)
+      assert {^mono1, ^sys1, ^os1, ^dt1, ^naive1, ^date1, ^time1} = EtaElixirSut.clocks()
+
+      :eta_time.advance(5_000)
+      {mono2, sys2, os2, dt2, naive2, _date2, _time2} = EtaElixirSut.clocks()
+
+      assert mono2 - mono1 == 5_000
+      assert sys2 - sys1 == 5_000
+      assert os2 - os1 == 5_000
+      assert DateTime.diff(dt2, dt1, :millisecond) == 5_000
+      assert NaiveDateTime.diff(naive2, naive1, :millisecond) == 5_000
+    end
+  end
+
+  describe "the clock shims, inert without a clock" do
+    test "legacy plural units still convert" do
+      assert is_integer(Eta.System.monotonic_time(:milliseconds))
+      assert_in_delta Eta.System.system_time(:second), System.system_time(:second), 2
+    end
+
+    test "the calendar shims match the real constructors' shapes" do
+      assert %DateTime{microsecond: {_, 6}} = Eta.Calendar.datetime_utc_now()
+      assert %DateTime{microsecond: {_, 3}} = Eta.Calendar.datetime_utc_now(:millisecond)
+      assert %DateTime{microsecond: {_, 0}} = Eta.Calendar.datetime_utc_now(:second, Calendar.ISO)
+      assert %Time{microsecond: {_, 3}} = Eta.Calendar.time_utc_now(:millisecond)
+      assert %NaiveDateTime{} = Eta.Calendar.naive_utc_now()
+
+      real = DateTime.utc_now()
+      assert abs(DateTime.diff(Eta.Calendar.datetime_utc_now(), real, :millisecond)) < 2_000
+      assert abs(Date.diff(Eta.Calendar.date_utc_today(), Date.utc_today())) <= 1
     end
   end
 

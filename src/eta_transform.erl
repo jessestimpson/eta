@@ -259,9 +259,11 @@ inline: `GenServer`'s clients share `eta_net`'s targets (same wire protocol),
 its starts go through `Eta.GenServer` (which reproduces the `name:` option
 translation `GenServer.do_start/4` performs out of reach), its broadcasts raise
 as unsupported, and `-behaviour('Elixir.GenServer')` — what `use GenServer`
-declares — gates the reply pass exactly as `gen_server` does. Calls that still
-delegate inside the Elixir stdlib (`Task`, `Agent`, `Process.sleep/1`, the
-calendar functions) are not covered yet and pass through untouched.
+declares — gates the reply pass exactly as `gen_server` does. The clock reads
+that do not inline — `Process.sleep/1`, the unit-argument `System` forms, and
+the calendar constructors (`DateTime.utc_now` and kin) — land on `eta_time`,
+`Eta.System` and `Eta.Calendar`. What still delegates inside the Elixir stdlib
+uncovered is `Task` and `Agent`, which pass through untouched.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -419,7 +421,32 @@ calendar functions) are not covered yet and pass through untouched.
     {'Elixir.GenServer', start_link, 2} => {'Elixir.Eta.GenServer', start_link},
     {'Elixir.GenServer', start_link, 3} => {'Elixir.Eta.GenServer', start_link},
     {'Elixir.GenServer', start, 2} => {'Elixir.Eta.GenServer', start},
-    {'Elixir.GenServer', start, 3} => {'Elixir.Eta.GenServer', start}
+    {'Elixir.GenServer', start, 3} => {'Elixir.Eta.GenServer', start},
+    %% Elixir's clock reads that do not inline. (`System.system_time/0`,
+    %% `System.os_time/0`, `Process.send_after/3,4` and friends need no entry:
+    %% the Elixir compiler lowers them to the `erlang`/`os` calls above.)
+    %% `Process.sleep/1` is `eta_time:sleep/1`'s exact contract, `infinity`
+    %% included. The unit-argument `System` forms go through `Eta.System`,
+    %% which reproduces the legacy-plural unit normalisation `System` performs
+    %% out of reach. The calendar constructors read `os:system_time` *inside*
+    %% their own modules — a clock dependence that does not even look like one
+    %% at the call site — so they are rebuilt from the virtual clock by
+    %% `Eta.Calendar`.
+    {'Elixir.Process', sleep, 1} => eta_time,
+    {'Elixir.System', monotonic_time, 1} => {'Elixir.Eta.System', monotonic_time},
+    {'Elixir.System', system_time, 1} => {'Elixir.Eta.System', system_time},
+    {'Elixir.System', os_time, 1} => {'Elixir.Eta.System', os_time},
+    {'Elixir.DateTime', utc_now, 0} => {'Elixir.Eta.Calendar', datetime_utc_now},
+    {'Elixir.DateTime', utc_now, 1} => {'Elixir.Eta.Calendar', datetime_utc_now},
+    {'Elixir.DateTime', utc_now, 2} => {'Elixir.Eta.Calendar', datetime_utc_now},
+    {'Elixir.NaiveDateTime', utc_now, 0} => {'Elixir.Eta.Calendar', naive_utc_now},
+    {'Elixir.NaiveDateTime', utc_now, 1} => {'Elixir.Eta.Calendar', naive_utc_now},
+    {'Elixir.NaiveDateTime', utc_now, 2} => {'Elixir.Eta.Calendar', naive_utc_now},
+    {'Elixir.Time', utc_now, 0} => {'Elixir.Eta.Calendar', time_utc_now},
+    {'Elixir.Time', utc_now, 1} => {'Elixir.Eta.Calendar', time_utc_now},
+    {'Elixir.Time', utc_now, 2} => {'Elixir.Eta.Calendar', time_utc_now},
+    {'Elixir.Date', utc_today, 0} => {'Elixir.Eta.Calendar', date_utc_today},
+    {'Elixir.Date', utc_today, 1} => {'Elixir.Eta.Calendar', date_utc_today}
 }).
 
 -if(?DOCATTRS).
