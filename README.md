@@ -109,6 +109,8 @@ configuration.
    end to end: an empty directory becomes a quorum register with a
    planted bug, and the bug becomes a minimized, replayable failure that
    explains itself.
+7. [A journey through DST, in Elixir](docs/07-a-journey-through-dst-elixir.md).
+   The same walkthrough with the register built in Elixir.
 
 [docs/design.md](docs/design.md) is still a work in progress. Eventually, it will
 be the internal specification for the `eta` project itself.
