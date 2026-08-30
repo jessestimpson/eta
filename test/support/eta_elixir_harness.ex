@@ -16,12 +16,17 @@ defmodule EtaElixir.Harness do
   @impl true
   def init(seed, _config) do
     {:ok, pid} = EtaElixir.Counter.start_link([])
-    {:ok, %{counter: pid, seed: seed}}
+    {:ok, %{counter: pid, seed: seed, clients: []}}
   end
 
+  # The counter *and every op process*. `eta_run` adopts exactly the pids this
+  # returns after each op — a `spawn_op` process the harness does not list here
+  # is never released from its gate, so its operation silently never runs.
+  # (The facade-era harnesses had exactly that bug, and nothing reported it:
+  # the runs stayed clean and deterministic, minus their client ops.)
   @impl true
-  def processes(%{counter: pid}) do
-    [pid]
+  def processes(%{counter: pid, clients: clients}) do
+    [pid | clients]
   end
 
   @impl true
@@ -38,8 +43,8 @@ defmodule EtaElixir.Harness do
   end
 
   def execute(:get, %{counter: pid} = state) do
-    _ = :eta_run.spawn_op(fn -> EtaElixir.Counter.get(pid) end)
-    state
+    client = :eta_run.spawn_op(fn -> EtaElixir.Counter.get(pid) end)
+    %{state | clients: [client | state.clients]}
   end
 
   @impl true

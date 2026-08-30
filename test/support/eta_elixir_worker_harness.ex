@@ -12,12 +12,14 @@ defmodule EtaElixir.WorkerHarness do
   @impl true
   def init(_seed, _config) do
     {:ok, pid} = EtaElixir.Worker.start_link([])
-    {:ok, %{worker: pid}}
+    {:ok, %{worker: pid, clients: []}}
   end
 
+  # The worker and every op process — see the note in `EtaElixir.Harness`:
+  # a `spawn_op` pid not listed here is never released from its gate.
   @impl true
-  def processes(%{worker: pid}) do
-    [pid]
+  def processes(%{worker: pid, clients: clients}) do
+    [pid | clients]
   end
 
   @impl true
@@ -36,18 +38,18 @@ defmodule EtaElixir.WorkerHarness do
 
   @impl true
   def execute(:health, %{worker: pid} = state) do
-    _ = :eta_run.spawn_op(fn -> EtaElixir.Worker.health(pid) end)
-    state
+    client = :eta_run.spawn_op(fn -> EtaElixir.Worker.health(pid) end)
+    %{state | clients: [client | state.clients]}
   end
 
   def execute(:measure, %{worker: pid} = state) do
-    _ = :eta_run.spawn_op(fn -> EtaElixir.Worker.measure(pid) end)
-    state
+    client = :eta_run.spawn_op(fn -> EtaElixir.Worker.measure(pid) end)
+    %{state | clients: [client | state.clients]}
   end
 
   def execute(:detach, %{worker: pid} = state) do
-    _ = :eta_run.spawn_op(fn -> EtaElixir.Worker.detach(pid) end)
-    state
+    client = :eta_run.spawn_op(fn -> EtaElixir.Worker.detach(pid) end)
+    %{state | clients: [client | state.clients]}
   end
 
   @impl true
