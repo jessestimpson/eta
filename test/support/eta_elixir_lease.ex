@@ -27,10 +27,8 @@ defmodule EtaElixir.Lease do
   `expiries <= grants` is the harness's invariant.
   """
 
-  use Eta
+  use Eta, observe: :all
   @behaviour :gen_statem
-
-  @eta_observe :all
 
   @lease_ms 100
 

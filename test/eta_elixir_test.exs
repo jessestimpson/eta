@@ -75,8 +75,7 @@ defmodule DstElixirTest do
   end
 
   defmodule EtaElixirOptOut do
-    use Eta
-    @eta_net false
+    use Eta, net: false
 
     def kick(pid) do
       send(pid, :hello)
@@ -233,18 +232,54 @@ defmodule DstElixirTest do
              "a stamped beam changed on the second pass"
     end
 
-    test "@eta_net false opts out of the network pass and keeps the clock", %{
+    test "net: false opts out of the network pass and keeps the clock", %{
       dir: dir,
       pass1: pass1
     } do
       # The same split `-eta_net(false).` gives an Erlang module: sends stay
-      # raw, but timers still land on `eta_time` — proof the persisted Elixir
-      # attribute reaches the gating pass in the shape it already matches.
+      # raw, but timers still land on `eta_time` — proof the option reaches
+      # the gating pass as the persisted attribute it already matches.
       assert pass1[beam(EtaElixirOptOut)] == :transformed
 
       called = calls(dir, EtaElixirOptOut)
-      refute :eta_net in called, "@eta_net false did not disable the network pass"
+      refute :eta_net in called, "net: false did not disable the network pass"
       assert :eta_time in called
+    end
+
+    test "the options become the persisted attributes, and nothing else" do
+      [{mod, bin}] =
+        Code.compile_string("""
+        defmodule EtaElixirAllOptions do
+          use Eta, net: false, after: false, observe: :all
+        end
+        """)
+
+      {:ok, {^mod, [attributes: attrs]}} = :beam_lib.chunks(bin, [:attributes])
+
+      assert attrs[:eta] == [true]
+      assert attrs[:eta_net] == [false]
+      assert attrs[:eta_after] == [false]
+      assert attrs[:eta_observe] == [:all]
+    end
+
+    test "an unknown option raises where the use is written" do
+      assert_raise ArgumentError, ~r/unknown option.*:observ\b/s, fn ->
+        Code.compile_string("""
+        defmodule EtaElixirBadKey do
+          use Eta, observ: :all
+        end
+        """)
+      end
+    end
+
+    test "a value the pass cannot honour raises the same way" do
+      assert_raise ArgumentError, ~r/invalid value for the :net option/, fn ->
+        Code.compile_string("""
+        defmodule EtaElixirBadValue do
+          use Eta, net: :maybe
+        end
+        """)
+      end
     end
 
     test "a beam without debug info is refused by name", %{pass1: pass1} do

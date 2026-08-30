@@ -114,8 +114,12 @@ end
 Your modules say `use MyApp.Eta` and call `MyApp.Eta.label/1` and
 `MyApp.Eta.log/1`; every build except `:dst` compiles them with no
 relationship to `eta` at all, exactly as the header does for Erlang. The
-optional attributes ride along as module attributes — `@eta_net false`,
-`@eta_observe :all` — and mean what their Erlang counterparts mean.
+optional passes are gated by options on the `use` itself —
+`use MyApp.Eta, net: false`, `use MyApp.Eta, observe: :all` — which the
+wrapper forwards, and which mean what their Erlang attribute counterparts
+(`-eta_net(false).`, `-eta_observe(all).`) mean. A misspelled option is a
+compile error at the `use` site, not a module that silently is not simulated
+the way it claims.
 
 The mechanism differs from Erlang's in one respect: Elixir deprecated the
 compiler's `parse_transform` hook, so the transform runs *after* compilation

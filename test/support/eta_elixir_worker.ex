@@ -27,10 +27,8 @@ defmodule EtaElixir.Worker do
   keeps the raw declaration covered.
   """
 
-  use Eta
+  use Eta, observe: :all
   @behaviour :gen_server
-
-  @eta_observe :all
 
   @tick_ms 50
 

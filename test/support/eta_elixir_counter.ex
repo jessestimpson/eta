@@ -17,13 +17,11 @@ defmodule EtaElixir.Counter do
   callbacks are transformed along with everything else, because the rewrite
   works on post-expansion abstract format.
 
-  `@eta_observe :all` publishes the state on every callback return.
+  `observe: :all` publishes the state on every callback return.
   """
 
-  use Eta
+  use Eta, observe: :all
   use GenServer
-
-  @eta_observe :all
 
   @tick_ms 50
 

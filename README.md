@@ -65,10 +65,9 @@ build:
 
 ```elixir
 defmodule MyServer do
-  use MyApp.Eta   # your wrapper: `use Eta` in the :dst build, nothing anywhere else
+  # your wrapper: `use Eta, observe: :all` in the :dst build, nothing anywhere else
+  use MyApp.Eta, observe: :all
   use GenServer
-
-  @eta_observe :all
 
   def init(_) do
     _ = Process.send_after(self(), :tick, 50)   # rewritten to the virtual clock

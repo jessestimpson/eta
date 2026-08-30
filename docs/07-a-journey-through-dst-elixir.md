@@ -124,12 +124,6 @@ defmodule Abd.Eta do
       quote do
         use Eta, unquote(opts)
       end
-    else
-      quote do
-        Module.register_attribute(__MODULE__, :eta_observe, persist: true)
-        Module.register_attribute(__MODULE__, :eta_net, persist: true)
-        Module.register_attribute(__MODULE__, :eta_after, persist: true)
-      end
     end
   end
 
@@ -156,9 +150,9 @@ If the compile fails, double-check your configuration.
 **The wrapper module is what makes `only: :dst` possible.** It is the Elixir
 counterpart of the Erlang walkthrough's `abd_eta.hrl`: your modules say
 `use Abd.Eta`, and every build except `:dst` compiles them with no relationship
-to `eta` at all. The non-dst branch still registers the eta attributes, so an
-`@eta_observe` you add later is a persisted attribute in every build rather
-than an "unused attribute" warning in the ones without `eta`.
+to `eta` at all. The optional passes are gated by options on the `use` itself
+(we'll pass `observe: :all` in step 15), which the wrapper forwards in the
+`:dst` build and which vanish with the `use` in every other.
 
 **The `:eta` entry in `compilers` is the transform.** Elixir has no
 `parse_transform` hook, so `mix compile.eta` runs after the `:elixir` compiler
@@ -1664,21 +1658,20 @@ system state. It requires special configuration of the transform because
 state is typically accessible via message passing, and all processes are suspended,
 which halts message passing during the `check/1` phase.
 
-### Tweak the transform with an `@eta_observe` attribute
+### Tweak the transform with an `observe` option
 
-One attribute on `lib/abd/replica.ex`:
+One option on `lib/abd/replica.ex`'s `use` line:
 
 ```elixir
-  use Abd.Eta
+  use Abd.Eta, observe: :all
   use GenServer
-
-  @eta_observe :all
 ```
 
 For every `GenServer` callback, the transform will publish the returned state
 to a shared memory location, observable by the harness. (In the Erlang
-walkthrough this is `-eta_observe({st, [ts, val]})`, naming record fields; an
-Elixir state is a struct, and `:all` publishes the whole thing.)
+walkthrough this is the `-eta_observe({st, [ts, val]})` attribute, naming
+record fields; an Elixir state is a struct, `:all` publishes the whole thing,
+and the option sets the same persisted attribute the Erlang form does.)
 
 ### Read it back out
 
