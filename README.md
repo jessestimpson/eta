@@ -56,6 +56,35 @@ When a run fails, shrink it:
 
 The seed produces the same trace each time, and the shrink reduces the size of that trace.
 
+Elixir is supported, and the code stays idiomatic — no renamed call sites, no
+facade. Elixir compiles to the same abstract format the parse transform
+rewrites, so a Mix compiler (`mix compile.eta`) applies the very same
+transform to each opted-in module after compilation. A module opts in with
+`use Eta`, via a wrapper of your own that keeps `eta` out of every other
+build:
+
+```elixir
+defmodule MyServer do
+  use MyApp.Eta   # your wrapper: `use Eta` in the :dst build, nothing anywhere else
+  use GenServer
+
+  @eta_observe :all
+
+  def init(_) do
+    _ = Process.send_after(self(), :tick, 50)   # rewritten to the virtual clock
+    {:ok, %{count: 0}}
+  end
+
+  def handle_info(:tick, state) do
+    _ = Process.send_after(self(), :tick, 50)
+    {:noreply, %{state | count: state.count + 1}}
+  end
+end
+```
+
+See [Setting up a project](docs/02-setting-up.md) for the Elixir build
+configuration.
+
 `eta` includes some simple distributed systems in order to illustrate DST:
 
 1. A [two-phase commit implementation](test/support/eta_2pc.erl), which is used in `eta`'s own tests.
@@ -118,9 +147,13 @@ Early and under development.
 
 ### Known gaps, roughly by size
 
-- **Limited Elixir support.** The Erlang `parse_transform` is the mechanism
-  for keeping your code deployable to prod without disruptive changes. Elixir
-  support may come later.
+- **Elixir's `Task` and `Agent` are not simulated.** Both spawn and wait
+  inside the Elixir standard library, where the scheduler cannot gate them,
+  so under a run their entry points raise by name rather than quietly running
+  outside the schedule. `GenServer`, `:gen_statem`, timers, clock reads
+  (`DateTime.utc_now/0` included), `receive ... after`, spawns and monitors
+  are all covered; see the Elixir section of `eta_transform`'s docs for the
+  boundary.
 - **One simulation per VM.** `eta_time` and `eta_log` keep state in named ETS
   tables, so runs must be serial. Keep the tests `async: false`. This is one of
   the reasons we suggest running simulations from their own build profile, so

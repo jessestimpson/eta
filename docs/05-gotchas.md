@@ -686,6 +686,45 @@ With more than one invariant, the fallback will cheerfully shrink one bug
 into a different one, which is worse than no shrink because it looks like
 progress.
 
+## Elixir hazards
+
+### Task and Agent raise, on purpose
+
+Both spawn and wait *inside* the Elixir standard library, where the scheduler
+cannot gate them: a `Task.async/1` child would run outside the schedule, and
+a `Task.await/2` is a `receive ... after` in a module no transform touched,
+sitting on the real clock. Every entry point is rewritten to raise while a
+scheduler is active — `{eta_sched, {unsupported, {Task, :async, 1}, ...}}` —
+and to call the original otherwise, so ordinary builds and tests are
+unaffected. Under simulation, use a plain `spawn/1` (which is gated) or a
+`GenServer` for the same job.
+
+### The stdlib boundary is the transform boundary
+
+The general rule behind the last gotcha: an Elixir standard library function
+that spawns, sleeps, or reads a clock *inside its own implementation* is
+outside the transform's reach unless the rewrite tables name it. `GenServer`,
+the `System` clock reads and the calendar constructors are named;
+`Process.send_after/3` and friends are inlined by the compiler into calls the
+Erlang tables already cover. When in doubt, read the compiled evidence — the
+beam's imports say exactly who a module calls:
+
+```elixir
+{:ok, {_, [imports: imports]}} = :beam_lib.chunks(~c"path/to.beam", [:imports])
+```
+
+A transformed module whose imports still include `Elixir.Task` (or a library
+that wraps it) has a channel the schedule does not control.
+
+### A stamped beam survives an eta upgrade
+
+`mix compile.eta` stamps every beam it rewrites and skips stamped beams on
+sight — that is what makes the pass safe to run repeatedly. The flip side:
+upgrading `eta` does not make Mix recompile *your* modules, and a stamped
+beam carries yesterday's transform until its source changes. After changing
+the `eta` dependency, run `mix compile --force` in the `:dst` env. (The same
+staleness gotcha as the Erlang one above, wearing Mix clothing.)
+
 ## Teardown hazards
 
 ETS tables are owned by the process that created them, so an `on_exit`

@@ -84,6 +84,63 @@ evaluates its argument in this form, so anything you log must be free of side
 effects, and a variable used only inside one of these will be reported as
 unused. Bind it with a leading underscore.
 
+### The same opt-in, in Elixir
+
+Elixir has no include mechanism, so the wrapper is a module instead of a
+header — the same trick with macros where the `ifdef` was:
+
+```elixir
+defmodule MyApp.Eta do
+  @dst Mix.env() == :dst
+
+  defmacro __using__(opts) do
+    if @dst do
+      quote do
+        use Eta, unquote(opts)
+      end
+    end
+  end
+
+  defmacro label(value) do
+    if @dst, do: quote(do: Eta.label(unquote(value))), else: :ok
+  end
+
+  defmacro log(event) do
+    if @dst, do: quote(do: Eta.log(unquote(event))), else: 0
+  end
+end
+```
+
+Your modules say `use MyApp.Eta` and call `MyApp.Eta.label/1` and
+`MyApp.Eta.log/1`; every build except `:dst` compiles them with no
+relationship to `eta` at all, exactly as the header does for Erlang. The
+optional attributes ride along as module attributes — `@eta_net false`,
+`@eta_observe :all` — and mean what their Erlang counterparts mean.
+
+The mechanism differs from Erlang's in one respect: Elixir deprecated the
+compiler's `parse_transform` hook, so the transform runs *after* compilation
+instead of during it. `mix compile.eta` reads each opted-in module's abstract
+format back out of its beam (the same stable protocol Dialyzer uses), runs
+`eta_transform` on it unchanged, and puts the beam back. Wire it into the
+`:dst` profile only:
+
+```elixir
+  compilers: Mix.compilers() ++ if(Mix.env() == :dst, do: [:eta], else: [])
+```
+
+That line plus the `only: :dst` dependency is the whole configuration. The
+transformed code is the same code the Erlang tables produce — Elixir inlines
+`send/2`, `spawn/1`, `Process.send_after/3` and friends down to the very
+`:erlang` calls they match, `receive do ... after` is virtualised the same
+way, and the `'Elixir.*'` entries cover what does not inline (`GenServer`,
+the clock reads, `DateTime.utc_now/0` and kin). `Task` and `Agent` raise by
+name under a run; see the Elixir section of `eta_transform`'s module docs
+for the boundary.
+
+One requirement: the rewrite needs `debug_info` in the compiled beams, which
+is Mix's default. Strip it and `mix compile.eta` refuses the module by name
+rather than shipping real-clock code into a simulation.
+
 ### Run simulations from their own build profile
 
 **In Mix, a `dst` environment and a `mix dst` alias to enter it.** In
@@ -243,6 +300,10 @@ The spawn rewrites matter more than they look. A child spawned with a plain
 `erlang:spawn` runs briefly on the real scheduler before anything suspends
 it. `eta_sched:spawn/1` starts it blocked on a token instead, so there's no
 window at all.
+
+Elixir modules qualify by construction — the compiler resolves every call and
+inlines the `Process`/`Kernel`/`System` wrappers to their `:erlang` forms —
+so there is nothing to do here in Elixir.
 
 ## Make your state readable
 
