@@ -54,6 +54,17 @@ defmodule DstElixirTest do
        Date.utc_today(), Time.utc_now()}
     end
 
+    def task_roundtrip do
+      Task.async(fn -> :sim_free end) |> Task.await(1000)
+    end
+
+    def agent_roundtrip do
+      {:ok, pid} = Agent.start_link(fn -> 41 end)
+      value = Agent.get(pid, &(&1 + 1))
+      :ok = Agent.stop(pid)
+      value
+    end
+
     def wait(timeout) do
       receive do
         :cancel -> :cancelled
@@ -162,7 +173,7 @@ defmodule DstElixirTest do
              "timer:sleep/1 survived the rewrite"
     end
 
-    test "GenServer is covered; Task is still the named gap", %{dir: dir} do
+    test "GenServer is covered; Task and Agent raise by name", %{dir: dir} do
       called = calls(dir, EtaElixirSut)
 
       # `GenServer.cast/2` used to be the pinned gap. The 'Elixir.GenServer'
@@ -170,10 +181,16 @@ defmodule DstElixirTest do
       refute :"Elixir.GenServer" in called,
              "a GenServer client call survived the rewrite"
 
-      # `Task.async/1` still delegates inside Elixir's stdlib, where no
-      # transform of user code reaches. Pinned so the Task work has a test to
-      # flip when it lands.
-      assert :"Elixir.Task" in called
+      # `Task` and `Agent` spawn and wait inside Elixir's stdlib, where
+      # nothing can gate them — so their call sites are rewritten to
+      # eta_sched:unsupported/2, which raises while a scheduler is active and
+      # calls the original otherwise. The gap keeps its name; implementing
+      # real Task support flips this to a plain rewrite.
+      refute :"Elixir.Task" in called,
+             "a Task call survived as a direct stdlib delegation"
+
+      refute :"Elixir.Agent" in called,
+             "an Agent call survived as a direct stdlib delegation"
     end
 
     test "the clock reads that do not inline land on the shims", %{dir: dir} do
@@ -238,16 +255,21 @@ defmodule DstElixirTest do
     end
   end
 
+  # Load the transformed beam explicitly rather than trusting whichever
+  # version the compiler left in the VM.
+  defp load_sut(dir) do
+    file = Path.join(dir, beam(EtaElixirSut))
+    :code.purge(EtaElixirSut)
+
+    {:module, EtaElixirSut} =
+      :code.load_binary(EtaElixirSut, String.to_charlist(file), File.read!(file))
+
+    :ok
+  end
+
   describe "the rewritten code runs" do
     setup %{dir: dir} do
-      # Load the transformed beam explicitly rather than trusting whichever
-      # version the compiler left in the VM.
-      file = Path.join(dir, beam(EtaElixirSut))
-      :code.purge(EtaElixirSut)
-
-      {:module, EtaElixirSut} =
-        :code.load_binary(EtaElixirSut, String.to_charlist(file), File.read!(file))
-
+      :ok = load_sut(dir)
       :ok = :eta_time.start()
       on_exit(fn -> :eta_time.stop() end)
       :ok
@@ -288,6 +310,32 @@ defmodule DstElixirTest do
       assert os2 - os1 == 5_000
       assert DateTime.diff(dt2, dt1, :millisecond) == 5_000
       assert NaiveDateTime.diff(naive2, naive1, :millisecond) == 5_000
+    end
+  end
+
+  describe "the named gap, gated on the scheduler" do
+    setup %{dir: dir} do
+      :ok = load_sut(dir)
+      :ok
+    end
+
+    test "Task and Agent work when nothing is running" do
+      assert EtaElixirSut.task_roundtrip() == :sim_free
+      assert EtaElixirSut.agent_roundtrip() == 42
+    end
+
+    test "Task and Agent raise by name while a scheduler is active" do
+      sched = :eta_sched.new()
+
+      try do
+        assert {:eta_sched, {:unsupported, {Task, :async, 1}, _}} =
+                 catch_error(EtaElixirSut.task_roundtrip())
+
+        assert {:eta_sched, {:unsupported, {Agent, :start_link, 1}, _}} =
+                 catch_error(EtaElixirSut.agent_roundtrip())
+      after
+        :eta_sched.release(sched)
+      end
     end
   end
 

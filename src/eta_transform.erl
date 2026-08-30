@@ -262,8 +262,10 @@ as unsupported, and `-behaviour('Elixir.GenServer')` — what `use GenServer`
 declares — gates the reply pass exactly as `gen_server` does. The clock reads
 that do not inline — `Process.sleep/1`, the unit-argument `System` forms, and
 the calendar constructors (`DateTime.utc_now` and kin) — land on `eta_time`,
-`Eta.System` and `Eta.Calendar`. What still delegates inside the Elixir stdlib
-uncovered is `Task` and `Agent`, which pass through untouched.
+`Eta.System` and `Eta.Calendar`. `Task` and `Agent` are the named gap: their
+spawns and waits happen inside the Elixir stdlib where nothing can gate them,
+so every entry point is rewritten to `eta_sched:unsupported/2`, which raises
+while a scheduler is active and calls the original otherwise.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -449,6 +451,87 @@ uncovered is `Task` and `Agent`, which pass through untouched.
     {'Elixir.Date', utc_today, 1} => {'Elixir.Eta.Calendar', date_utc_today}
 }).
 
+%% Elixir client functions eta cannot gate yet, rewritten to raise **while a
+%% scheduler is active** and delegate otherwise — `eta_sched:unsupported/2`.
+%%
+%% `Task` spawns inside the Elixir stdlib (so the child would run outside the
+%% schedule) and `Task.await/2` is a `receive ... after` in a module no
+%% transform touched (so the wait would sit on the real clock). `Agent` is a
+%% GenServer whose start and whole client API delegate the same way. This
+%% list rides the *unconditional* pass rather than `?NET_UNSUPPORTED` because
+%% the hazard is the scheduler's, not the network's: a run without a network
+%% still cannot afford an ungated spawn. What is left alone is as deliberate
+%% as what is here: `Task.completed/1`, `Task.ignore/1` and `Task.find/2`
+%% operate on a task value without spawning or waiting, and a supervisor
+%% start is not gated on the Erlang side either.
+-define(SCHED_UNSUPPORTED, [
+    {'Elixir.Task', async, 1},
+    {'Elixir.Task', async, 3},
+    {'Elixir.Task', async_stream, 2},
+    {'Elixir.Task', async_stream, 3},
+    {'Elixir.Task', async_stream, 4},
+    {'Elixir.Task', async_stream, 5},
+    {'Elixir.Task', await, 1},
+    {'Elixir.Task', await, 2},
+    {'Elixir.Task', await_many, 1},
+    {'Elixir.Task', await_many, 2},
+    {'Elixir.Task', yield, 1},
+    {'Elixir.Task', yield, 2},
+    {'Elixir.Task', yield_many, 1},
+    {'Elixir.Task', yield_many, 2},
+    {'Elixir.Task', shutdown, 1},
+    {'Elixir.Task', shutdown, 2},
+    {'Elixir.Task', start, 1},
+    {'Elixir.Task', start, 3},
+    {'Elixir.Task', start_link, 1},
+    {'Elixir.Task', start_link, 3},
+    {'Elixir.Task.Supervisor', async, 2},
+    {'Elixir.Task.Supervisor', async, 3},
+    {'Elixir.Task.Supervisor', async, 4},
+    {'Elixir.Task.Supervisor', async, 5},
+    {'Elixir.Task.Supervisor', async_nolink, 2},
+    {'Elixir.Task.Supervisor', async_nolink, 3},
+    {'Elixir.Task.Supervisor', async_nolink, 4},
+    {'Elixir.Task.Supervisor', async_nolink, 5},
+    {'Elixir.Task.Supervisor', async_stream, 3},
+    {'Elixir.Task.Supervisor', async_stream, 4},
+    {'Elixir.Task.Supervisor', async_stream, 5},
+    {'Elixir.Task.Supervisor', async_stream, 6},
+    {'Elixir.Task.Supervisor', async_stream_nolink, 3},
+    {'Elixir.Task.Supervisor', async_stream_nolink, 4},
+    {'Elixir.Task.Supervisor', async_stream_nolink, 5},
+    {'Elixir.Task.Supervisor', async_stream_nolink, 6},
+    {'Elixir.Task.Supervisor', start_child, 2},
+    {'Elixir.Task.Supervisor', start_child, 3},
+    {'Elixir.Task.Supervisor', start_child, 4},
+    {'Elixir.Task.Supervisor', start_child, 5},
+    {'Elixir.Agent', start, 1},
+    {'Elixir.Agent', start, 2},
+    {'Elixir.Agent', start, 3},
+    {'Elixir.Agent', start, 4},
+    {'Elixir.Agent', start_link, 1},
+    {'Elixir.Agent', start_link, 2},
+    {'Elixir.Agent', start_link, 3},
+    {'Elixir.Agent', start_link, 4},
+    {'Elixir.Agent', get, 2},
+    {'Elixir.Agent', get, 3},
+    {'Elixir.Agent', get, 4},
+    {'Elixir.Agent', get, 5},
+    {'Elixir.Agent', get_and_update, 2},
+    {'Elixir.Agent', get_and_update, 3},
+    {'Elixir.Agent', get_and_update, 4},
+    {'Elixir.Agent', get_and_update, 5},
+    {'Elixir.Agent', update, 2},
+    {'Elixir.Agent', update, 3},
+    {'Elixir.Agent', update, 4},
+    {'Elixir.Agent', update, 5},
+    {'Elixir.Agent', cast, 2},
+    {'Elixir.Agent', cast, 4},
+    {'Elixir.Agent', stop, 1},
+    {'Elixir.Agent', stop, 2},
+    {'Elixir.Agent', stop, 3}
+]).
+
 -if(?DOCATTRS).
 -doc "The `parse_transform` entry point. See the module doc.".
 -endif.
@@ -535,13 +618,20 @@ rewrite(
 rewrite(
     {call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}, _Locals
 ) ->
-    case maps:find({Mod, Fun, length(Args)}, ?REWRITES) of
-        {ok, {Target, TargetFun}} ->
-            {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, TargetFun}}, Args};
-        {ok, Target} ->
-            {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, Fun}}, Args};
-        error ->
-            {call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}
+    MFA = {Mod, Fun, length(Args)},
+    case lists:member(MFA, ?SCHED_UNSUPPORTED) of
+        true ->
+            unsupported_call(Anno, eta_sched, MFA, Args);
+        false ->
+            case maps:find(MFA, ?REWRITES) of
+                {ok, {Target, TargetFun}} ->
+                    {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, TargetFun}},
+                        Args};
+                {ok, Target} ->
+                    {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, Fun}}, Args};
+                error ->
+                    {call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}
+            end
     end;
 rewrite({call, Anno, {atom, FAnno, Fun}, Args}, Locals) ->
     Key = {Fun, length(Args)},
@@ -993,7 +1083,7 @@ net_rewrite({op, Anno, '!', Dest, Msg}, _Locals) ->
 net_rewrite({call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}, _Locals) ->
     MFA = {Mod, Fun, length(Args)},
     case lists:member(MFA, ?NET_UNSUPPORTED) of
-        true -> unsupported_call(Anno, MFA, Args);
+        true -> unsupported_call(Anno, eta_net, MFA, Args);
         false -> net_rewrite_known(Anno, RAnno, MAnno, FAnno, Mod, Fun, Args)
     end;
 net_rewrite({call, Anno, {atom, FAnno, Fun}, Args}, Locals) ->
@@ -1007,12 +1097,13 @@ net_rewrite({call, Anno, {atom, FAnno, Fun}, Args}, Locals) ->
 net_rewrite(Node, _Locals) ->
     Node.
 
-%% `M:F(A, B)` becomes `eta_net:unsupported({M, F, 2}, [A, B])`.
+%% `M:F(A, B)` becomes `Target:unsupported({M, F, 2}, [A, B])` — `eta_net` for
+%% the network pass, `eta_sched` for `?SCHED_UNSUPPORTED`.
 %%
-%% One target for every arity of every unsupported function, because it carries
-%% the original MFA rather than encoding it in the target's name — which is also
-%% what lets it call the original when no network is running.
-unsupported_call(Anno, {M, F, A}, Args) ->
+%% One target function for every arity of every unsupported call, because it
+%% carries the original MFA rather than encoding it in the target's name —
+%% which is also what lets it call the original when nothing is running.
+unsupported_call(Anno, Target, {M, F, A}, Args) ->
     MFA =
         {tuple, Anno, [
             {atom, Anno, M},
@@ -1024,7 +1115,7 @@ unsupported_call(Anno, {M, F, A}, Args) ->
         {nil, Anno},
         Args
     ),
-    {call, Anno, {remote, Anno, {atom, Anno, eta_net}, {atom, Anno, unsupported}}, [MFA, List]}.
+    {call, Anno, {remote, Anno, {atom, Anno, Target}, {atom, Anno, unsupported}}, [MFA, List]}.
 
 net_rewrite_known(Anno, RAnno, MAnno, FAnno, Mod, Fun, Args) ->
     case maps:find({Mod, Fun, length(Args)}, ?NET_REWRITES) of

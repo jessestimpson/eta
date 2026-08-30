@@ -177,6 +177,11 @@ releasing, not after.
     gated/1, gated/3
 ]).
 
+%% Client functions eta cannot gate yet — Elixir's `Task` and `Agent`, which
+%% spawn and wait inside the Elixir stdlib. Raise while a scheduler is active,
+%% delegate otherwise. See `unsupported/2`.
+-export([unsupported/2]).
+
 %% The distributed forms, which raise while a run is active. See `no_dist/3`.
 -export([
     spawn/2, spawn/4,
@@ -660,6 +665,37 @@ no_dist(true, MFA, _Delegate) ->
             {no_distribution, MFA,
                 <<"eta does not simulate distribution; run the nodes as processes in one VM">>}}
     ).
+
+%% `M:F(A, B)` becomes `eta_sched:unsupported({M, F, 2}, [A, B])`, for the
+%% functions `eta_transform`'s `?SCHED_UNSUPPORTED` lists — Elixir's `Task` and
+%% `Agent`, whose spawns and waits happen inside the Elixir stdlib. The
+%% scheduler cannot gate a process the stdlib creates, so it would run outside
+%% the schedule; a `Task.await/2` is a `receive ... after` in a module no
+%% transform touched, so its wait would sit on the real clock. Same position
+%% `no_dist/3` takes on the distributed spawns and `eta_net:unsupported/2`
+%% takes on the unroutable sends, for the same reason: there is no honest
+%% local substitute, and letting the call through would mean a run reporting
+%% determinism it does not have.
+%%
+%% Gated on `active()` rather than on a network, because the hazard is the
+%% scheduler's — a run without a network still cannot afford an ungated spawn.
+-spec unsupported({module(), atom(), arity()}, [term()]) -> term().
+unsupported({M, F, _A} = MFA, Args) ->
+    case active() of
+        false ->
+            apply(M, F, Args);
+        true ->
+            error(
+                {eta_sched,
+                    {unsupported, MFA, <<
+                        "this function spawns or waits inside the Elixir standard "
+                        "library, where the scheduler cannot gate it: a process it "
+                        "created would run outside the schedule, and a wait would "
+                        "sit on the real clock. Spawn through spawn/1 or a "
+                        "gen_server/gen_statem start instead"
+                    >>}}
+            )
+    end.
 
 %% Computed in the *parent*, because `$ancestors` is the parent's list with the
 %% parent on the front and the child cannot see it.

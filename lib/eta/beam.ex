@@ -29,10 +29,13 @@ defmodule Eta.Beam do
 
   ## Prototype boundaries, deliberately
 
-  - **The `'Elixir.*'` rewrite tables cover `GenServer` and the clock reads —
-    not yet `Task` or `Agent`**, whose calls delegate inside Elixir's stdlib
-    and pass through untouched. This module is the delivery mechanism; that
-    table grows separately, and it is the same work under any mechanism.
+  - **The `'Elixir.*'` rewrite tables cover `GenServer` and the clock reads.
+    `Task` and `Agent` are the named gap**: their spawns and waits happen
+    inside Elixir's stdlib where nothing can gate them, so their entry points
+    raise while a scheduler is active (`eta_sched:unsupported/2`) rather than
+    quietly running outside the schedule. This module is the delivery
+    mechanism; that table grows separately, and it is the same work under any
+    mechanism.
   - The rewritten beam is compiled fresh from forms, so the Elixir-specific
     chunks (`Docs`, `ExCk`) are dropped. Harmless in a `:dst` profile, whose
     beams exist to be simulated, not documented.
