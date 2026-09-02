@@ -1909,6 +1909,10 @@ kill_all(Dying) ->
             %% As `notify_exit/2` would, but the scheduler has not seen these
             %% deaths yet and a survivor may monitor one before it does.
             true = ets:insert(?DEAD, {P}),
+            %% Its timers die with it, as a real node's do. Left in the wheel
+            %% they would be strays the run gets charged with, for a fault the
+            %% run injected on purpose. See `eta_time:forget/1`.
+            _ = eta_time:forget(P),
             true = erlang:exit(P, kill)
         end,
         Dying

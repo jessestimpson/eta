@@ -71,7 +71,8 @@ concurrently in the same node.
     monotonic_time/1,
     system_time/0,
     system_time/1,
-    timestamp/0
+    timestamp/0,
+    universal_time/0
 ]).
 
 %% Timers.
@@ -113,6 +114,7 @@ concurrently in the same node.
     advance/1,
     pending/0,
     strays/0,
+    forget/1,
     set_faults/1,
     stats/0
 ]).
@@ -283,6 +285,16 @@ timestamp() ->
         true ->
             Micro = system_time(microsecond),
             {Micro div 1000000000000, (Micro div 1000000) rem 1000000, Micro rem 1000000}
+    end.
+
+%% `calendar:universal_time/0` is a wall-clock read by another name — the same
+%% `os:system_time/0` underneath — and `eta_transform` points it here. Derived
+%% from `system_time/1` so it agrees with every other read of the clock.
+-spec universal_time() -> calendar:datetime().
+universal_time() ->
+    case running() of
+        false -> calendar:universal_time();
+        true -> calendar:system_time_to_universal_time(system_time(second), second)
     end.
 
 %% ---------------------------------------------------------------------------
@@ -693,6 +705,38 @@ strays() ->
     case ets:info(?STRAYS, size) of
         undefined -> 0;
         N -> N
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Cancels every timer addressed to `Pid`. What `eta_net:kill_node/2` calls for
+each process it kills: a node that has died takes its timers with it, so a
+heartbeat or gossip tick the process had armed is not a stray the run should
+be charged with — it is exactly what a real node death cancels.
+
+Timers addressed to a registered name are left alone; a name may be taken by a
+restarted process, and a real timer to a name outlives the process too.
+""".
+-endif.
+-spec forget(pid()) -> non_neg_integer().
+forget(Pid) when is_pid(Pid) ->
+    case running() of
+        false ->
+            0;
+        true ->
+            Mine = [
+                {Key, Ref}
+             || {Key, Ref, Dest, _Msg, _Kind, _Drop} <- ets:tab2list(?TIMERS),
+                Dest =:= Pid
+            ],
+            lists:foreach(
+                fun({Key, Ref}) ->
+                    true = ets:delete(?TIMERS, Key),
+                    true = ets:delete(?REFS, Ref)
+                end,
+                Mine
+            ),
+            length(Mine)
     end.
 
 -if(?DOCATTRS).

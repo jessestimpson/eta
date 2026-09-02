@@ -26,6 +26,26 @@ defmodule DstTimeTest do
   # ---------------------------------------------------------------------------
 
   describe "virtual clock" do
+    test "forget/1 cancels every timer addressed to a pid and nothing else" do
+      # What `eta_net:kill_node/2` calls for each process it kills: a dead
+      # node's heartbeat is not a stray the run should be charged with.
+      :ok = @time.start(%{start_ms: 0})
+      other = spawn(fn -> receive do: (:never -> :ok) end)
+
+      r1 = @time.send_after(10, other, :a)
+      _r2 = @time.send_after(20, other, :b)
+      r3 = @time.send_after(30, self(), :c)
+      assert @time.pending() == 3
+
+      assert @time.forget(other) == 2
+      assert @time.pending() == 1
+      assert @time.read_timer(r1) == false
+      assert is_integer(@time.read_timer(r3))
+      assert @time.forget(other) == 0
+
+      Process.exit(other, :kill)
+    end
+
     test "time does not move on its own" do
       :ok = @time.start(%{start_ms: 0})
 

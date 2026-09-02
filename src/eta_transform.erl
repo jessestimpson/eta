@@ -132,6 +132,8 @@ simulation.
 | `os:system_time/0,1` | `eta_time:system_time/0,1` |
 | `os:timestamp/0` | `eta_time:timestamp/0` |
 | `timer:sleep/1` | `eta_time:sleep/1` |
+| `calendar:universal_time/0` | `eta_time:universal_time/0` |
+| `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`, `seed/1,2` | `eta_rand:*` |
 
 ## Sending
 
@@ -271,6 +273,19 @@ pass exists to virtualise. A sleep in an *untransformed* module still hangs.
     %% no transform of user code reaches — so the call site is rewritten instead.
     %% See `eta_time:sleep/1`, including why it must not run on the driver.
     {timer, sleep, 1} => eta_time,
+    %% A wall-clock read by another name. See `eta_time:universal_time/0`.
+    {calendar, universal_time, 0} => eta_time,
+    %% `rand`'s process-local state is seeded lazily by OTP from real entropy,
+    %% inside the `rand` module — so a system that picks a peer at random has a
+    %% schedule that is not a function of the seed, and nothing reports it. See
+    %% `eta_rand`.
+    {rand, uniform, 0} => eta_rand,
+    {rand, uniform, 1} => eta_rand,
+    {rand, uniform_real, 0} => eta_rand,
+    {rand, normal, 0} => eta_rand,
+    {rand, normal, 2} => eta_rand,
+    {rand, seed, 1} => eta_rand,
+    {rand, seed, 2} => eta_rand,
     %% Spawning. A child spawned plainly runs on the real scheduler until
     %% `set_on_spawn` adoption catches it; `eta_sched:spawn/1` starts it blocked
     %% instead, so there is no window. See `eta_sched:spawn/1`.

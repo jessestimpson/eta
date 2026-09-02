@@ -123,6 +123,9 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
     %% What the simulated network did, or `#{}` when none was installed. See
     %% `eta_net:stats/0`; `dropped` is what a non-vacuity guard asserts on.
     net := #{atom() => non_neg_integer()},
+    %% What the seeded `rand` streams did. `unmanaged` is a draw by a process
+    %% the scheduler was not stepping. See `eta_rand:stats/0`.
+    rand := #{atom() => non_neg_integer()},
     sched := #{atom() => term()}
 }.
 
@@ -388,6 +391,9 @@ knowing as more are added, this checks them:
   Fix by spawning through `eta_run:spawn_op/1` and `eta_sched:spawn/1`.
 - `sched.timeouts` — steps that ended without the process reaching a receive,
   so it was suspended wherever it happened to be.
+- `net.unmanaged` and `rand.unmanaged` — a send, or a `rand` draw, by a process
+  other than the one being stepped, so when it happened was decided by wall
+  clock. See `eta_net` and `eta_rand`.
 
 `{suspect, Reasons}` rather than `{error, _}` deliberately: the run happened and
 its violation, if any, is real. What you cannot do is trust the seed to give it
@@ -400,6 +406,7 @@ simulation suite after the determinism gate itself.
 -spec audit(result()) -> ok | {suspect, [{atom(), term()}]}.
 audit(Result = #{modules_loaded := Modules, sched := Sched}) ->
     Net = maps:get(net, Result, #{}),
+    Rand = maps:get(rand, Result, #{}),
     Checks = [
         {modules_loaded, Modules, []},
         {adopted_late, maps:get(adopted_late, Sched, 0), 0},
@@ -416,7 +423,11 @@ audit(Result = #{modules_loaded := Modules, sched := Sched}) ->
         %% was decided by wall clock. Nothing else in this list catches it — the
         %% run audits clean and the trace diverges anyway. See
         %% `eta_sched:stepping/0`.
-        {net_unmanaged, maps:get(unmanaged, Net, 0), 0}
+        {net_unmanaged, maps:get(unmanaged, Net, 0), 0},
+        %% The same failure for `rand`: a draw by a process other than the one
+        %% being stepped advanced, or created, a stream at a moment wall clock
+        %% chose. See `eta_rand`.
+        {rand_unmanaged, maps:get(unmanaged, Rand, 0), 0}
     ],
     case [{What, Found} || {What, Found, Clean} <- Checks, Found =/= Clean] of
         [] -> ok;
@@ -566,6 +577,10 @@ drive(Mod, Opts, Source) ->
     %% by default, so a harness that wants faults only after its cluster has
     %% synced calls `eta_net:set_policy/1` from `init/2` rather than reseeding.
     ok = start_net(maps:get(net, Opts, false), Seed),
+    %% And the seeded `rand` streams, for the same reason again: a process that
+    %% draws during `init/2` gets its stream from this run's seed rather than
+    %% from OTP's entropy. See `eta_rand`.
+    ok = eta_rand:start(#{seed => Seed}),
     try
         {ok, Sut} = Mod:init(Seed, maps:get(config, Opts, #{})),
         Sched0 = eta_sched:new(#{seed => Seed}),
@@ -614,6 +629,7 @@ drive(Mod, Opts, Source) ->
         %% down first and its non-vacuity guard reported zero drops on a run that
         %% had dropped plenty, a guard that failed closed only by accident.
         eta_net:stop(),
+        eta_rand:stop(),
         eta_time:stop()
     end.
 
@@ -1091,6 +1107,7 @@ finish(Outcome, R) ->
     %% While both the network and the clock are still up — `in_flight` is a
     %% question about the wheel, not just a counter.
     Net = net_stats(),
+    Rand = eta_rand:stats(),
     %% Before `release/1` and `terminate/1`, so that teardown's own loading is
     %% not blamed on the run.
     Modules = loaded_since(R#r.loaded),
@@ -1119,6 +1136,7 @@ finish(Outcome, R) ->
         modules_loaded => Modules,
         stray_timers => Strays,
         net => Net,
+        rand => Rand,
         sched => Stats
     }.
 

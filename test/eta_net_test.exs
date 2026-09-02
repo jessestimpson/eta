@@ -1404,6 +1404,27 @@ defmodule EtaNetTest do
       %{member: member, conn: conn, peer: peer, observer: observer}
     end
 
+    test "takes the dead node's timers with it", %{member: member, conn: conn, peer: peer} do
+      # A heartbeat armed by a process that then dies with its node would sit
+      # in the wheel as a stray the run is charged with, for a fault the run
+      # injected on purpose. The survivor's timer is untouched.
+      :ok = :eta_time.start(%{seed: 1})
+
+      try do
+        _ = :eta_time.send_after(1_000, member, :tick)
+        _ = :eta_time.send_after(1_000, conn, :tick)
+        kept = :eta_time.send_after(1_000, peer, :tick)
+        assert :eta_time.pending() == 3
+
+        :ok = @net.kill_node(:na, %{signal: :nodedown})
+
+        assert :eta_time.pending() == 1
+        assert is_integer(:eta_time.read_timer(kept))
+      after
+        :eta_time.stop()
+      end
+    end
+
     test "kills every located process, signals the survivors, and reports noconnection to a remote monitor",
          %{member: member, conn: conn, peer: peer, observer: observer} do
       # Cross-node: simulated, so it can be told what distribution would have told

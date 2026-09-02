@@ -131,6 +131,20 @@ defmodule DstSchedTest do
   # ---------------------------------------------------------------------------
 
   describe "determinism" do
+    test "a gated start from a process the scheduler is not stepping raises rather than hanging" do
+      # The child would be born waiting for a token only adoption sends, and the
+      # caller would wait on the child. This is what a harness's `execute/2`
+      # does when it calls a transformed module's `start_link/3` directly.
+      sched = @sched.new(%{seed: 1})
+
+      try do
+        assert {:eta_sched, {:start_outside_schedule, {Pinger, :link}, _}} =
+                 catch_error(@sched.start_link(Pinger, {:p, nil}, []))
+      after
+        @sched.release(sched)
+      end
+    end
+
     test "one seed produces an identical trace across many runs" do
       # The design doc's Phase 0 bar, at its stated number. Each run builds and tears
       # down a real supervision tree; 1000 of them costs ~23s, which is worth

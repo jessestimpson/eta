@@ -855,6 +855,7 @@ gated_start(Name, Mod, Args, Kind) ->
     gated_start(Name, Mod, Args, Kind, gated).
 
 gated_start(Name, Mod, Args, Kind, Entry) ->
+    ok = assert_stepping(Mod, Kind),
     Parent = self(),
     Ancestors = [Parent | own_ancestors()],
     MFA = [Parent, Ancestors, Name, Mod, Args],
@@ -865,6 +866,29 @@ gated_start(Name, Mod, Args, Kind, Entry) ->
             plain -> {erlang:spawn(?MODULE, Entry, MFA), undefined}
         end,
     await_start(Pid, Ref, Kind).
+
+%% A gated child is released when the scheduler adopts it, and the scheduler
+%% adopts what the process it is stepping creates. A start from any other
+%% process while a scheduler is active — the harness's `execute/2` is the
+%% usual one, through a transformed module's `start_link/3` — would wait in
+%% `await_start/3` for a token nothing sends, with the driver blocked and the
+%% run unable to end. Raising is the only useful answer; `eta_run:spawn_op/1`
+%% is the way to do it from an operation.
+assert_stepping(Mod, Kind) ->
+    case stepping() of
+        Self when Self =:= self() ->
+            ok;
+        _ ->
+            error(
+                {?MODULE,
+                    {start_outside_schedule, {Mod, Kind}, <<
+                        "a gated start from a process the scheduler is not stepping "
+                        "would wait for a token nothing sends. Start it from an "
+                        "operation via eta_run:spawn_op/1, or before the scheduler "
+                        "exists in init/2"
+                    >>}}
+            )
+    end.
 
 %% `infinity`, deliberately: see the note on start timeouts above. The child cannot
 %% run until the scheduler adopts it, and the scheduler is not waiting on us.

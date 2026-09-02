@@ -211,6 +211,29 @@ a process-dictionary stack.
 Watch `sched.adopted_late` in the run result. It should be at or very near
 zero.
 
+### An unseeded `rand` is a determinism hole, and it's handled
+
+`rand:uniform/1` draws from a state in the process dictionary, and a process
+that has never seeded it gets seeded by OTP on first use — from
+`erlang:system_time/0` and `erlang:unique_integer/1`, inside the `rand`
+module, where no transform of your code reaches. So a system that picks a
+gossip peer with `lists:nth(rand:uniform(length(Peers)), Peers)` has a
+schedule that isn't a function of the seed, and nothing in the run result
+says so: `adopted_late` is 0, nothing loaded late, the scheduler's accounting
+is clean, and the same seed produces a different trace on every run.
+
+`eta_transform` rewrites `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`
+and `seed/1,2` to `eta_rand`, which gives each process a stream of its own
+derived from the run's seed. An explicit `rand:seed(Alg, Seed)` is honoured,
+since that was deterministic already. Only the process-local API is covered:
+`rand:uniform_s/1,2` and the rest of the `_s` family take their state as an
+argument and were never the problem.
+
+What it can't cover is a draw in an untransformed module, or one made by a
+process the scheduler isn't stepping. The second is counted as
+`rand.unmanaged` in the run result and `audit/1` reports it, the same way
+`net.unmanaged` reports a send from outside the schedule.
+
 ### The distributed spawn forms raise
 
 `spawn(Node, Fun)` and its relatives ask for a process on another node, and

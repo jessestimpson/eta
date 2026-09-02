@@ -1,6 +1,19 @@
 # Changelog
 
-## 0.1.0 - 2026-08-26
+## 0.1.1 (TBD)
+
+### Enhancements
+
+- Added `eta_rand`, a seeded stand-in for the process-local `rand` state.
+- A `gen_server` or `gen_statem` that is started outside the scheduler
+  can be detected in certain cases. In those cases, an error is raised:
+  `{eta_sched, {start_outside_schedule, _, _}}`
+- Added `eta_time:forget/1`, which cancels every timer addressed to a pid, and
+  `eta_net:kill_node/2` now calls it for each process it kills.
+- Added `eta_time:universal_time/0`, which the parse_transform uses in place of
+  `calendar:universal_time/0`.
+
+## 0.1.0 (2026-08-26)
 
 Initial release. `eta` was extracted from the project that motivated it, a
 durable process registry, and developed against 2 example systems that ship in
