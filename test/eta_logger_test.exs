@@ -37,6 +37,15 @@ defmodule EtaLoggerTest do
       assert events() == [{:warning, ["~p failed", [:replica_2]]}]
     end
 
+    test "the ?LOG_ macros become events too" do
+      # They expand to `erlang:apply(logger, macro_log, [Location, Level | Args])`
+      # rather than a level call, which is a different shape for the transform
+      # to catch — and the one every OTP 21+ codebase actually uses.
+      :eta_spawn_sut.say_macro("stalled")
+      :eta_spawn_sut.say_macro_fmt("~p gone", [:node_b])
+      assert events() == [{:warning, ["stalled"]}, {:error, ["~p gone", [:node_b]]}]
+    end
+
     test "reports and logger:log/2 carry their level" do
       :eta_spawn_sut.say_report(%{what: :broke})
       :eta_spawn_sut.say_level(:debug, "quiet")

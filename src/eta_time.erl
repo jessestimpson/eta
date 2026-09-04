@@ -152,13 +152,22 @@ Starts the virtual clock.
 Options:
 
 - `start_ms` — the clock's initial value (default 0).
+- `system_ms` — what `system_time/1` reads at `start_ms`, in milliseconds since
+  the epoch. Defaults to the real wall clock, so a hand-driven clock reads
+  plausibly. `eta_run` sets it from the seed instead: a system that derives a
+  decision from `os:timestamp/0` — seeding `rand` from it is the common case —
+  would otherwise carry the real start time into its schedule, and a run and
+  its replay start at different times.
 - `seed` — seeds the fault RNG, so an injected timer fault schedule replays.
 - `faults` — see `set_faults/1`.
 
 Idempotent in the sense that starting over a running clock resets it.
 """.
 -endif.
--spec start(#{start_ms => integer(), seed => integer(), faults => fault_opts()}) -> ok.
+-spec start(#{
+    start_ms => integer(), system_ms => integer(), seed => integer(), faults => fault_opts()
+}) ->
+    ok.
 start(Opts) ->
     ok = claim(?STATE, eta_time, clock_in_use),
     stop(),
@@ -175,7 +184,8 @@ start(Opts) ->
         {dropped, 0},
         %% Offset chosen so system_time/1 returns a plausible wall clock rather
         %% than a number near zero, which tends to confuse code that formats it.
-        {system_offset, erlang:system_time(millisecond) - StartMs},
+        %% Real by default; a run pins it, see the option.
+        {system_offset, maps:get(system_ms, Opts, erlang:system_time(millisecond)) - StartMs},
         {faults, maps:get(faults, Opts, #{})},
         {rand, rand:seed_s(exsss, {Seed, Seed + 7, Seed + 13})}
     ]),
@@ -710,9 +720,10 @@ strays() ->
 -if(?DOCATTRS).
 -doc """
 Cancels every timer addressed to `Pid`. What `eta_net:kill_node/2` calls for
-each process it kills: a node that has died takes its timers with it, so a
-heartbeat or gossip tick the process had armed is not a stray the run should
-be charged with — it is exactly what a real node death cancels.
+each process it kills, and what `eta_sched` calls for every exit it observes:
+a process that has died takes its timers with it, so a heartbeat or gossip
+tick it had armed is not a stray the run should be charged with — it is
+exactly what a death cancels.
 
 Timers addressed to a registered name are left alone; a name may be taken by a
 restarted process, and a real timer to a name outlives the process too.

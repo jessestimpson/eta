@@ -146,6 +146,10 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
 %% slower is a `check/1` that called into a suspended process — see `eta_harness`.
 -define(CHECK_TIMEOUT, 5000).
 
+%% Where the simulated wall clock starts: 2024-01-01T00:00:00Z, plus a second
+%% per seed so that no two seeds share a timestamp either.
+-define(SYSTEM_EPOCH_MS, 1704067200000).
+
 -record(r, {
     mod :: module(),
     sut :: eta_harness:state(),
@@ -569,7 +573,12 @@ drive(Mod, Opts, Source) ->
     ok = start_log(maps:get(log, Opts, true)),
     ok = eta_log:label('$eta'),
     %% Before the system, always — see the module doc.
-    ok = eta_time:start(#{seed => Seed}),
+    %% The wall clock the system reads is pinned to the seed as well. Left
+    %% real, a run and its replay would start at different times, and any
+    %% decision derived from `os:timestamp/0` — a `rand` seeded from it, which
+    %% riak_core's claimant does — would differ between them with nothing in
+    %% the trace to show for it.
+    ok = eta_time:start(#{seed => Seed, system_ms => ?SYSTEM_EPOCH_MS + Seed * 1000}),
     %% And the network before the system for the same reason the clock is: a
     %% policy installed after the system has started has already had the startup
     %% traffic go past it, and startup runs on the real scheduler. That is how a

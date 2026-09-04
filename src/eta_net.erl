@@ -1,5 +1,12 @@
 -module(eta_net).
 
+-compile(
+    {nowarn_deprecated_function, [
+        {gen_fsm, send_event, 2},
+        {gen_fsm, send_all_state_event, 2}
+    ]}
+).
+
 %% `monitor/2,3` and `demonitor/1,2` are the API names, shadowing the
 %% auto-imported BIFs. The originals are always reached qualified.
 -compile({no_auto_import, [monitor/2, monitor/3, demonitor/1, demonitor/2]}).
@@ -140,6 +147,8 @@ waiting one out costs no real time.
     send/2,
     send/3,
     cast/2,
+    send_event/2,
+    send_all_state_event/2,
     call/2,
     call/3,
     reply/1,
@@ -393,6 +402,35 @@ cast(Dest, Msg) ->
 
 -if(?DOCATTRS).
 -doc """
+`gen_fsm:send_event/2`, routed: a cast under `gen_fsm`'s `'$gen_event'`
+envelope, tagged by the event the same way.
+""".
+-endif.
+-spec send_event(dest() | term(), term()) -> ok.
+send_event(Dest, Event) ->
+    case running() andalso normalize(Dest) of
+        To when is_pid(To) ->
+            catch route(self(), To, {'$gen_event', Event}, tag(Event)),
+            ok;
+        _ ->
+            gen_fsm:send_event(Dest, Event)
+    end.
+
+-if(?DOCATTRS).
+-doc "`gen_fsm:send_all_state_event/2`, routed. See `send_event/2`.".
+-endif.
+-spec send_all_state_event(dest() | term(), term()) -> ok.
+send_all_state_event(Dest, Event) ->
+    case running() andalso normalize(Dest) of
+        To when is_pid(To) ->
+            catch route(self(), To, {'$gen_all_state_event', Event}, tag(Event)),
+            ok;
+        _ ->
+            gen_fsm:send_all_state_event(Dest, Event)
+    end.
+
+-if(?DOCATTRS).
+-doc """
 `gen_server:call/2,3` and `gen_statem:call/2,3`, with **both legs on the
 network**. One target for both, because the request is the same
 `{'$gen_call', From, Request}` either way.
@@ -413,13 +451,22 @@ differences:
 
 - **The timeout is virtual**, so waiting one out on a dropped request costs no
   real time and fires where the schedule chose. See below for when.
-- **The monitor is `eta_net`'s own and is deliberately left real**, rather than
-  going through `monitor/2`. It exists to notice a callee that died, and it has
-  to work whatever the scheduler is or is not reporting — this is the path that
-  turns a dead callee into an exit instead of a hang. The cost is that a call
-  outstanding across a `partition/3` ends in its (virtual) timeout rather than in
-  `noconnection`, which is a known simplification. Monitors the *system* holds
-  are simulated and do get `noconnection`; see `monitor/2`.
+- **The monitor is `eta_net`'s own, real and simulated at once.** Real, rather
+  than going through `monitor/2`, because it exists to notice a callee that
+  died and has to work whatever the scheduler is or is not reporting — this is
+  the path that turns a dead callee into an exit instead of a hang. And entered
+  in the simulated-monitor table for the duration of the call, so that a
+  `partition/3` cutting the link fires it with `noconnection` the way it fires
+  every monitor the system holds across the cut. The caller sees
+  `{{nodedown, Node}, {eta_net, call, _}}`, which is what `gen:call/4` makes of
+  a `noconnection` DOWN. A call *into* an already-severed link fails the same
+  way at once, as distribution refuses a node it cannot connect to.
+
+  That matters for a call with no timeout of its own. `riak_core`'s metadata
+  exchange is a chain of `infinity` calls holding a lock on both trees; under
+  the earlier simplification — a call outstanding across a partition ended in
+  its timeout — one partition left it holding both locks forever, and no
+  exchange between those nodes ever succeeded again.
 
 **Raises `unrouted_reply` if the callee was not built with the transform**, since
 its reply then comes around the network and one direction of the channel is
@@ -473,7 +520,15 @@ call(Dest, Req, Timeout0) ->
                 false -> sim_call(To, Dest, Req, Timeout)
             end;
         _ ->
-            gen_server:call(Dest, Req, Timeout)
+            %% A `{Name, Node}` naming a simulated node with nothing registered
+            %% under `Name' — the server died with its node, say — is `noproc`,
+            %% as a call to an unregistered local name is. Handing it to
+            %% `gen_server:call/3` instead would have the VM try to reach a node
+            %% that does not exist, on the real clock. See `monitor/2`.
+            case running() andalso on_simulated_node(Dest) of
+                true -> exit({noproc, {eta_net, call, [Dest, Req, Timeout]}});
+                false -> gen_server:call(Dest, Req, Timeout)
+            end
     end.
 
 %% Whether a deadline armed by *this* process will actually be reached.
@@ -507,18 +562,39 @@ call_timeout({dirty_timeout, T}) -> T;
 call_timeout(T) -> T.
 
 do_call(To, Dest, Req, Timeout) ->
+    %% A link already down is refused before anything is sent, as distribution
+    %% refuses a node it cannot connect to — rather than routing a request the
+    %% cut will swallow and waiting out a timeout the caller may not have.
+    case link_down(self(), To) of
+        true -> exit({{nodedown, node_of(To)}, {eta_net, call, [Dest, Req, Timeout]}});
+        false -> ok
+    end,
     Tag = make_ref(),
     Mon = erlang:monitor(process, To),
     %% Before the request goes out, so a reply cannot beat the registration and be
     %% mistaken for an unrouted one.
     true = ets:insert(?CALLS, {Tag, outstanding}),
+    %% The same monitor, entered in the simulated table for the duration of the
+    %% call so `sever/3` can fire it with `noconnection` when a partition cuts
+    %% the link. Taken out again on every way out below, since a DOWN for a call
+    %% that has finished would land as a message nothing expects.
+    true = ets:insert(?MONS, {Mon, self(), To, To, 'DOWN', next_seq()}),
     _ = route(self(), To, {'$gen_call', {self(), Tag}, Req}, tag(Req)),
-    case wait(Tag, Mon, Timeout) of
+    Result = wait(Tag, Mon, Timeout),
+    true = ets:delete(?MONS, Mon),
+    case Result of
         {reply, Reply} ->
             true = erlang:demonitor(Mon, [flush]),
             ok = check_routed(Tag, To, Req),
             Reply;
+        {down, noconnection} ->
+            %% The link went while the call was out. Flushed, because the real
+            %% monitor is still armed and the synthetic DOWN did not consume it.
+            true = erlang:demonitor(Mon, [flush]),
+            true = ets:delete(?CALLS, Tag),
+            exit({{nodedown, node_of(To)}, {eta_net, call, [Dest, Req, Timeout]}});
         {down, Reason} ->
+            true = erlang:demonitor(Mon, [flush]),
             true = ets:delete(?CALLS, Tag),
             exit({Reason, {eta_net, call, [Dest, Req, Timeout]}});
         timeout ->
@@ -1016,13 +1092,35 @@ next_seq() ->
     ets:update_counter(?STATE, seq, 1).
 
 -if(?DOCATTRS).
--doc "The simulated node a process is on, or `undefined`. See `place/2`.".
+-doc """
+The simulated node a process is on, or `undefined`. See `place/2`.
+
+A process that is not placed itself answers with its **spawner's** node, if
+the spawner has one. Children a scheduled parent creates are placed by
+`inherit/2` as `eta_sched` adopts them, so this fallback is for the child that
+exists before there is a scheduler to adopt it — a worker a server spawns from
+its `init/1` during the harness's `init/2` — which is on its parent's node in
+every sense but the table's. It is *not* placed by being asked about: it stays
+off the wire and outside `kill_node/2`'s reach, which is why the harness should
+still return from `init/2` with such children finished.
+""".
 -endif.
 -spec node_of(dest()) -> term() | undefined.
 node_of(Dest) ->
-    case placement(normalize(Dest)) of
-        {Node, _Faultable} -> Node;
-        undefined -> undefined
+    case normalize(Dest) of
+        Pid when is_pid(Pid) -> node_of_pid(Pid);
+        _ -> undefined
+    end.
+
+node_of_pid(Pid) ->
+    case placement(Pid) of
+        {Node, _Faultable} ->
+            Node;
+        undefined ->
+            case erlang:process_info(Pid, parent) of
+                {parent, Parent} when is_pid(Parent) -> node_of_pid(Parent);
+                _ -> undefined
+            end
     end.
 
 -if(?DOCATTRS).
@@ -1368,6 +1466,13 @@ simulated_pair(Watcher, Target) ->
 simulated_name({Name, Node}) when is_atom(Name), Node =/= node() ->
     whereis_name(Node, Name) =/= undefined;
 simulated_name(_) ->
+    false.
+
+%% Whether a `{Name, Node}` names a node the topology knows — whatever is or
+%% is not registered there. `place/2` records every node it is given.
+on_simulated_node({Name, Node}) when is_atom(Name), Node =/= node() ->
+    ets:member(?PLACE, {node, Node});
+on_simulated_node(_) ->
     false.
 
 %% What `erlang:monitor/2` puts in the DOWN message's `Object` position.

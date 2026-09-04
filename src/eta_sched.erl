@@ -217,6 +217,25 @@ releasing, not after.
     statem_gated/5
 ]).
 
+%% And for `gen_fsm`, which has no `start_monitor` and enters its loop through
+%% `gen_fsm:enter_loop/4,5`. See `fsm_start_link/3`.
+-export([
+    fsm_start_link/3, fsm_start_link/4,
+    fsm_start/3, fsm_start/4,
+    fsm_gated/5
+]).
+
+-compile(
+    {nowarn_deprecated_function, [
+        {gen_fsm, start, 3},
+        {gen_fsm, start, 4},
+        {gen_fsm, start_link, 3},
+        {gen_fsm, start_link, 4},
+        {gen_fsm, enter_loop, 4},
+        {gen_fsm, enter_loop, 5}
+    ]}
+).
+
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export_type([sched/0, id/0, outcome/0, cold/0]).
@@ -368,6 +387,10 @@ Resumes every process, stops tracing, and shuts the scheduler down.
 
 The system runs freely again. Inspect (`choices/1`, `stats/1`) *before* calling
 this — the handle is dead afterwards.
+
+`active/0` is false from the moment before the first process resumes, so a
+start a resumed process makes on its way out is a plain one rather than a gated
+start nothing will release.
 """.
 -endif.
 -spec release(sched()) -> ok.
@@ -461,7 +484,7 @@ only genuinely ungated children.
 
 The child is spawned by MFA rather than as a fun so that the spawn trace event
 carries `{eta_sched, gated, _}` — that is how the scheduler tells a gated child from
-one it must chase. `gated_plib` and `statem_gated` are recognised the same way;
+one it must chase. `gated_plib`, `statem_gated` and `fsm_gated` are recognised the same way;
 adding a gated entry point means adding it to `is_gated/1` and to `handle_trace/2`
 as well, or its children wait on a token nobody sends.
 
@@ -1022,6 +1045,90 @@ statem_enter_loop(Mod, undefined, State, Data, Actions) ->
 statem_enter_loop(Mod, Name, State, Data, Actions) ->
     gen_statem:enter_loop(Mod, [], State, Data, Name, Actions).
 
+-if(?DOCATTRS).
+-doc """
+`gen_fsm:start_link/3` for a system under simulation — the `gen_fsm` half of
+`start_link/3`, on the same terms as `statem_start_link/3`.
+
+`init/1` returning `{ok, StateName, StateData}` and `{ok, StateName, StateData,
+Timeout}` is covered — the time-out goes onto the virtual clock through
+`eta_fsm:init_return/1` when one is running, and is refused when none is —
+along with `{stop, Reason}` and `ignore`. `hibernate` raises rather than being
+guessed at.
+
+`gen_fsm` has no `start_monitor`. Inert with no scheduler running.
+""".
+-endif.
+-spec fsm_start_link(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
+fsm_start_link(Mod, Args, Options) ->
+    case active() of
+        false -> gen_fsm:start_link(Mod, Args, Options);
+        true -> gated_start(undefined, Mod, Args, link, fsm_gated)
+    end.
+
+-spec fsm_start(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
+fsm_start(Mod, Args, Options) ->
+    case active() of
+        false -> gen_fsm:start(Mod, Args, Options);
+        true -> gated_start(undefined, Mod, Args, plain, fsm_gated)
+    end.
+
+-spec fsm_start_link(gen_server:server_name(), module(), term(), list()) ->
+    {ok, pid()} | ignore | {error, term()}.
+fsm_start_link(Name, Mod, Args, Options) ->
+    case active() of
+        false -> gen_fsm:start_link(Name, Mod, Args, Options);
+        true -> gated_start(Name, Mod, Args, link, fsm_gated)
+    end.
+
+-spec fsm_start(gen_server:server_name(), module(), term(), list()) ->
+    {ok, pid()} | ignore | {error, term()}.
+fsm_start(Name, Mod, Args, Options) ->
+    case active() of
+        false -> gen_fsm:start(Name, Mod, Args, Options);
+        true -> gated_start(Name, Mod, Args, plain, fsm_gated)
+    end.
+
+-if(?DOCATTRS).
+-doc false.
+-endif.
+fsm_gated(Parent, Ancestors, Name, Mod, Args) ->
+    _ = wait_for_token(),
+    put('$ancestors', Ancestors),
+    put('$initial_call', {Mod, init, 1}),
+    case register_name(Name) of
+        ok ->
+            fsm_gated_init(Parent, Name, Mod, Args);
+        {error, _} = Err ->
+            Parent ! {'$eta_started', self(), Err},
+            exit(normal)
+    end.
+
+%% `init_return/1` takes a `{ok, S, D, Timeout}` onto the virtual clock and
+%% returns `{ok, S, D}`; with no clock it returns the value untouched, and that
+%% lands in the refusing clause below — a real-clock time-out under a scheduler
+%% is the thing this exists to prevent.
+fsm_gated_init(Parent, Name, Mod, Args) ->
+    case eta_fsm:init_return(Mod:init(Args)) of
+        {ok, StateName, StateData} ->
+            Parent ! {'$eta_started', self(), {ok, self()}},
+            fsm_enter_loop(Mod, Name, StateName, StateData);
+        {stop, Reason} ->
+            Parent ! {'$eta_started', self(), {error, Reason}},
+            exit(Reason);
+        ignore ->
+            Parent ! {'$eta_started', self(), ignore},
+            exit(normal);
+        Other ->
+            Parent ! {'$eta_started', self(), {error, {eta_sched, unsupported_init, Other}}},
+            exit({eta_sched, unsupported_init, Other})
+    end.
+
+fsm_enter_loop(Mod, undefined, StateName, StateData) ->
+    gen_fsm:enter_loop(Mod, [], StateName, StateData);
+fsm_enter_loop(Mod, Name, StateName, StateData) ->
+    gen_fsm:enter_loop(Mod, [], StateName, StateData, Name).
+
 own_ancestors() ->
     case get('$ancestors') of
         undefined -> [];
@@ -1315,6 +1422,13 @@ handle_call({register_adopting, Pids}, _From, St) ->
     {Adopted, St1} = close_entry(do_register(St, Pids)),
     {reply, {ok, Adopted}, St1};
 handle_call(release, _From, St) ->
+    %% Inactive *before* anything resumes. A resumed process runs on the real
+    %% scheduler at once, and one that starts a child through a rewritten
+    %% `gen_server:start` would otherwise find a scheduler still active and
+    %% nobody stepping — a gated start nothing will release, refused with
+    %% `start_outside_schedule`. riak_core's Plumtree did exactly that at
+    %% teardown, from an exchange tick it had queued during the run.
+    ok = deactivate(),
     {reply, ok, do_release(St)};
 handle_call(ids, _From, St = #st{procs = Procs}) ->
     {reply, lists:sort(maps:keys(Procs)), St};
@@ -1388,7 +1502,13 @@ handle_info(_Msg, St) ->
 %% the VM has cleaned up, and an untraced-but-suspended process in the meantime
 %% is a confusing thing to leave behind. Release explicitly.
 terminate(_Reason, St) ->
+    ok = deactivate(),
     _ = do_release(St),
+    ok.
+
+%% Ends `active/0`. Idempotent, since `release/1` reaches it twice — once from
+%% the call and once from the stop that follows.
+deactivate() ->
     try
         ets:delete(?ACTIVE)
     catch
@@ -1441,11 +1561,22 @@ do_register(St = #st{ids = Ids, gated = Gated}, Pid) when is_pid(Pid) ->
 %% The VM's own record of how the process was started, not the `$initial_call`
 %% in its dictionary — `proc_lib` overwrites the latter, and this has to survive
 %% that.
+%% Whether a gated child is still blocked on its token with none queued for
+%% it. Safe on a suspended process, and `undefined` — dead — is `false`.
+needs_token(Pid) ->
+    case erlang:process_info(Pid, [current_function, messages]) of
+        [{current_function, {?MODULE, wait_for_token, 0}}, {messages, Msgs}] ->
+            not lists:member(?GO, Msgs);
+        _ ->
+            false
+    end.
+
 is_gated(Pid) ->
     case erlang:process_info(Pid, initial_call) of
         {initial_call, {?MODULE, gated, _}} -> true;
         {initial_call, {?MODULE, gated_plib, _}} -> true;
         {initial_call, {?MODULE, statem_gated, _}} -> true;
+        {initial_call, {?MODULE, fsm_gated, _}} -> true;
         _ -> false
     end.
 
@@ -1512,7 +1643,20 @@ mint(St = #st{pinning = true, fresh = N}) ->
 
 do_release(St = #st{procs = Procs, gated = Gated}) ->
     %% Anything still waiting for its token would block forever otherwise.
-    maps:foreach(fun(Pid, true) -> catch Pid ! ?GO end, Gated),
+    %% Only those, though: `gated` holds every child that was ever sent a
+    %% token, and a second one to a child that already has, or had, its first
+    %% lands in its mailbox as an ordinary message — a `gen_server` without a
+    %% catch-all `handle_info/2` crashes on it at teardown. Found by running
+    %% riak_core_broadcast under simulation.
+    maps:foreach(
+        fun(Pid, true) ->
+            case needs_token(Pid) of
+                true -> catch Pid ! ?GO;
+                false -> ok
+            end
+        end,
+        Gated
+    ),
     maps:foreach(
         fun(_Id, Pid) ->
             %% `process_info/2` rather than `is_process_alive/1`, for the reason
@@ -1858,7 +2002,7 @@ do_drain(St, Pid, Ref, SelfSends) ->
 %% has not run.
 handle_trace(
     St = #st{ids = Ids, gated = Gated}, {trace, Parent, spawn, Child, {?MODULE, F, _}}
-) when F =:= gated; F =:= gated_plib; F =:= statem_gated ->
+) when F =:= gated; F =:= gated_plib; F =:= statem_gated; F =:= fsm_gated ->
     %% A child belongs wherever its parent does. `eta_net` is inert if no network
     %% is running, and a no-op if the parent was never placed — see
     %% `eta_net:place/2` for why a topology that does not follow spawning is a
@@ -1914,6 +2058,12 @@ handle_trace(St = #st{ids = Ids, exited = Exited}, {trace, Pid, exit, Reason}) -
     %% for it, and is inert if no network is running. See
     %% `eta_net:notify_exit/2`.
     ok = eta_net:notify_exit(Pid, Reason),
+    %% Its timers go with it. A deadline addressed to a dead process can make
+    %% nothing runnable, so leaving it in the wheel only gives the clock a
+    %% place to advance to for no reason, and the audit a stray to report. A
+    %% `gen_fsm` that crashed on a partition with a 60-second time-out armed
+    %% was how it showed up.
+    _ = eta_time:forget(Pid),
     case maps:find(Pid, Ids) of
         {ok, Id} -> St#st{exited = Exited#{Id => true}};
         error -> St

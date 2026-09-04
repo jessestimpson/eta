@@ -101,6 +101,16 @@ defmodule DstTimeTest do
       assert @time.system_time(:millisecond) == sys + 1_000
     end
 
+    test "system_ms pins what the wall clock reads at start" do
+      # What `eta_run` does with the seed: a system that seeds `rand` from
+      # `os:timestamp/0` must see the same timestamp in a run and its replay.
+      :ok = @time.start(%{start_ms: 0, system_ms: 1_704_067_200_000})
+      assert @time.system_time(:millisecond) == 1_704_067_200_000
+      assert @time.timestamp() == {1_704, 67_200, 0}
+      @time.advance(1_500)
+      assert @time.timestamp() == {1_704, 67_201, 500_000}
+    end
+
     test "units convert correctly" do
       :ok = @time.start(%{start_ms: 1_500})
 

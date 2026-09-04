@@ -69,7 +69,10 @@ a reader will want is how you lose the line that mattered.
     debug/3,
     log/2,
     log/3,
-    log/4
+    log/4,
+    macro_log/3,
+    macro_log/4,
+    macro_log/5
 ]).
 
 emergency(A1) -> emit(emergency, [A1]).
@@ -104,11 +107,25 @@ log(Level, A1, A2, A3) -> emit(Level, [A1, A2, A3]).
 %% Recorded when a run is collecting, delegated when it is not. `eta_log:log/1`
 %% is already inert without a table, but delegating explicitly is what keeps a
 %% transformed module's logging visible outside a simulation.
+%% What the `?LOG_*` macros reach, through `erlang:apply(logger, macro_log,
+%% [Location, Level | Args])`. The location is dropped from the recorded event
+%% — the run's log has its own notion of who said what — and handed back to
+%% `logger` unchanged when nothing is collecting.
+macro_log(Location, Level, A1) ->
+    emit(Level, [A1], fun() -> logger:macro_log(Location, Level, A1) end).
+macro_log(Location, Level, A1, A2) ->
+    emit(Level, [A1, A2], fun() -> logger:macro_log(Location, Level, A1, A2) end).
+macro_log(Location, Level, A1, A2, A3) ->
+    emit(Level, [A1, A2, A3], fun() -> logger:macro_log(Location, Level, A1, A2, A3) end).
+
 emit(Level, Args) ->
+    emit(Level, Args, fun() -> apply(logger, Level, Args) end).
+
+emit(Level, Args, Delegate) ->
     case eta_log:running() of
         true ->
             _ = eta_log:log({Level, Args}),
             ok;
         false ->
-            apply(logger, Level, Args)
+            Delegate()
     end.

@@ -8,6 +8,7 @@
 -module(eta_spawn_sut).
 
 -include_lib("eta/include/eta.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -export([
     plain/1,
@@ -29,7 +30,7 @@
 ]).
 -export([start_link/1, start_link_named/2, start_named/2, start_monitor_named/2]).
 -export([remote/2, remote_mfa/2, remote_link/2, remote_opt/2, plib_remote/2]).
--export([say/1, say_fmt/2, say_report/1, say_level/2]).
+-export([say/1, say_fmt/2, say_report/1, say_level/2, say_macro/1, say_macro_fmt/2]).
 -export([init/1, handle_call/3, handle_cast/2]).
 
 %% What every spawned child runs. Sends its own pid so the caller can prove the
@@ -73,6 +74,9 @@ plib_remote(Node, To) -> proc_lib:spawn(Node, fun() -> announce(To) end).
 
 %% Ordinary logging, which the transform routes into `eta_log`.
 say(Msg) -> logger:info(Msg).
+%% The macro form: `erlang:apply(logger, macro_log, [Location, Level | Args])`.
+say_macro(Msg) -> ?LOG_WARNING(Msg).
+say_macro_fmt(Fmt, Args) -> ?LOG_ERROR(Fmt, Args).
 say_fmt(Fmt, Args) -> logger:warning(Fmt, Args).
 say_report(Report) -> logger:error(Report).
 say_level(Level, Msg) -> logger:log(Level, Msg).

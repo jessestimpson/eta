@@ -5,9 +5,18 @@
 ### Enhancements
 
 - Added `eta_rand`, a seeded stand-in for the process-local `rand` state.
+- `gen_fsm` support
 - A `gen_server` or `gen_statem` that is started outside the scheduler
   can be detected in certain cases. In those cases, an error is raised:
   `{eta_sched, {start_outside_schedule, _, _}}`
+- `eta_sched:release/1` no longer sends a second gate token to a child that
+  already received one.
+- The simulated wall clock is a function of the seed.
+- The `?LOG_*` macros are routed into the run's log. They expand to
+  `erlang:apply(logger, macro_log, [Location, Level | Args])` rather than a
+  level call, so the transform now rewrites an `erlang:apply/3` with literal
+  module and function when the pair is in its table, and `eta_logger` gained
+  `macro_log/3,4,5`.
 - Added `eta_time:forget/1`, which cancels every timer addressed to a pid, and
   `eta_net:kill_node/2` now calls it for each process it kills.
 - Added `eta_time:universal_time/0`, which the parse_transform uses in place of

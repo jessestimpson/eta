@@ -340,6 +340,34 @@ defmodule EtaNetTest do
       assert %{dropped: 1} = @net.stats()
     end
 
+    test "a partition ends an outstanding call in nodedown, as distribution does", %{
+      caller: caller
+    } do
+      # The reply is held on the wire, so the call is outstanding when the link
+      # goes. The caller's own monitor is what fires: `gen:call/4` turns a
+      # `noconnection` DOWN into `{nodedown, Node}`, and so does this.
+      :ok = @net.set_policy(%{drop_p: 1.0, scope: {:tags, [:"$gen_reply"]}})
+
+      task = call_async(caller, :call_echo, {:echo, 5})
+      await_armed()
+      :ok = @net.partition(:a, :b)
+
+      assert {:exit, {{:nodedown, :b}, _}} = await_call(task)
+      assert @time.now_ms() == 0, "the call waited for its timeout rather than the link"
+    end
+
+    test "a call to a name nothing holds on a simulated node is noproc", %{caller: caller} do
+      # The server died with its node, say. Real distribution is not consulted.
+      assert {:exit, {:noproc, _}} = call_from(caller, {:nobody_here, :b}, {:echo, 7})
+    end
+
+    test "a call into a severed link fails at once", %{caller: caller} do
+      :ok = @net.partition(:a, :b)
+
+      assert {:exit, {{:nodedown, :b}, _}} = call_from(caller, :call_echo, {:echo, 6})
+      assert %{delivered: 0} = @net.stats()
+    end
+
     test "a lost request times out the caller too", %{caller: caller} do
       :ok = @net.set_policy(%{drop_p: 1.0, scope: {:tags, [:echo]}})
 
@@ -801,6 +829,28 @@ defmodule EtaNetTest do
       assert @net.node_of(child) == :undefined
     end
 
+    test "an unplaced child of a placed spawner answers with the spawner's node" do
+      # The child a server spawns from `init/1` during the harness's `init/2`:
+      # no scheduler exists to adopt it, so nothing calls `inherit/2`, yet it is
+      # on its parent's node in every sense but the table's. Located, not placed
+      # — off the wire, and not the network's to fault.
+      :ok = @net.start(%{seed: 1})
+      me = self()
+
+      parent =
+        spawn(fn ->
+          receive do
+            :go -> send(me, {:child, spawn(fn -> Process.sleep(:infinity) end)})
+          end
+        end)
+
+      :ok = @net.place(:a, [parent])
+      send(parent, :go)
+      assert_receive {:child, child}
+
+      assert @net.node_of(child) == :a
+      refute @net.faultable(child)
+    end
   end
 
   describe "simulated name registration" do

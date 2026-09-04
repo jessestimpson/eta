@@ -236,6 +236,8 @@ parse transform will only rewrite fully module-qualified calling conventions:
 | `erlang:spawn/1,3`, `spawn_link`, `proc_lib` equivalents | `eta_sched:*` |
 | `gen_server:start/3,4`, `start_link/3,4`, `start_monitor/3,4` | `eta_sched:*` |
 | the same six on `gen_statem` | `eta_sched:statem_*` |
+| `gen_fsm:start/3,4`, `start_link/3,4` | `eta_sched:fsm_*` |
+| `gen_fsm:send_event_after/2`, `start_timer/2`, `cancel_timer/1` | `eta_fsm:*` |
 
 The spawn rewrites matter more than they look. A child spawned with a plain
 `erlang:spawn` runs briefly on the real scheduler before anything suspends

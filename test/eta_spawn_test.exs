@@ -51,6 +51,34 @@ defmodule EtaSpawnTest do
   end
 
   describe "inert with no scheduler running" do
+    test "release/1 does not send a second token to a child that already has one" do
+      # `gated` holds every child ever sent a token. Releasing used to send all
+      # of them another, which a gen_server without a catch-all handle_info/2
+      # crashes on at teardown — riak_core_broadcast did.
+      sched = :eta_sched.new(%{seed: 1})
+      me = self()
+
+      child =
+        :eta_sched.spawn(fn ->
+          send(me, {:started, self()})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      # Registered from the driver's side: the only route to a token for a
+      # child whose parent the scheduler does not own.
+      _ = :eta_sched.register(sched, [child])
+      :eta_sched.release(sched)
+
+      assert_receive {:started, ^child}, 1_000
+      Process.sleep(20)
+      {:messages, msgs} = Process.info(child, :messages)
+      refute :"$eta_sched_go" in msgs, "a second token was queued: #{inspect(msgs)}"
+      send(child, :stop)
+    end
+
     setup do
       refute :eta_sched.active(), "a scheduler leaked from another test"
       :ok
@@ -277,6 +305,82 @@ defmodule EtaSpawnTest do
                under_scheduler(fn ->
                  :eta_spawn_sut.start_named({:global, :eta_spawn_global}, self())
                end)
+    end
+  end
+
+  describe "after release/1" do
+    test "a resumed process finds no scheduler, so its starts are plain" do
+      # A gated child that runs only once released — nothing steps it — and
+      # reports what it sees. Before the fix it saw an active scheduler with
+      # nobody stepping, and a rewritten start from there was refused.
+      sched = :eta_sched.new(%{seed: 1})
+      me = self()
+      child = :eta_sched.spawn(fn -> send(me, {:active, :eta_sched.active()}) end)
+      sched = :eta_sched.register(sched, [child])
+
+      :ok = :eta_sched.release(sched)
+
+      assert_receive {:active, false}
+    end
+  end
+
+  describe "on exit" do
+    test "a process's timers go with it" do
+      :ok = :eta_time.start(%{start_ms: 0})
+      on_exit(fn -> :eta_time.stop() end)
+      sched = :eta_sched.new(%{seed: 1})
+      me = self()
+
+      child =
+        :eta_sched.spawn(fn ->
+          _ = :eta_time.send_after(60_000, self(), :never)
+          send(me, {:armed, :eta_time.pending()})
+        end)
+
+      sched = sched |> :eta_sched.register([child]) |> :eta_sched.run(20)
+      assert_receive {:armed, 1}
+      assert :eta_time.pending() == 0, "the dead child's deadline is still in the wheel"
+      :ok = :eta_sched.release(sched)
+    end
+  end
+
+  describe "gen_fsm starts" do
+    # The same gate again, through `eta_sched:fsm_start_*`. `gen_fsm` has no
+    # `start_monitor`, so two forms per name.
+    test "start_link/3 gates its child and still returns a live machine" do
+      assert {:ok, pid} = under_scheduler(fn -> :eta_fsm_sut.start_link(self()) end)
+      assert Process.alive?(pid)
+      assert :eta_fsm_sut.state(pid) == :a
+      :eta_fsm_sut.stop(pid)
+    end
+
+    for f <- [:start_link_named, :start_named] do
+      @f f
+      test "#{f} registers the name and enters the loop under it" do
+        name = :"eta_fsm_#{@f}"
+
+        assert {:ok, pid} =
+                 under_scheduler(fn -> apply(:eta_fsm_sut, @f, [{:local, name}, self()]) end)
+
+        assert Process.whereis(name) == pid
+        assert :eta_fsm_sut.who(name) == pid
+        assert {:a, %{owner: _}} = :sys.get_state(pid)
+        assert :proc_lib.translate_initial_call(pid) == {:eta_fsm_sut, :init, 1}
+
+        :eta_fsm_sut.stop(pid)
+      end
+    end
+
+    test "a name already taken is reported, not crashed on" do
+      name = :eta_fsm_taken
+
+      assert {:ok, first} =
+               under_scheduler(fn -> :eta_fsm_sut.start_named({:local, name}, self()) end)
+
+      assert {:error, {:already_started, ^first}} =
+               under_scheduler(fn -> :eta_fsm_sut.start_named({:local, name}, self()) end)
+
+      :eta_fsm_sut.stop(first)
     end
   end
 

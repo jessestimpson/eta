@@ -30,6 +30,9 @@ controlled by attributes rather than by naming another transform:
    callback's returned action list and arms a virtual deadline instead, and
    prepends the clause that delivers it. Applied to every module declaring
    `-behaviour(gen_statem)`. See `eta_statem`.
+6. **`gen_fsm` time-outs** — takes the `Timeout` off a callback's return and
+   arms a virtual deadline instead; `gen_fsm` delivers it itself. Applied to
+   every module declaring `-behaviour(gen_fsm)`. See `eta_fsm`.
 
 They live here rather than in modules of their own for a build reason, and it is
 worth recording because it cost a broken CI run to find. **Mix does not reliably
@@ -145,8 +148,10 @@ The network pass rewrites, unless the module declares `-eta_net(false)`:
 | `erlang:send/2,3` | `eta_net:send/2,3` |
 | `gen_server:cast/2` | `eta_net:cast/2` |
 | `gen_statem:cast/2` | `eta_net:cast/2` |
+| `gen_fsm:send_event/2`, `send_all_state_event/2` | `eta_net:send_event/2`, `send_all_state_event/2` |
 | `gen_server:reply/2` | `eta_net:reply/2` |
 | `gen_statem:reply/1,2` | `eta_net:reply/1,2` |
+| `gen_fsm:reply/2` | `eta_net:reply/2` |
 | `erlang:monitor/2,3` | `eta_net:monitor/2,3` |
 | `erlang:demonitor/1,2` | `eta_net:demonitor/1,2` |
 
@@ -187,7 +192,9 @@ which is what makes "the work happened, the caller never learned it did" a
 reachable state. See `eta_net:call/3`.
 
 `gen_statem`'s starts are gated like `gen_server`'s, through
-`eta_sched:statem_start_link/3` and friends.
+`eta_sched:statem_start_link/3` and friends; `gen_fsm`'s through
+`eta_sched:fsm_start_link/3` and friends, and its `send_event_after/2`,
+`start_timer/2` and `cancel_timer/1` go to `eta_fsm`.
 
 **State time-outs are virtualised**, by the fifth pass and `eta_statem`. That is
 a `gen_statem`-shaped hole the other passes cannot reach, because the timer is
@@ -211,6 +218,7 @@ discoverable by using it instead of by reading a table.
 |---|---|
 | `gen_server:abcast`, `multi_call`, `send_request`/`wait_response`/`receive_response`/`check_response` | at run time, while a network is running |
 | `gen_statem`'s `send_request`/`wait_response`/`receive_response`/`check_response` | the same |
+| `gen_fsm`'s `sync_send_event`/`sync_send_all_state_event` | the same |
 | every client-side function of `gen_event` | the same |
 | a module declaring `-behaviour(gen_event)` | at **compile** time |
 
@@ -354,6 +362,12 @@ pass exists to virtualise. A sleep in an *untransformed* module still hangs.
     {logger, log, 2} => eta_logger,
     {logger, log, 3} => eta_logger,
     {logger, log, 4} => eta_logger,
+    %% The `?LOG_*` macros in kernel's logger.hrl expand to
+    %% `erlang:apply(logger, macro_log, [Location, Level | Args])`, which the
+    %% call rewrite below reaches through its `erlang:apply/3` clause.
+    {logger, macro_log, 3} => eta_logger,
+    {logger, macro_log, 4} => eta_logger,
+    {logger, macro_log, 5} => eta_logger,
     {gen_server, start_monitor, 3} => eta_sched,
     {gen_server, start_monitor, 4} => eta_sched,
     {gen_server, start_link, 3} => eta_sched,
@@ -369,7 +383,17 @@ pass exists to virtualise. A sleep in an *untransformed* module still hangs.
     {gen_statem, start_link, 3} => {eta_sched, statem_start_link},
     {gen_statem, start_link, 4} => {eta_sched, statem_start_link},
     {gen_statem, start, 3} => {eta_sched, statem_start},
-    {gen_statem, start, 4} => {eta_sched, statem_start}
+    {gen_statem, start, 4} => {eta_sched, statem_start},
+    %% And `gen_fsm`, which has no `start_monitor`. See `eta_sched:fsm_start_link/3`.
+    {gen_fsm, start_link, 3} => {eta_sched, fsm_start_link},
+    {gen_fsm, start_link, 4} => {eta_sched, fsm_start_link},
+    {gen_fsm, start, 3} => {eta_sched, fsm_start},
+    {gen_fsm, start, 4} => {eta_sched, fsm_start},
+    %% `gen_fsm`'s own timers are `erlang:start_timer/3` inside OTP, where the
+    %% rewrite above does not reach. See `eta_fsm`.
+    {gen_fsm, send_event_after, 2} => {eta_fsm, send_event_after},
+    {gen_fsm, start_timer, 2} => {eta_fsm, start_timer},
+    {gen_fsm, cancel_timer, 1} => {eta_fsm, cancel_timer}
 }).
 
 -if(?DOCATTRS).
@@ -387,7 +411,7 @@ parse_transform(Forms, _Options) ->
     %% last also means its own wrapper sits outermost, which is the right order —
     %% the state is published and the replies are sent before the action list is
     %% read for time-outs.
-    statem_timeout_pass(observe_pass(after_pass(net_pass(Rewritten, Locals)))).
+    fsm_timeout_pass(statem_timeout_pass(observe_pass(after_pass(net_pass(Rewritten, Locals))))).
 
 %% Every `{Name, Arity}` the module defines itself. Needed to decide whether an
 %% unqualified `spawn(F)` is the auto-imported BIF or the module's own function.
@@ -430,6 +454,28 @@ walk(Node, _Locals) ->
     {spawn_opt, 4}
 ]).
 
+%% `erlang:apply(M, F, Args)` with literal `M` and `F` — the shape kernel's
+%% `?LOG_*` macros expand to — is rewritten by module when any arity of `{M, F}`
+%% is in the table, since the arity is inside the list. Only targets that keep
+%% the function name qualify, which every `logger` entry does.
+rewrite(
+    {call, Anno, {remote, RAnno, {atom, EAnno, erlang}, {atom, AAnno, apply}}, [
+        {atom, MAnno, Mod}, {atom, _, Fun} = F, Args
+    ]},
+    _Locals
+) ->
+    Targets = lists:usort([
+        T
+     || {{M, Fn, _A}, T} <- maps:to_list(?REWRITES), M =:= Mod, Fn =:= Fun, is_atom(T)
+    ]),
+    Mod1 =
+        case Targets of
+            [Target] -> Target;
+            _ -> Mod
+        end,
+    {call, Anno, {remote, RAnno, {atom, EAnno, erlang}, {atom, AAnno, apply}}, [
+        {atom, MAnno, Mod1}, F, Args
+    ]};
 %% A remote call whose target is in the rewrite table has its module replaced.
 %% Arity is taken from the argument list, so a rewrite only applies to the exact
 %% arities declared.
@@ -475,6 +521,11 @@ rewrite(Node, _Locals) ->
     {erlang, send, 3} => eta_net,
     {gen_server, cast, 2} => {eta_net, cast},
     {gen_statem, cast, 2} => {eta_net, cast},
+    %% `gen_fsm`'s asynchronous events, which are casts under another envelope.
+    {gen_fsm, send_event, 2} => {eta_net, send_event},
+    {gen_fsm, send_all_state_event, 2} => {eta_net, send_all_state_event},
+    %% `gen_fsm:reply/2` is `gen_server:reply/2` under another name.
+    {gen_fsm, reply, 2} => {eta_net, reply},
     {gen_server, reply, 2} => {eta_net, reply},
     %% `gen_statem:reply/2` is `gen_server:reply/2` under another name.
     %% `reply/1` is the list-or-single form, and gets its own target.
@@ -555,6 +606,13 @@ rewrite(Node, _Locals) ->
     {gen_statem, receive_response, 3},
     {gen_statem, check_response, 2},
     {gen_statem, check_response, 3},
+    %% `gen_fsm`'s synchronous events carry a `'$gen_sync_event'` label rather
+    %% than a `'$gen_call'`, and their reply leg is not brought onto the network
+    %% by any pass. Refused until they are.
+    {gen_fsm, sync_send_event, 2},
+    {gen_fsm, sync_send_event, 3},
+    {gen_fsm, sync_send_all_state_event, 2},
+    {gen_fsm, sync_send_all_state_event, 3},
     %% `gen_event` the same: a handler's reply is produced inside the event
     %% manager, out of reach.
     {gen_event, notify, 2},
@@ -1098,6 +1156,67 @@ statem_fire_clause(Anno, Arity) ->
     Ignored = lists:duplicate(Arity - 2, U),
     {clause, Anno, [{atom, Anno, info}, Msg | Ignored], [], [
         remote_call(Anno, eta_statem, fire, [Ref])
+    ]}.
+
+%% ---------------------------------------------------------------------------
+%% gen_fsm time-out pass — applied to every `gen_fsm`
+%% ---------------------------------------------------------------------------
+
+%% Puts a `gen_fsm`'s time-outs on the virtual clock. See `eta_fsm` for what the
+%% generated code does; this is only the code generation, and it is one edit
+%% per callback:
+%%
+%%     StateName(Event, Data) ->
+%%         eta_fsm:return(eta_fsm:enter(), begin OriginalBody end).
+%%
+%% Arguments are evaluated left to right, so `enter/0` reads the pending
+%% time-out before the body runs and `return/2` compares against it after — the
+%% device that lets a state function call another one directly without the
+%% outer return cancelling what the inner one armed.
+%%
+%% No clause is prepended: `gen_fsm` dispatches the deadline's message to the
+%% state function itself. See `eta_fsm:message/1`.
+%%
+%% ## Which functions are wrapped
+%%
+%% A `gen_fsm`'s state functions are named by its states, so as with
+%% `gen_statem` there is no fixed list: every exported function of arity 2 or 3
+%% is a candidate, less `terminate/3`, plus `handle_sync_event/4` and `init/1`.
+%% That takes in the module's API — `start/3` is exported at arity 3 — which is
+%% harmless: `eta_fsm:return/2` leaves any value that is not a `gen_fsm` return
+%% alone, and `enter/0` has no side effects.
+fsm_timeout_pass(Forms) ->
+    case lists:member(gen_fsm, behaviours(Forms)) of
+        false ->
+            Forms;
+        true ->
+            Callbacks = fsm_callbacks(Forms),
+            [fsm_timeout_form(F, Callbacks) || F <- Forms]
+    end.
+
+fsm_callbacks(Forms) ->
+    Exported = exported(Forms),
+    Fixed = sets:from_list([{init, 1}, {handle_sync_event, 4}]),
+    States = sets:from_list([
+        {N, A}
+     || {N, A} <- sets:to_list(Exported), A =:= 2 orelse A =:= 3, {N, A} =/= {terminate, 3}
+    ]),
+    sets:union(States, sets:intersection(Exported, Fixed)).
+
+fsm_timeout_form({function, Anno, Name, Arity, Clauses}, Callbacks) ->
+    case sets:is_element({Name, Arity}, Callbacks) of
+        true -> {function, Anno, Name, Arity, [fsm_timeout_clause(C) || C <- Clauses]};
+        false -> {function, Anno, Name, Arity, Clauses}
+    end;
+fsm_timeout_form(Form, _Callbacks) ->
+    Form.
+
+fsm_timeout_clause({clause, Anno, Pats, Guards, Body}) ->
+    {clause, Anno, Pats, Guards, [
+        remote_call(Anno, eta_fsm, return, [
+            remote_call(Anno, eta_fsm, enter, []),
+            {block, Anno, Body}
+        ])
     ]}.
 
 %% ---------------------------------------------------------------------------

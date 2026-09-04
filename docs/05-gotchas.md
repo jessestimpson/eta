@@ -285,6 +285,16 @@ state inside one VM is a bigger change than it looks.
 
 ## Time hazards
 
+### The wall clock is pinned to the seed, and that is load-bearing
+
+`eta_time:system_time/1` and `os:timestamp/0` read as a plausible wall clock,
+and until 0.2 the anchor was the real time the clock started. That was a leak:
+a system that seeds `rand` from `os:timestamp/0` (riak_core's claimant does)
+carried the real start time into its schedule, so one seed reproduced when
+run twice in a row and a run and its replay diverged. `eta_run` now starts
+the clock with `system_ms` derived from the seed. If you drive `eta_time` by
+hand and something in your system does the same, pass `system_ms` yourself.
+
 ### Start the clock before the system
 
 `eta_run` does this for you, which is why `init/2` is called by the driver
@@ -330,6 +340,33 @@ cancels a running event time-out, and delivering a virtualized state time-out
 spends one, so a machine using both would find eta's own traffic cancelling
 its deadlines. Use `state_timeout`, which is the right tool for most of what
 people reach for an event time-out to do anyway.
+
+### gen_fsm's time-outs are handled the same way
+
+`gen_fsm` is deprecated and still everywhere in older code — `riak_core`'s
+metadata exchange is one. Its time-out is the `after` of the `receive` in
+`gen_fsm`'s own loop, which no transform of your module reaches, so it has
+the same hole `state_timeout` had and gets the same answer: the `Timeout` is
+taken off the callback's return before OTP sees it and a virtual deadline is
+armed instead. Delivery is free, because `gen_fsm` already dispatches a
+`{timeout, Ref, {'$gen_event', Event}}` message — the shape its own
+`send_event_after/2` produces — to the state function as `Event`.
+
+Two of its rules are worth knowing, and `eta` keeps both:
+
+- **Any message cancels it.** Not a state change, any message. A machine
+  that means "do this unless something arrives first" has that; one that
+  means "do this in 5 seconds regardless" wants `send_event_after/2`.
+- **A state function that calls another one directly** — `prepare(Ev, S) ->
+  update(start, S)` — arms whatever the inner one returns. The wrapper around
+  the outer function sees a return with no time-out and leaves the inner
+  arm alone, because it was not the one pending when the outer call began.
+
+`{ok, S, D, Timeout}` from `init/1`, `{reply, R, S, D, Timeout}` and
+`{next_state, S, D, Timeout}` are all read. `hibernate` raises. Synchronous
+events (`sync_send_event` and friends) raise while a network is running —
+their reply leg is not on the network yet — while `send_event/2` and
+`send_all_state_event/2` are routed like casts.
 
 ### A state_timeout's cancellation rules are subtler than they look
 
