@@ -4,7 +4,7 @@ defmodule Eta.MixProject do
   def project do
     [
       app: :eta,
-      version: "0.1.0",
+      version: "0.1.1",
       elixir: "~> 1.15",
       erlc_paths: erlc_paths(Mix.env()),
       erlc_options: erlc_options(Mix.env()),
