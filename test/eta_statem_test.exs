@@ -84,6 +84,41 @@ defmodule EtaStatemTest do
     ref
   end
 
+  # The sink's messages once at least `n` have arrived. `drained/1` reads
+  # without clearing, so this polls it rather than accumulating. For an
+  # assertion about messages another process sends, the count is the condition
+  # and the elapsed time is not; returning early on exhausted tries leaves the
+  # assertion to report what actually arrived.
+  defp drained_at_least(pid, n, tries \\ 400) do
+    msgs = drained(pid)
+
+    cond do
+      length(msgs) >= n -> msgs
+      tries == 0 -> msgs
+      true -> Process.sleep(5) && drained_at_least(pid, n, tries - 1)
+    end
+  end
+
+  # "It has stopped" is an event to wait for. Returns either way, so the
+  # `refute` that follows is what reports.
+  defp await_dead(pid, tries \\ 400) do
+    cond do
+      not Process.alive?(pid) -> :ok
+      tries == 0 -> :ok
+      true -> Process.sleep(5) && await_dead(pid, tries - 1)
+    end
+  end
+
+  # See the note on `await_armed/2` in eta_net_test: a call's timeout is armed
+  # in the caller, so advancing before it exists loses the deadline entirely.
+  defp await_armed(n \\ 1, tries \\ 400) do
+    cond do
+      :eta_time.pending() >= n -> :ok
+      tries == 0 -> :ok
+      true -> Process.sleep(5) && await_armed(n, tries - 1)
+    end
+  end
+
   defp receive_call(ref) do
     receive do
       {^ref, result} -> result
@@ -132,14 +167,13 @@ defmodule EtaStatemTest do
       :eta_statem_echo.qualified(s, :from_qualified)
       :eta_statem_echo.cast(:inert_statem, {:forward, s, :from_cast})
 
-      Process.sleep(20)
-      assert Enum.sort(drained(s)) == [:from_bang, :from_cast, :from_qualified]
+      assert Enum.sort(drained_at_least(s, 3)) == [:from_bang, :from_cast, :from_qualified]
     end
 
     test "stop_and_reply answers and then stops", %{pid: pid} do
       Process.unlink(pid)
       assert :eta_statem_echo.call(:inert_statem, {:bye, 5}) == {:bye, 5}
-      Process.sleep(20)
+      await_dead(pid)
       refute Process.alive?(pid)
     end
   end
@@ -169,8 +203,7 @@ defmodule EtaStatemTest do
       :eta_statem_echo.cast(:pass_statem, {:forward, s, :from_cast})
       assert :eta_statem_echo.call(:pass_statem, {:echo, 9}) == {:echoed, 9}
 
-      Process.sleep(20)
-      assert Enum.sort(drained(s)) == [:from_bang, :from_cast, :from_qualified]
+      assert Enum.sort(drained_at_least(s, 3)) == [:from_bang, :from_cast, :from_qualified]
 
       # bang + qualified + the machine's forward + the reply.
       assert %{delivered: n} = @net.stats()
@@ -210,7 +243,7 @@ defmodule EtaStatemTest do
       assert :eta_statem_echo.call(:pass_statem, {:bye, 3}) == {:bye, 3}
       assert @net.stats().delivered - before >= 2
 
-      Process.sleep(20)
+      await_dead(pid)
       refute Process.alive?(pid)
     end
 
@@ -252,7 +285,7 @@ defmodule EtaStatemTest do
       :ok = @net.set_policy(%{drop_p: 1.0, scope: {:tags, [:"$gen_reply"]}})
 
       task = call_async(caller, :link_statem, {:echo, 2})
-      Process.sleep(20)
+      await_armed()
       @time.advance(5_000)
 
       assert {:exit, {:timeout, _}} = receive_call(task)
@@ -263,7 +296,7 @@ defmodule EtaStatemTest do
       :ok = @net.set_policy(%{drop_p: 1.0, scope: {:tags, [:echo]}})
 
       task = call_async(caller, :link_statem, {:echo, 3})
-      Process.sleep(20)
+      await_armed()
       @time.advance(5_000)
 
       assert {:exit, {:timeout, _}} = receive_call(task)

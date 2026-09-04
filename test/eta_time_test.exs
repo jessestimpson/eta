@@ -21,6 +21,32 @@ defmodule DstTimeTest do
   defp new_trace, do: :ets.new(:eta_time_trace, [:public, :ordered_set])
   defp events(tab), do: :ets.tab2list(tab) |> Enum.map(&elem(&1, 1))
 
+  # "The SUT has armed its deadline" and "the SUT has seen it fire" are both
+  # conditions another process brings about, so they are waited for rather than
+  # slept through. A fixed sleep is a race in both directions: arming late means
+  # the advance moves the clock past a deadline that does not exist yet and
+  # nothing ever fires, and observing late means the assertion reads an empty
+  # trace. Neither shows up as a timing failure — they surface as "pending == 0"
+  # or "the SUT observed the wrong elapsed time", which is where the time goes.
+  #
+  # Exhausting the tries returns rather than flunking, so the assertion that
+  # follows is still the thing that reports, with its own message.
+  defp await_armed(n \\ 1, tries \\ 400) do
+    cond do
+      :eta_time.pending() >= n -> :ok
+      tries == 0 -> :ok
+      true -> Process.sleep(5) && await_armed(n, tries - 1)
+    end
+  end
+
+  defp await_events(trace, n, tries \\ 400) do
+    cond do
+      length(events(trace)) >= n -> :ok
+      tries == 0 -> :ok
+      true -> Process.sleep(5) && await_events(trace, n, tries - 1)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # The clock itself
   # ---------------------------------------------------------------------------
@@ -200,15 +226,15 @@ defmodule DstTimeTest do
       trace = new_trace()
 
       pid = @sut.start(trace, 250)
-      # Give it a moment to reach its receive; nothing can fire, since only the
-      # driver moves the clock.
-      Process.sleep(20)
+      # Nothing can fire until the driver moves the clock, so this only has to
+      # wait for the deadline to exist.
+      await_armed()
 
       assert @time.pending() == 1, "the SUT's send_after did not reach eta_time"
       assert events(trace) == []
 
       @time.advance_to_next()
-      Process.sleep(20)
+      await_events(trace, 1)
 
       assert events(trace) == [{:fired, 250}],
              "the SUT observed the wrong elapsed time: #{inspect(events(trace))}"
@@ -243,14 +269,14 @@ defmodule DstTimeTest do
       {micros, _} =
         :timer.tc(fn ->
           @sut.sleeper(trace, 60_000)
-          Process.sleep(20)
+          await_armed()
 
           assert @time.pending() == 1, "the sleep did not arm a virtual deadline"
           assert @time.next_deadline() == 60_000
           assert events(trace) == []
 
           @time.advance_to_next()
-          Process.sleep(20)
+          await_events(trace, 1)
         end)
 
       assert events(trace) == [{:slept, 60_000}],
@@ -275,7 +301,7 @@ defmodule DstTimeTest do
       trace = new_trace()
 
       pid = @sut.sleeper(trace, 60_000)
-      Process.sleep(20)
+      await_armed()
       assert @time.pending() == 1
 
       sched = @sched.new(%{seed: 1}) |> @sched.register([pid])
@@ -315,7 +341,7 @@ defmodule DstTimeTest do
       interval = 30_000
       count = 200
       pid = @sut.start_periodic(trace, interval, count)
-      Process.sleep(20)
+      await_armed()
 
       sched = @sched.new(%{seed: 1}) |> @sched.register([pid])
 
@@ -352,7 +378,7 @@ defmodule DstTimeTest do
         trace = new_trace()
 
         pid = @sut.start_periodic(trace, 1_000, 6)
-        Process.sleep(20)
+        await_armed()
 
         sched = @sched.new(%{seed: seed}) |> @sched.register([pid])
         sched = @sched.run(sched, 500, fn -> @time.advance_to_next() end)
@@ -382,7 +408,7 @@ defmodule DstTimeTest do
       trace = new_trace()
 
       pid = @sut.start(trace, 100)
-      Process.sleep(20)
+      await_armed()
 
       sched = @sched.new(%{seed: 2}) |> @sched.register([pid])
       sched = @sched.run(sched, 500, fn -> @time.advance_to_next() end)

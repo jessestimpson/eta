@@ -181,6 +181,37 @@ defmodule EtaNetTest do
     end
   end
 
+  # A call arms its timeout in the *caller*, so "the call is outstanding" is a
+  # condition to wait for rather than a span to sleep through. Sleeping a fixed
+  # 20ms and advancing races it: arm after the advance and the clock has already
+  # passed the deadline, so nothing fires and the test fails 2s later in
+  # `await_call` — a scheduling hiccup reported as a broken timeout.
+  #
+  # Exhausting the tries returns rather than flunking, leaving the assertion
+  # that follows to report in its own terms.
+  defp await_armed(n \\ 1, tries \\ 400) do
+    cond do
+      :eta_time.pending() >= n -> :ok
+      tries == 0 -> :ok
+      true -> Process.sleep(5) && await_armed(n, tries - 1)
+    end
+  end
+
+  # The sink's messages once at least `n` have arrived. `drained/1` reads
+  # without clearing, so this polls it rather than accumulating. For an
+  # assertion about messages another process sends, the count is the condition
+  # and the elapsed time is not; returning early on exhausted tries leaves the
+  # assertion to report what actually arrived.
+  defp drained_at_least(pid, n, tries \\ 400) do
+    msgs = drained(pid)
+
+    cond do
+      length(msgs) >= n -> msgs
+      tries == 0 -> msgs
+      true -> Process.sleep(5) && drained_at_least(pid, n, tries - 1)
+    end
+  end
+
   defp taken(pid) do
     ref = make_ref()
     send(pid, {:__take__, ref})
@@ -214,8 +245,7 @@ defmodule EtaNetTest do
       s = sink()
       assert @net.cast(:inert_echo, {:forward, s, :through}) == :ok
       assert :eta_net_echo.call(:inert_echo, {:echo, 7}) == {:echoed, 7}
-      Process.sleep(20)
-      assert drained(s) == [:through]
+      assert drained_at_least(s, 1) == [:through]
     end
 
     test "a cast to a name nobody has registered does not raise" do
@@ -249,8 +279,7 @@ defmodule EtaNetTest do
       :eta_net_echo.cast(:pass_echo, {:forward, s, :from_cast})
       assert :eta_net_echo.call(:pass_echo, {:echo, 9}) == {:echoed, 9}
 
-      Process.sleep(20)
-      assert Enum.sort(drained(s)) == [:from_bang, :from_cast, :from_qualified]
+      assert Enum.sort(drained_at_least(s, 3)) == [:from_bang, :from_cast, :from_qualified]
 
       # bang + qualified + the echo's forward + the reply. The cast itself is sent
       # by the test process, which is not transformed, so it does not count.
@@ -304,7 +333,7 @@ defmodule EtaNetTest do
       task = call_async(caller, :call_echo, {:echo, 2})
       # Nothing runnable will ever satisfy the receive, so only the clock can end
       # it — and it is a virtual clock, so this costs nothing.
-      Process.sleep(20)
+      await_armed()
       @time.advance(5_000)
 
       assert {:exit, {:timeout, _}} = await_call(task)
@@ -315,7 +344,7 @@ defmodule EtaNetTest do
       :ok = @net.set_policy(%{drop_p: 1.0, scope: {:tags, [:echo]}})
 
       task = call_async(caller, :call_echo, {:echo, 3})
-      Process.sleep(20)
+      await_armed()
       @time.advance(5_000)
 
       assert {:exit, {:timeout, _}} = await_call(task)
@@ -327,7 +356,7 @@ defmodule EtaNetTest do
       {micros, result} =
         :timer.tc(fn ->
           task = call_async(caller, :call_echo, {:echo, 4})
-          Process.sleep(20)
+          await_armed()
           @time.advance(5_000)
           await_call(task)
         end)
@@ -352,7 +381,7 @@ defmodule EtaNetTest do
       # Unlink first: the echo is started with start_link from the test process.
       Process.unlink(pid)
       Process.exit(pid, :kill)
-      Process.sleep(10)
+      wait_until(fn -> not Process.alive?(pid) end)
 
       assert {:exit, {:noproc, _}} = call_from(caller, :call_echo, {:echo, 6})
     end
@@ -367,7 +396,7 @@ defmodule EtaNetTest do
       # match — for a gen_server caller, an `handle_info` clause it never
       # expected, and a crash the simulation manufactured rather than found.
       task = call_async(caller, :call_echo, {:defer, :k})
-      Process.sleep(20)
+      await_armed()
       @time.advance(5_000)
       assert {:exit, {:timeout, _}} = await_call(task)
 
@@ -412,7 +441,7 @@ defmodule EtaNetTest do
         send(me, {ref, result})
       end)
 
-      Process.sleep(20)
+      await_armed()
 
       # The deadline is in eta's wheel rather than the VM's, which is the claim.
       assert @time.pending() == 1
@@ -771,6 +800,7 @@ defmodule EtaNetTest do
       :ok = @net.inherit(parent, child)
       assert @net.node_of(child) == :undefined
     end
+
   end
 
   describe "simulated name registration" do
