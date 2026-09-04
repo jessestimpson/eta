@@ -7,7 +7,7 @@
 `gen_fsm`'s time-outs, on the virtual clock. The `gen_fsm` counterpart of
 `eta_statem`, and a simpler one.
 
-A `gen_fsm` time-out is the `after` of a `receive` inside `gen_fsm:loop/8`: a
+A `gen_fsm` time-out is the `after` of a `receive` inside `gen_fsm:loop`: a
 callback returns `{next_state, S, D, Time}` and the loop waits `Time` for a
 message, delivering `timeout` to the state function if none comes. No transform
 of the module's code reaches that `receive`, so under simulation it would sit on

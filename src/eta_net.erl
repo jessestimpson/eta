@@ -458,7 +458,7 @@ differences:
   in the simulated-monitor table for the duration of the call, so that a
   `partition/3` cutting the link fires it with `noconnection` the way it fires
   every monitor the system holds across the cut. The caller sees
-  `{{nodedown, Node}, {eta_net, call, _}}`, which is what `gen:call/4` makes of
+  `{{nodedown, Node}, {eta_net, call, _}}`, which is what `gen:call` makes of
   a `noconnection` DOWN. A call *into* an already-severed link fails the same
   way at once, as distribution refuses a node it cannot connect to.
 
