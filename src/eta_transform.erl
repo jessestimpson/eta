@@ -154,8 +154,26 @@ The network pass rewrites, unless the module declares `-eta_net(false)`:
 | `gen_fsm:reply/2` | `eta_net:reply/2` |
 | `erlang:monitor/2,3` | `eta_net:monitor/2,3` |
 | `erlang:demonitor/1,2` | `eta_net:demonitor/1,2` |
+| `erlang:node/0,1`, `nodes/0,1`, `is_alive/0`, `disconnect_node/1` | `eta_net`, same names |
+| `erlang:send_nosuspend/2,3` | `eta_net:send_nosuspend/2,3` |
+| `net_kernel:monitor_nodes/1,2`, `connect_node/1` | `eta_net`, same names |
+| `net_kernel:disconnect/1` | `eta_net:disconnect_node/1` |
+| `net_adm:ping/1` | `eta_net:ping/1` |
+| Elixir's `Node.self/0`, `list/0,1`, `connect/1`, `disconnect/1`, `ping/1`, `alive?/0` | `eta_net`'s equivalents |
 
 `!` is the one rewrite that is not a call.
+
+**Why node identity is in this pass.** Every simulated node is the same real
+node, so a system asking `node()` gets one answer for the whole cluster, and one
+asking `node(Pid) == node()` thinks every process is local. `eta_net` answers from
+its topology instead — see "Node identity" there. The bare auto-imported forms
+are rewritten on the same terms as `monitor/2`.
+
+**`node()` in a guard** cannot be a call to `eta_net`, so the clauses around it
+are rewritten first: the node is read just before the clauses are tried and the
+guard compares against that. **`node(X)` in a guard is refused at compile time**,
+with the line, because `X` is usually bound by the clause's own pattern and there
+is nowhere to read it first. Move that test into the body.
 
 **Why monitors are in this pass.** A link failure fires every monitor held across
 it, and a monitor is made by a BIF inside the system under test — so a simulated
@@ -220,7 +238,9 @@ discoverable by using it instead of by reading a table.
 | `gen_statem`'s `send_request`/`wait_response`/`receive_response`/`check_response` | the same |
 | `gen_fsm`'s `sync_send_event`/`sync_send_all_state_event` | the same |
 | every client-side function of `gen_event` | the same |
+| `erlang:monitor_node/2,3`, `erlang:nodes/2`, Elixir's `Node.monitor/2,3` | the same |
 | a module declaring `-behaviour(gen_event)` | at **compile** time |
+| `node(X)` in a guard | at **compile** time |
 
 The last one is a property of the module rather than of a code path: a handler's
 reply is produced inside the event manager, which is neither the module this
@@ -714,7 +734,36 @@ rewrite(Node, _Locals) ->
     {'Elixir.GenServer', call, 2} => {eta_net, call},
     {'Elixir.GenServer', call, 3} => {eta_net, call},
     {'Elixir.GenServer', cast, 2} => {eta_net, cast},
-    {'Elixir.GenServer', reply, 2} => {eta_net, reply}
+    {'Elixir.GenServer', reply, 2} => {eta_net, reply},
+    %% Node identity and membership. In one VM every process is on the same real
+    %% node, so a system that asks which node it is on, or which pid is local,
+    %% gets one answer for the whole cluster. `eta_net` answers from its topology
+    %% instead, and inert without one. See "Node identity" in `eta_net`.
+    %% `node/0,1` are guard BIFs as well, which a call to `eta_net` cannot be:
+    %% `node_guard_pass/1` handles those before this table is applied.
+    {erlang, node, 0} => eta_net,
+    {erlang, node, 1} => eta_net,
+    {erlang, nodes, 0} => eta_net,
+    {erlang, nodes, 1} => eta_net,
+    {erlang, is_alive, 0} => eta_net,
+    {erlang, disconnect_node, 1} => eta_net,
+    {erlang, send_nosuspend, 2} => eta_net,
+    {erlang, send_nosuspend, 3} => eta_net,
+    {net_kernel, monitor_nodes, 1} => eta_net,
+    {net_kernel, monitor_nodes, 2} => eta_net,
+    {net_kernel, connect_node, 1} => eta_net,
+    {net_kernel, disconnect, 1} => {eta_net, disconnect_node},
+    {net_adm, ping, 1} => eta_net,
+    %% Elixir inlines `node/0,1` and `Node.list/0,1` to the `erlang` calls
+    %% above. The rest of `Node` are remote calls into a module no transform
+    %% reaches.
+    {'Elixir.Node', self, 0} => {eta_net, node},
+    {'Elixir.Node', list, 0} => {eta_net, nodes},
+    {'Elixir.Node', list, 1} => {eta_net, nodes},
+    {'Elixir.Node', connect, 1} => {eta_net, connect_node},
+    {'Elixir.Node', disconnect, 1} => {eta_net, disconnect_node},
+    {'Elixir.Node', ping, 1} => {eta_net, ping},
+    {'Elixir.Node', 'alive?', 0} => {eta_net, is_alive}
 }).
 
 %% Client-side messaging `eta_net` does not implement yet.
@@ -796,7 +845,14 @@ rewrite(Node, _Locals) ->
     {gen_event, receive_response, 2},
     {gen_event, receive_response, 3},
     {gen_event, check_response, 2},
-    {gen_event, check_response, 3}
+    {gen_event, check_response, 3},
+    %% Per-node monitoring and `nodes/2`'s info lists: membership `eta_net` does
+    %% not model yet. `monitor_nodes/1,2` is the supported way to watch nodes.
+    {erlang, monitor_node, 2},
+    {erlang, monitor_node, 3},
+    {erlang, nodes, 2},
+    {'Elixir.Node', monitor, 2},
+    {'Elixir.Node', monitor, 3}
 ]).
 
 %% On unless a module says otherwise, for the same reason the `after` pass is:
@@ -810,7 +866,8 @@ net_pass(Forms, Locals) ->
             Forms;
         true ->
             ok = behaviour_unsupported(Forms),
-            statem_return_pass(handle_call_pass(net_walk(Forms, Locals)))
+            Guarded = node_guard_pass(Forms),
+            statem_return_pass(handle_call_pass(net_walk(Guarded, Locals)))
     end.
 
 %% A `gen_event` module cannot have its replies put on the network, so it is
@@ -1078,7 +1135,13 @@ net_walk(Node, _Locals) ->
     {monitor, 2},
     {monitor, 3},
     {demonitor, 1},
-    {demonitor, 2}
+    {demonitor, 2},
+    {node, 0},
+    {node, 1},
+    {nodes, 0},
+    {nodes, 1},
+    {is_alive, 0},
+    {disconnect_node, 1}
 ]).
 
 %% `Dest ! Msg` is `{op, Anno, '!', Dest, Msg}` — the one rewrite here that is not
@@ -1104,6 +1167,182 @@ net_rewrite({call, Anno, {atom, FAnno, Fun}, Args}, Locals) ->
     end;
 net_rewrite(Node, _Locals) ->
     Node.
+
+%% ---------------------------------------------------------------------------
+%% `node()` in a guard
+%% ---------------------------------------------------------------------------
+
+%% `node/0` and `node/1` are guard BIFs, and a guard cannot call `eta_net`. Left
+%% alone, a guard would compare against the real node while the body compared
+%% against the simulated one, and a clause like `when Origin == node()` would
+%% quietly never match. So before the network rewrites run:
+%%
+%% - **`node()` in a guard** is evaluated just before the clauses are tried and
+%%   bound to a variable the guard reads instead. The node a process is on does
+%%   not change between the two, so the clause selection is the same one the
+%%   original made.
+%%
+%%       case X of P when Y == node() -> B end
+%%   becomes
+%%       begin N = erlang:node(), case X of P when Y == N -> B end end
+%%
+%%   and `net_walk/2` then points that `erlang:node()` at `eta_net`. A
+%%   function's clauses move into a helper that takes the node as one more
+%%   argument; an anonymous function's into an inner one called with it.
+%%
+%% - **`node(X)` in a guard is refused**, at compile time. `X` is usually bound
+%%   by the clause's own pattern, so there is nowhere to evaluate it first, and
+%%   no rewrite keeps the clause order without re-implementing pattern matching.
+%%   Move the test into the body.
+node_guard_pass(Forms) ->
+    put('$eta_node_var', 0),
+    try
+        lists:flatmap(fun node_guard_form/1, Forms)
+    after
+        erase('$eta_node_var')
+    end.
+
+node_guard_form({function, Anno, Name, Arity, Clauses0}) ->
+    Clauses = ng_walk(Clauses0),
+    case clauses_use_node(Clauses) of
+        false ->
+            [{function, Anno, Name, Arity, Clauses}];
+        true ->
+            Helper = list_to_atom(
+                "-eta_node-" ++ atom_to_list(Name) ++ "/" ++ integer_to_list(Arity)
+            ),
+            Var = fresh_node_var(),
+            Args = [{var, Anno, arg_var(I)} || I <- lists:seq(1, Arity)],
+            Wrapper =
+                {function, Anno, Name, Arity, [
+                    {clause, Anno, Args, [], [
+                        {call, Anno, {atom, Anno, Helper}, Args ++ [node_call(Anno)]}
+                    ]}
+                ]},
+            Inner = [
+                {clause, CA, Pats ++ [{var, CA, Var}], subst_guards(Gs, Var), Body}
+             || {clause, CA, Pats, Gs, Body} <- Clauses
+            ],
+            [Wrapper, {function, Anno, Helper, Arity + 1, Inner}]
+    end;
+node_guard_form(Form) ->
+    [Form].
+
+%% Bottom-up, so a construct nested inside another is rewritten first and its
+%% guards are already free of `node()` by the time the outer one is looked at.
+ng_walk(Node) when is_tuple(Node) ->
+    ng_rewrite(list_to_tuple([ng_walk(E) || E <- tuple_to_list(Node)]));
+ng_walk(Nodes) when is_list(Nodes) ->
+    [ng_walk(E) || E <- Nodes];
+ng_walk(Node) ->
+    Node.
+
+ng_rewrite({'case', A, E, Cs} = X) ->
+    bind_node(A, Cs, X, fun(V) -> {'case', A, E, subst_clauses(Cs, V)} end);
+ng_rewrite({'receive', A, Cs} = X) ->
+    bind_node(A, Cs, X, fun(V) -> {'receive', A, subst_clauses(Cs, V)} end);
+ng_rewrite({'receive', A, Cs, T, B} = X) ->
+    bind_node(A, Cs, X, fun(V) -> {'receive', A, subst_clauses(Cs, V), T, B} end);
+ng_rewrite({'if', A, Cs} = X) ->
+    bind_node(A, Cs, X, fun(V) -> {'if', A, subst_clauses(Cs, V)} end);
+ng_rewrite({'try', A, Body, Cs, Catch, After} = X) ->
+    bind_node(A, Cs ++ Catch, X, fun(V) ->
+        {'try', A, Body, subst_clauses(Cs, V), subst_clauses(Catch, V), After}
+    end);
+ng_rewrite({'maybe', A, Body, {'else', EA, Cs}} = X) ->
+    bind_node(A, Cs, X, fun(V) -> {'maybe', A, Body, {'else', EA, subst_clauses(Cs, V)}} end);
+ng_rewrite({'fun', A, {clauses, Cs}} = X) ->
+    case clauses_use_node(Cs) of
+        false -> X;
+        true -> {'fun', A, {clauses, [fun_shell(A, Cs)]}}
+    end;
+ng_rewrite({named_fun, A, Name, Cs} = X) ->
+    case clauses_use_node(Cs) of
+        false -> X;
+        true -> {named_fun, A, Name, [fun_shell(A, Cs)]}
+    end;
+ng_rewrite(X) ->
+    X.
+
+bind_node(A, Clauses, Orig, Build) ->
+    case clauses_use_node(Clauses) of
+        false ->
+            Orig;
+        true ->
+            V = fresh_node_var(),
+            {block, A, [{match, A, {var, A, V}, node_call(A)}, Build(V)]}
+    end.
+
+%% `fun(Pats) when G -> B end` becomes
+%% `fun(A1..An) -> V = node(), (fun(Pats) when G' -> B end)(A1..An) end`,
+%% so the node is read when the function is called, by the process calling it.
+fun_shell(A, [{clause, _, Pats, _, _} | _] = Cs) ->
+    V = fresh_node_var(),
+    Args = [{var, A, arg_var(I)} || I <- lists:seq(1, length(Pats))],
+    {clause, A, Args, [], [
+        {match, A, {var, A, V}, node_call(A)},
+        {call, A, {'fun', A, {clauses, subst_clauses(Cs, V)}}, Args}
+    ]}.
+
+clauses_use_node(Clauses) ->
+    lists:any(fun({clause, _, _, Gs, _}) -> guards_use_node(Gs) end, Clauses).
+
+guards_use_node(Guards) ->
+    ng_any(Guards).
+
+ng_any({call, A, F, Args} = Call) ->
+    case node_bif(Call) of
+        0 -> true;
+        1 -> node1_in_guard(A);
+        false -> ng_any(F) orelse ng_any(Args)
+    end;
+ng_any(T) when is_tuple(T) -> ng_any(tuple_to_list(T));
+ng_any(L) when is_list(L) -> lists:any(fun ng_any/1, L);
+ng_any(_) -> false.
+
+node_bif({call, _, {remote, _, {atom, _, erlang}, {atom, _, node}}, Args}) when length(Args) =< 1 ->
+    length(Args);
+node_bif({call, _, {atom, _, node}, Args}) when length(Args) =< 1 ->
+    length(Args);
+node_bif(_) ->
+    false.
+
+node1_in_guard(Anno) ->
+    error(
+        {eta_net,
+            {node_in_guard, erl_anno:line(Anno), <<
+                "node(X) in a guard cannot be simulated: the guard would ask the "
+                "real node, which is the same for every simulated node. Move the "
+                "test into the clause body, or add `-eta_net(false).` to keep this "
+                "module out of the network pass"
+            >>}}
+    ).
+
+subst_clauses(Clauses, V) ->
+    [{clause, A, P, subst_guards(Gs, V), B} || {clause, A, P, Gs, B} <- Clauses].
+
+subst_guards(Guards, V) ->
+    subst_node(Guards, V).
+
+subst_node({call, A, _, []} = Call, V) ->
+    case node_bif(Call) of
+        0 -> {var, A, V};
+        false -> Call
+    end;
+subst_node(T, V) when is_tuple(T) -> list_to_tuple([subst_node(E, V) || E <- tuple_to_list(T)]);
+subst_node(L, V) when is_list(L) -> [subst_node(E, V) || E <- L];
+subst_node(X, _V) -> X.
+
+node_call(A) ->
+    {call, A, {remote, A, {atom, A, erlang}, {atom, A, node}}, []}.
+
+fresh_node_var() ->
+    N = get('$eta_node_var') + 1,
+    put('$eta_node_var', N),
+    list_to_atom("_eta_node" ++ integer_to_list(N)).
+
+arg_var(I) ->
+    list_to_atom("_eta_arg" ++ integer_to_list(I)).
 
 %% `M:F(A, B)` becomes `Target:unsupported({M, F, 2}, [A, B])` — `eta_net` for
 %% the network pass, `eta_sched` for `?SCHED_UNSUPPORTED`.

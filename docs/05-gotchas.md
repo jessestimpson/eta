@@ -636,6 +636,9 @@ real link failure is never *just* lost messages. It comes with `nodedown` and
 Drop messages without delivering the node event and you've injected something
 no real network produces: messages vanishing while both ends still believe
 the link is up. The unrecovered state you then report isn't a defect.
+`eta_net:partition/2` delivers that event to every process subscribed with
+`net_kernel:monitor_nodes/1`, so a system that watches nodes the usual way hears
+it without the harness doing anything.
 
 There's a trap on the other side of that. If you do deliver the node event,
 recovery may repair the very divergence you were trying to observe. In the
@@ -675,6 +678,60 @@ The consequence is that such a fault tunes bimodally rather than smoothly. 10
 seeds of a 3-replica register with a 10-second pause gave give-up counts of
 `0, 0, 0, 0, 0, 0, 9, 9, 11, 12`. Lowering the rate makes jams rarer. It
 can't make them milder.
+
+## Distribution hazards
+
+### Every simulated node is one VM
+
+`node()`, `nodes()` and `net_kernel`'s events are answered by `eta_net`, so a
+system can ask who it is and who it can reach as it would on a real cluster. Its
+names are another matter. There is one registry, one ETS namespace and one
+`persistent_term` for the whole VM, so two nodes' instances that register the same
+local name collide on the second start.
+
+Give each node's instance its own names. Then the system addresses a peer as
+`{Name, Node}` using the name *its own* instance has, which on the peer belongs to
+nobody. Alias it there:
+
+```erlang
+eta_net:register_name(node_b, myapp_a_server, {local, myapp_b_server}).
+```
+
+The alias is looked up at each send, so it follows the server across restarts and
+resolves to nothing while its node is down. Anything that has to agree between
+nodes and contains the instance's name, such as an id a peer compares, still needs
+a seam: the name on the wire can't be the local one.
+
+### node(X) in a guard is refused
+
+`node()` in a guard is fine; the transform reads it just before the clauses are
+tried. `node(Pid)` in a guard isn't, because the pid is usually bound by the
+clause's own pattern and there's nowhere to read it first. The transform refuses
+the module with the line number rather than letting the guard ask the real node,
+which is the same for every simulated node. Move the test into the body:
+
+```elixir
+# Refused:
+defp exit_local(pid) when node(pid) == node(), do: Process.exit(pid, :kill)
+
+# Fine:
+defp exit_local(pid), do: if(node(pid) == node(), do: Process.exit(pid, :kill))
+```
+
+### A heal doesn't reconnect
+
+On a real cluster a healed network leaves nodes disconnected until something
+connects them, usually a reconnect loop or a library like libcluster. `eta_net`
+does the same: after `heal_partition/2`, a node is connected again only when one
+of its processes calls `connect_node/1` or sends without `noconnect`. A system that
+only ever sends with `noconnect` and has no reconnect loop of its own stays apart,
+and a run that ends that way reports divergence that is real for that system. If
+your production cluster has a reconnect loop the system doesn't, put one in the
+harness.
+
+Nodes start disconnected for the same reason. Connect them once each node's
+system is up, as a cluster's discovery would, or peers will reach it before it is
+ready to hear them.
 
 ## Shrinking hazards
 

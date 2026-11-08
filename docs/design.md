@@ -1291,18 +1291,25 @@ ordering rather than a restatement of it.
 
 #### What it deliberately is not
 
-`eta_net` does not emulate `net_kernel`, and this is worth stating loudly because
-the next reader will assume otherwise. A simulated node is a name in a table.
-`nodes()` will not list one, `net_kernel:monitor_nodes/1` will not report one,
-`connect_node/1` will not reach one, and `node(Pid)` still answers with the real
-node. What is delivered is the *events* a link or node failure produces, and
-nothing else — a system under test receives its `nodedown` because a harness sent
-it, not because distribution did.
+`eta_net` does not emulate distribution. A simulated node is a name in a table,
+and nothing about it is a second VM: there is one registry, one ETS namespace and
+one `persistent_term`, so two instances that register the same local name collide.
 
-That leaves a real obligation on the system under test rather than on the
-framework: a connector-shaped process that subscribes through `net_kernel` needs a
-seam the harness can drive instead. There is no way around it short of emulating
-distribution, which is the thing `eta` has declined to do since the first page.
+What it does answer is *who is where*. The first version did not, and every system
+that asked — `node()` to stamp what it owns, `node(Pid) == node()` to decide what
+is local, `net_kernel:monitor_nodes/1` to hear about peers — needed a seam in its
+own code that the harness could drive. Writing that seam for a real library, Group,
+took a behaviour with nine callbacks and a sweep of every `node()` call site, and
+the result was mostly a restatement of what `eta_net` already knew from `place/2`
+and `partition/3`. So the transform now points those calls at `eta_net`, which
+answers from its topology, keeps connections the way distribution does — explicit,
+lost on a partition or a kill, re-made by `connect_node/1` or a plain send — and
+delivers `nodeup`/`nodedown` to `monitor_nodes/1` subscribers itself.
+
+The one-VM part is still the system's to handle, and it is smaller: give each
+node's instance its own local names, and alias them with `register_name/3`'s
+`{local, Name}` form so `{Name, Node}` addressing still works. Group's seam came
+down to one compile-time option, the name its streams carry on the wire.
 
 ## Effort
 

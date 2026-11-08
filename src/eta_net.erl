@@ -7,9 +7,22 @@
     ]}
 ).
 
-%% `monitor/2,3` and `demonitor/1,2` are the API names, shadowing the
-%% auto-imported BIFs. The originals are always reached qualified.
--compile({no_auto_import, [monitor/2, monitor/3, demonitor/1, demonitor/2]}).
+%% `monitor/2,3`, `demonitor/1,2` and the node functions are the API names,
+%% shadowing the auto-imported BIFs. The originals are always reached qualified.
+-compile(
+    {no_auto_import, [
+        monitor/2,
+        monitor/3,
+        demonitor/1,
+        demonitor/2,
+        node/0,
+        node/1,
+        nodes/0,
+        nodes/1,
+        is_alive/0,
+        disconnect_node/1
+    ]}
+).
 
 -define(DOCATTRS, ?OTP_RELEASE >= 27).
 
@@ -116,18 +129,38 @@ owns when they are *seen*, exactly as it does for any other message. Neither
 draws from the fault RNG: adding a signal must not shift the fault schedule for
 the traffic that can be faulted.
 
-## Not `net_kernel`
+## Node identity
 
-A simulated node is a name in a table, not a node. `nodes()` will not list one,
-`net_kernel:monitor_nodes/1` will not report one, `connect_node/1` will not reach
-one, and `node(Pid)` still answers with the real node. This module delivers the
-*events* a link or node failure produces and nothing else; a system under test
-receives its `nodedown` because a harness sent it, not because distribution did.
+In one VM every process is on the same real node, so `node()`, `node(Pid)`,
+`nodes()` and `net_kernel`'s events give a whole simulated cluster one answer.
+`eta_transform` points those calls here instead, and this module answers them from
+its topology:
 
-A connector-shaped process that calls `net_kernel:monitor_nodes/1` therefore has
-to be told about simulated nodes some other way — a `-ifdef(DST)` seam, or a
-subscription function the harness can call. There is no way around it: emulating
-`net_kernel` would mean emulating distribution, which `eta` does not do.
+- **`node/0`** is the simulated node the caller is placed or attached on.
+  `node/1` is the node a pid was placed on, kept after it dies.
+- **Connections are explicit**, as they are in distribution. A placed node starts
+  connected to nothing. `connect_node/1` connects it, and so does a plain send to
+  another node; a send with `noconnect` does not. `nodes/0` lists the nodes the
+  caller's node is connected to.
+- **Losing a connection is an event.** `partition/3`, `kill_node/2` and
+  `disconnect_node/1` disconnect, and every process subscribed with
+  `monitor_nodes/1` hears `{nodedown, Node}`. A heal does not reconnect; something
+  has to, as on a real cluster. `{nodeup, Node}` arrives when it does.
+- **Each side's view is its own.** `partition/3` with `learns` disconnects only
+  the side that noticed, and the other carries on believing it is connected.
+- **`send_nosuspend/2,3`** can find a link busy and return `false`, which is how
+  a real system loses a message on a live connection. See `send_nosuspend/3`.
+
+A process on no simulated node — a harness, an observer, anything a test spawns
+without placing — gets the real BIFs, so a network changes nothing for it.
+`with_node/2` lets such a process ask on a node's behalf.
+
+**What is still one VM.** A simulated node has no registry, ETS namespace or
+`persistent_term` of its own, so two instances of a system that register the same
+local name collide. Give each node's instance its own names, and use
+`register_name/3`'s `{local, Name}` form so `{Name, Node}` still finds the right
+one. `node(X)` in a guard cannot be redirected here and is refused at compile
+time; see `eta_transform`.
 
 Delay is virtual — a delayed message becomes a deadline in `eta_time`'s wheel — so
 waiting one out costs no real time.
@@ -185,6 +218,24 @@ waiting one out costs no real time.
     notify_exit/2
 ]).
 
+%% Membership: who a process's node is, who it is connected to, and the
+%% `net_kernel` events that say when that changes. See "Node identity" above.
+-export([
+    node/0,
+    node/1,
+    nodes/0,
+    nodes/1,
+    is_alive/0,
+    monitor_nodes/1,
+    monitor_nodes/2,
+    connect_node/1,
+    disconnect_node/1,
+    ping/1,
+    send_nosuspend/2,
+    send_nosuspend/3,
+    with_node/2
+]).
+
 %% Targeted faults.
 -export([
     cut/2,
@@ -234,20 +285,31 @@ waiting one out costs no real time.
     drop_p => float(),
     delay_p => float(),
     max_delay => pos_integer(),
-    scope => scope()
+    scope => scope(),
+    busy_p => float(),
+    busy_ms => pos_integer()
 }.
 
 -define(DEFAULT_POLICY, #{
     drop_p => 0.0,
     delay_p => 0.0,
     max_delay => 20,
-    scope => all
+    scope => all,
+    busy_p => 0.0,
+    busy_ms => 1000
 }).
+
+%% The process dictionary key `with_node/2` sets.
+-define(AS_NODE, '$eta_net_node').
 
 %% `signalled` and `noconnection` count link *events* rather than traffic, and are
 %% what a non-vacuity guard on a partition asserts on: a run whose partition
 %% reached nobody exercised no recovery path.
--define(COUNTERS, [delivered, dropped, delayed, cancelled, unmanaged, signalled, noconnection]).
+%% `busy` counts `send_nosuspend` calls refused because the link was busy. Those
+%% messages are not `dropped`: the sender was told, which is the whole difference.
+-define(COUNTERS, [
+    delivered, dropped, delayed, cancelled, unmanaged, signalled, noconnection, busy
+]).
 
 %% ---------------------------------------------------------------------------
 %% Lifecycle
@@ -369,18 +431,28 @@ send(Dest, Msg) ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:send/3`. The options are for distribution and have no meaning between two
-processes in one VM, so a routed send ignores them.
+`erlang:send/3`.
+
+Between two simulated nodes the options mean what they mean in distribution:
+`noconnect` returns `noconnect` and sends nothing when the sender's node is not
+connected to the destination's, and `nosuspend` returns `nosuspend` and sends
+nothing while the link is busy (see `send_nosuspend/3`). Anywhere else they have
+no meaning between two processes in one VM, and a routed send ignores them.
 """.
 -endif.
 -spec send(dest() | term(), term(), list()) -> ok | nosuspend | noconnect.
 send(Dest, Msg, Opts) ->
-    case running() andalso normalize(Dest) of
-        To when is_pid(To) ->
-            _ = route(self(), To, Msg),
-            ok;
-        _ ->
-            erlang:send(Dest, Msg, Opts)
+    case running() andalso across(Dest) of
+        {Here, There} ->
+            remote_send(Here, There, Dest, Msg, Opts, send);
+        false ->
+            case running() andalso normalize(Dest) of
+                To when is_pid(To) ->
+                    _ = route(self(), To, Msg),
+                    ok;
+                _ ->
+                    erlang:send(Dest, Msg, Opts)
+            end
     end.
 
 -if(?DOCATTRS).
@@ -875,11 +947,31 @@ unsupported({M, F, _A} = MFA, Args) ->
 %% `register_name/3` fills, which is what lets a system address its peers the way
 %% distributed Erlang does. The real node is checked first so a harness that
 %% never registers anything behaves exactly as before.
+%%
+%% A name with no simulated registration still resolves if a real process holds
+%% it **and is located on that node**. A system whose instances already have
+%% distinct local names then needs no `register_name/3` at all, and a process
+%% that restarts under the same name is found again without the harness noticing.
 normalize(Pid) when is_pid(Pid) -> Pid;
 normalize(Name) when is_atom(Name) -> erlang:whereis(Name);
-normalize({Name, Node}) when is_atom(Name), Node =:= node() -> erlang:whereis(Name);
-normalize({Name, Node}) when is_atom(Name) -> whereis_name(Node, Name);
+normalize({Name, Node}) when is_atom(Name), Node =:= erlang:node() -> erlang:whereis(Name);
+normalize({Name, Node}) when is_atom(Name) ->
+    case whereis_name(Node, Name) of
+        undefined -> located_name(Name, Node);
+        Pid -> Pid
+    end;
 normalize(_) -> undefined.
+
+located_name(Name, Node) ->
+    case running() andalso erlang:whereis(Name) of
+        Pid when is_pid(Pid) ->
+            case placement(Pid) of
+                {Node, _} -> Pid;
+                _ -> undefined
+            end;
+        _ ->
+            undefined
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Policy
@@ -896,6 +988,9 @@ Sets the random fault policy. Anything omitted keeps its current value.
   - `all` (the default),
   - `{tags, [Tag]}` — messages carrying one of these tags,
   - `fun(From, Dest, Tag) -> boolean()`.
+- `busy_p` — probability that a `send_nosuspend` finds the link busy, starting a
+  busy spell. See `send_nosuspend/3`.
+- `busy_ms` — upper bound, in **virtual** milliseconds, on a busy spell.
 
 A message's **tag** is its leading element, except that `cast/2` and `reply/2`
 name the payload rather than OTP's envelope: a cast of `{prepare, TxId}` is
@@ -998,11 +1093,13 @@ attach(Node, Pids) ->
 do_place(What, Node, Pids, Faultable) ->
     ok = require_running(What),
     true = ets:insert(?PLACE, {{node, Node}, true}),
+    true = ets:delete(?PLACE, {down, Node}),
     lists:foreach(
         fun(D) ->
             case normalize(D) of
                 P when is_pid(P) ->
-                    true = ets:insert(?PLACE, {{pid, P}, Node, Faultable, seq_of(P)});
+                    true = ets:insert(?PLACE, {{pid, P}, Node, Faultable, seq_of(P)}),
+                    true = ets:insert(?PLACE, {{home, P}, Node});
                 _ ->
                     ok
             end
@@ -1044,9 +1141,32 @@ A pid may hold several names, and re-registering a name moves it. Nothing is
 removed when a process dies: a name whose process is gone resolves to a dead pid,
 which routes and fails exactly as a stale `{Name, Node}` does against a real node
 that has restarted. Use `unregister_name/2` to model deregistration.
+
+## An alias for a local name
+
+`Dest` may instead be `{local, LocalName}`: on `Node`, `Name` means whichever
+process holds the real local name `LocalName`, **looked up at each send**, and
+only while that process is located on `Node`.
+
+```erlang
+%% Each node runs its own instance under its own local name, and peers address
+%% each other by their *own* instance's name, as they would in a real cluster.
+eta_net:register_name(node_b, myapp_a_server, {local, myapp_b_server}).
+```
+
+That is the shape a system takes when it runs one instance per simulated node in
+one VM: the instances need distinct local names, but the system addresses a peer
+by the name *it* would have on the peer. Because the lookup happens at send time,
+the alias follows the process across restarts — a supervisor bringing the server
+back under the same local name needs no new registration — and resolves to
+nothing while the node is down.
 """.
 -endif.
--spec register_name(term(), atom(), dest()) -> ok.
+-spec register_name(term(), atom(), dest() | {local, atom()}) -> ok.
+register_name(Node, Name, {local, Local}) when is_atom(Name), is_atom(Local) ->
+    ok = require_running(register_name),
+    true = ets:insert(?PLACE, {{name, Node, Name}, {local, Local}}),
+    ok;
 register_name(Node, Name, Dest) when is_atom(Name) ->
     ok = require_running(register_name),
     case normalize(Dest) of
@@ -1075,6 +1195,7 @@ The pid registered as `Name` on simulated node `Node`, or `undefined`.
 -spec whereis_name(term(), atom()) -> pid() | undefined.
 whereis_name(Node, Name) when is_atom(Name) ->
     case running() andalso ets:lookup(?PLACE, {name, Node, Name}) of
+        [{_, {local, Local}}] -> located_name(Local, Node);
         [{_, Pid}] -> Pid;
         _ -> undefined
     end.
@@ -1163,6 +1284,7 @@ inherit(Parent, Child) ->
     case running() andalso placement(Parent) of
         {Node, Faultable} ->
             true = ets:insert(?PLACE, {{pid, Child}, Node, Faultable, seq_of(Child)}),
+            true = ets:insert(?PLACE, {{home, Child}, Node}),
             ok;
         _ ->
             ok
@@ -1233,6 +1355,522 @@ require_running(What) ->
                         "eta_net:start/1 first"
                     >>}}
             )
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Membership
+%% ---------------------------------------------------------------------------
+
+-if(?DOCATTRS).
+-doc """
+`erlang:node/0` for a process on a simulated node: the node it is placed or
+attached on.
+
+Anything else gets the real node, so a process the network does not know about
+sees exactly what it would without one. `with_node/2` answers this for a process
+that is on no node, such as a harness reading one node's state.
+""".
+-endif.
+-spec node() -> term().
+node() ->
+    case local_node() of
+        undefined -> erlang:node();
+        Node -> Node
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`erlang:node/1`: the simulated node a pid was placed on, or the real one.
+
+A pid keeps its node after it dies, as a real pid does — it is written into the
+pid itself. Systems that learn about a peer's processes compare `node(Pid)` with
+the peer long after the process is gone.
+""".
+-endif.
+-spec node(pid() | port() | reference()) -> term().
+node(Pid) when is_pid(Pid) ->
+    case running() andalso ets:lookup(?PLACE, {home, Pid}) of
+        [{_, Node}] -> Node;
+        _ -> erlang:node(Pid)
+    end;
+node(Other) ->
+    erlang:node(Other).
+
+-if(?DOCATTRS).
+-doc """
+`erlang:nodes/0`: the nodes the calling process's node is connected to, sorted.
+
+What "connected" means is in "Node identity" in the module doc.
+""".
+-endif.
+-spec nodes() -> [term()].
+nodes() ->
+    case local_node() of
+        undefined -> erlang:nodes();
+        Node -> connected_to(Node)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`erlang:nodes/1`. `visible` and `connected` are `nodes/0`, `this` is the
+caller's node, `known` is every simulated node there has been, and `hidden` is
+empty: a simulated node is always visible. A list combines them in order.
+""".
+-endif.
+-spec nodes(atom() | [atom()]) -> [term()].
+nodes(Arg) ->
+    case local_node() of
+        undefined ->
+            erlang:nodes(Arg);
+        Node ->
+            Kinds =
+                case is_list(Arg) of
+                    true -> Arg;
+                    false -> [Arg]
+                end,
+            dedupe(lists:append([nodes_of(Node, K) || K <- Kinds]))
+    end.
+
+nodes_of(Node, K) when K =:= visible; K =:= connected -> connected_to(Node);
+nodes_of(_Node, hidden) -> [];
+nodes_of(Node, this) -> [Node];
+nodes_of(_Node, known) -> lists:sort([N || [N] <- ets:match(?PLACE, {{node, '$1'}, '_'})]);
+nodes_of(_Node, Other) -> error(badarg, [Other]).
+
+dedupe(List) -> dedupe(List, #{}).
+dedupe([], _Seen) -> [];
+dedupe([H | T], Seen) when is_map_key(H, Seen) -> dedupe(T, Seen);
+dedupe([H | T], Seen) -> [H | dedupe(T, Seen#{H => true})].
+
+-if(?DOCATTRS).
+-doc "`erlang:is_alive/0`: always `true` on a simulated node.".
+-endif.
+-spec is_alive() -> boolean().
+is_alive() ->
+    local_node() =/= undefined orelse erlang:is_alive().
+
+-if(?DOCATTRS).
+-doc "`net_kernel:monitor_nodes/1`. See `monitor_nodes/2`.".
+-endif.
+-spec monitor_nodes(boolean()) -> ok | error.
+monitor_nodes(Flag) ->
+    monitor_nodes(Flag, []).
+
+-if(?DOCATTRS).
+-doc """
+`net_kernel:monitor_nodes/2` for a process on a simulated node.
+
+`true` starts a subscription and `false` ends one, and like `net_kernel` each
+subscription delivers its own copy of every event. The caller's node receives
+`{nodeup, Node}` and `{nodedown, Node}` as its connections come and go: `nodeup`
+when `connect_node/1` or a plain send connects two nodes, and `nodedown` on
+`partition/3`, `kill_node/2` and `disconnect_node/1`. A heal does not reconnect,
+as it does not in distribution; something has to connect again.
+
+With options the message is `{nodeup | nodedown, Node, Info}`.
+`{node_type, visible | all}` adds `{node_type, visible}` to `Info`,
+`{node_type, hidden}` selects nothing (a simulated node is never hidden), and
+`nodedown_reason` adds `{nodedown_reason, Reason}` to a `nodedown`. The reasons
+are `net_tick_timeout` for a partition, `connection_closed` for a killed node and
+`disconnect` for `disconnect_node/1`.
+
+Events are delivered directly rather than routed, in subscription order, like
+`partition/3`'s signal — a cut channel cannot swallow the news of the cut.
+""".
+-endif.
+-spec monitor_nodes(boolean(), list()) -> ok | error.
+monitor_nodes(Flag, Opts) when is_boolean(Flag), is_list(Opts) ->
+    case local_node() of
+        undefined -> net_kernel:monitor_nodes(Flag, Opts);
+        Node -> subscribe(Flag, Node, self(), Opts)
+    end.
+
+subscribe(true, Node, Pid, Opts) ->
+    {Seq, Subs} =
+        case ets:lookup(?PLACE, {sub, Pid}) of
+            [{_, _Node, S, L}] -> {S, L};
+            [] -> {next_seq(), []}
+        end,
+    true = ets:insert(?PLACE, {{sub, Pid}, Node, Seq, Subs ++ [Opts]}),
+    ok;
+subscribe(false, _Node, Pid, Opts) ->
+    case ets:lookup(?PLACE, {sub, Pid}) of
+        [{Key, Node, Seq, Subs}] ->
+            case lists:delete(Opts, Subs) of
+                [] -> true = ets:delete(?PLACE, Key);
+                Left -> true = ets:insert(?PLACE, {Key, Node, Seq, Left})
+            end,
+            ok;
+        [] ->
+            ok
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`net_kernel:connect_node/1` and Elixir's `Node.connect/1`.
+
+`true` when the caller's node is now connected to `Node`: it already was, or
+`Node` is up and not partitioned from it, in which case both sides' subscribers
+get `nodeup`. `false` otherwise — a node that has never been placed, one that was
+killed, or one on the far side of a cut.
+""".
+-endif.
+-spec connect_node(term()) -> boolean() | ignored.
+connect_node(Node) ->
+    case local_node() of
+        undefined -> net_kernel:connect_node(Node);
+        Node -> true;
+        Here -> try_connect(Here, Node)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`erlang:disconnect_node/1` and Elixir's `Node.disconnect/1`.
+
+Tears down the connection as distribution does: messages in flight between the
+two nodes are lost, monitors across it fire `noconnection`, and both sides'
+subscribers get `nodedown` with reason `disconnect`. `false` if they were not
+connected. Nothing reconnects them until a process calls `connect_node/1` or
+sends to the other node without `noconnect`.
+""".
+-endif.
+-spec disconnect_node(term()) -> boolean() | ignored.
+disconnect_node(Node) ->
+    case local_node() of
+        undefined -> erlang:disconnect_node(Node);
+        Node -> false;
+        Here -> drop_connection(Here, Node)
+    end.
+
+-if(?DOCATTRS).
+-doc "`net_adm:ping/1` and Elixir's `Node.ping/1`: `connect_node/1` as `pong` or `pang`.".
+-endif.
+-spec ping(term()) -> pong | pang.
+ping(Node) ->
+    case local_node() of
+        undefined ->
+            net_adm:ping(Node);
+        _ ->
+            case connect_node(Node) of
+                true -> pong;
+                _ -> pang
+            end
+    end.
+
+-if(?DOCATTRS).
+-doc "`erlang:send_nosuspend/2`. See `send_nosuspend/3`.".
+-endif.
+-spec send_nosuspend(dest() | term(), term()) -> boolean().
+send_nosuspend(Dest, Msg) ->
+    send_nosuspend(Dest, Msg, []).
+
+-if(?DOCATTRS).
+-doc """
+`erlang:send_nosuspend/3`, with a link that can be busy.
+
+Between two simulated nodes it returns `false` and sends nothing when:
+
+- the link is **busy**. Each call that crosses a link starts a busy spell on it
+  with probability `busy_p`, lasting up to `busy_ms` virtual milliseconds, and
+  every `send_nosuspend` on that link in that direction is refused until it
+  ends. This is the fault a real system meets when a dist port's buffer is full:
+  the connection stays up, nothing says `nodedown`, and the message is gone
+  unless the sender acts on `false`. Plain sends are not refused, because a real
+  one would suspend the sender instead.
+- `noconnect` is given and the nodes are not connected, or they are not
+  connected and cannot be (a cut, or a node that is down).
+
+Otherwise the message is routed like any other send, so the random policy and
+any cut still apply, and the result is `true` — including for a name nobody holds
+on the other node, which distribution loses without saying so.
+
+Busy spells are drawn from the fault schedule only for traffic that crosses a
+link, and only while `busy_p` is above zero. `scope` does not apply: it selects
+messages, and a busy port refuses everything.
+
+Anywhere else this is `erlang:send_nosuspend/3`, or `true` after a routed send
+between local processes.
+""".
+-endif.
+-spec send_nosuspend(dest() | term(), term(), list()) -> boolean().
+send_nosuspend(Dest, Msg, Opts) ->
+    case running() andalso across(Dest) of
+        {Here, There} ->
+            remote_send(Here, There, Dest, Msg, Opts, nosuspend);
+        false ->
+            case running() andalso normalize(Dest) of
+                To when is_pid(To) ->
+                    _ = route(self(), To, Msg),
+                    true;
+                _ ->
+                    erlang:send_nosuspend(Dest, Msg, Opts)
+            end
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Runs `Fun` as though the calling process were on `Node`, for the membership
+functions only: `node/0`, `nodes/0,1`, `connect_node/1` and the rest answer for
+`Node`. Placement and routing are unchanged.
+
+For a harness that reads one node's state through the system's public API, which
+asks `node()` to decide what is local.
+""".
+-endif.
+-spec with_node(term(), fun(() -> T)) -> T.
+with_node(Node, Fun) when is_function(Fun, 0) ->
+    Old = put(?AS_NODE, Node),
+    try
+        Fun()
+    after
+        case Old of
+            undefined -> erase(?AS_NODE);
+            _ -> put(?AS_NODE, Old)
+        end
+    end.
+
+%% The caller's simulated node, or `undefined` when it has none.
+local_node() ->
+    case running() of
+        false ->
+            undefined;
+        true ->
+            case get(?AS_NODE) of
+                undefined ->
+                    case placement(self()) of
+                        {Node, _} -> Node;
+                        undefined -> undefined
+                    end;
+                Node ->
+                    Node
+            end
+    end.
+
+%% `{Here, There}` when a send from the caller to `Dest` goes between two
+%% different simulated nodes, otherwise `false`.
+across(Dest) ->
+    case {local_node(), dest_node(Dest)} of
+        {undefined, _} -> false;
+        {_, undefined} -> false;
+        {Same, Same} -> false;
+        {Here, There} -> {Here, There}
+    end.
+
+dest_node(Pid) when is_pid(Pid) ->
+    case ets:lookup(?PLACE, {home, Pid}) of
+        [{_, Node}] -> Node;
+        [] -> undefined
+    end;
+dest_node({Name, Node}) when is_atom(Name) ->
+    case ets:member(?PLACE, {node, Node}) of
+        true -> Node;
+        false -> undefined
+    end;
+dest_node(Name) when is_atom(Name) ->
+    case erlang:whereis(Name) of
+        Pid when is_pid(Pid) -> dest_node(Pid);
+        _ -> undefined
+    end;
+dest_node(_) ->
+    undefined.
+
+%% A send between two simulated nodes, as `erlang:send/3` (`send`) or
+%% `erlang:send_nosuspend/3` (`nosuspend`) does it.
+remote_send(Here, There, Dest, Msg, Opts, Mode) ->
+    Connected =
+        ets:member(?PLACE, {conn, Here, There}) orelse
+            (not lists:member(noconnect, Opts) andalso try_connect(Here, There)),
+    case Connected of
+        false when Mode =:= nosuspend ->
+            false;
+        false ->
+            case lists:member(noconnect, Opts) of
+                true -> noconnect;
+                false -> ok
+            end;
+        true ->
+            case normalize(Dest) of
+                To when is_pid(To) ->
+                    Busy =
+                        (Mode =:= nosuspend orelse lists:member(nosuspend, Opts)) andalso
+                            busy(self(), To, Here, There, Msg),
+                    case Busy of
+                        true when Mode =:= nosuspend ->
+                            false;
+                        true ->
+                            nosuspend;
+                        false ->
+                            _ = route(self(), To, Msg),
+                            accepted(Mode)
+                    end;
+                _ ->
+                    accepted(Mode)
+            end
+    end.
+
+accepted(nosuspend) -> true;
+accepted(send) -> ok.
+
+%% Whether the `Here -> There` link refuses this send. A spell in progress refuses
+%% everything; starting one is a draw from the fault schedule, made only for a
+%% send the schedule ordered and the policy may fault.
+busy(From, To, Here, There, Msg) ->
+    Key = {busy, Here, There},
+    Now = now_ms(),
+    Busy =
+        case ets:lookup(?CHAN, Key) of
+            [{_, Until}] when Until > Now ->
+                true;
+            _ ->
+                Policy = policy(),
+                BusyP = maps:get(busy_p, Policy),
+                BusyP > 0.0 andalso classify(From, To) =:= scheduled andalso
+                    crosses_link(From, To) andalso
+                    case draw() < BusyP of
+                        true ->
+                            Ms = max(1, trunc(draw() * maps:get(busy_ms, Policy))),
+                            true = ets:insert(?CHAN, {Key, Now + Ms}),
+                            true;
+                        false ->
+                            false
+                    end
+        end,
+    case Busy of
+        true ->
+            bump(busy),
+            _ = eta_log:log({net, busy, To, tag(Msg)}),
+            true;
+        false ->
+            false
+    end.
+
+%% A plain send between two simulated nodes connects them first, as distribution
+%% does, unless they are cut apart — then the send is dropped by `decide/3` as
+%% any send across a cut is.
+autoconnect(From, Dest) ->
+    case {placement(From), placement(Dest)} of
+        {{A, _}, {B, _}} when A =/= B ->
+            _ = ets:member(?PLACE, {conn, A, B}) orelse try_connect(A, B),
+            ok;
+        _ ->
+            ok
+    end.
+
+is_up(Node) ->
+    ets:member(?PLACE, {node, Node}) andalso not ets:member(?PLACE, {down, Node}).
+
+link_cut(A, B) ->
+    ets:member(?CHAN, {node_cut, A, B}) orelse ets:member(?CHAN, {node_cut, B, A}).
+
+connected_to(Node) ->
+    lists:sort([N || [N] <- ets:match(?PLACE, {{conn, Node, '$1'}})]).
+
+try_connect(Here, There) ->
+    case is_up(There) andalso not link_cut(Here, There) of
+        true ->
+            link_up(Here, There),
+            true;
+        false ->
+            false
+    end.
+
+%% Each side's belief that it is connected is held separately, because the two
+%% ends of a real connection find out about its loss separately. See `learns` in
+%% `partition/3`.
+link_up(A, B) ->
+    ok = believe(A, B),
+    believe(B, A).
+
+believe(X, Y) ->
+    case ets:insert_new(?PLACE, {{conn, X, Y}}) of
+        true -> node_event(X, nodeup, Y, undefined);
+        false -> ok
+    end.
+
+link_down(A, B, Learns, Reason) ->
+    Sides =
+        case Learns of
+            both -> [{A, B}, {B, A}];
+            a -> [{A, B}];
+            b -> [{B, A}]
+        end,
+    lists:foreach(fun({X, Y}) -> disbelieve(X, Y, Reason) end, Sides).
+
+disbelieve(X, Y, Reason) ->
+    case ets:member(?PLACE, {conn, X, Y}) of
+        true ->
+            true = ets:delete(?PLACE, {conn, X, Y}),
+            node_event(X, nodedown, Y, Reason);
+        false ->
+            ok
+    end.
+
+drop_connection(Here, There) ->
+    case ets:member(?PLACE, {conn, Here, There}) orelse ets:member(?PLACE, {conn, There, Here}) of
+        false ->
+            false;
+        true ->
+            Ours = on_node(Here),
+            Theirs = on_node(There),
+            _ = [cancel_pending(P, Q) || P <- Ours, Q <- Theirs],
+            _ = [cancel_pending(Q, P) || P <- Ours, Q <- Theirs],
+            ok = sever(Ours, Theirs, both),
+            ok = link_down(Here, There, both, disconnect),
+            true
+    end.
+
+%% `kill_node/2`, after the processes are gone: the node is down, every survivor
+%% connected to it hears `nodedown`, and its own subscriptions went with it.
+node_down(Node, Dying) ->
+    true = ets:insert(?PLACE, {{down, Node}}),
+    Peers = lists:sort([N || [N] <- ets:match(?PLACE, {{conn, '$1', Node}})]),
+    lists:foreach(fun(Peer) -> disbelieve(Peer, Node, connection_closed) end, Peers),
+    true = ets:match_delete(?PLACE, {{conn, Node, '_'}}),
+    lists:foreach(fun(P) -> true = ets:delete(?PLACE, {sub, P}) end, Dying),
+    ok.
+
+%% Tells every subscriber on `Node`, in subscription order. Direct, as
+%% `signals/3` is.
+node_event(Node, Kind, Other, Reason) ->
+    Subs = lists:sort([
+        {Seq, Pid, Subs}
+     || [Pid, Seq, Subs] <- ets:match(?PLACE, {{sub, '$1'}, Node, '$2', '$3'})
+    ]),
+    lists:foreach(
+        fun({_Seq, Pid, Each}) ->
+            lists:foreach(
+                fun(Opts) ->
+                    case node_message(Kind, Other, Reason, Opts) of
+                        skip ->
+                            ok;
+                        Msg ->
+                            _ = (catch erlang:send(Pid, Msg)),
+                            bump(signalled),
+                            _ = eta_log:log({net, signal, Pid, Kind})
+                    end
+                end,
+                Each
+            )
+        end,
+        Subs
+    ).
+
+node_message(Kind, Other, _Reason, []) ->
+    {Kind, Other};
+node_message(Kind, Other, Reason, Opts) ->
+    case lists:member({node_type, hidden}, Opts) of
+        true ->
+            skip;
+        false ->
+            Type = [
+                {node_type, visible}
+             || T <- [visible, all], lists:member({node_type, T}, Opts)
+            ],
+            Why = [
+                {nodedown_reason, Reason}
+             || Kind =:= nodedown, lists:member(nodedown_reason, Opts)
+            ],
+            {Kind, Other, lists:sublist(Type, 1) ++ Why}
     end.
 
 %% ---------------------------------------------------------------------------
@@ -1465,21 +2103,21 @@ simulated_pair(Watcher, Target) ->
 %% answers `{Name, Node}` from the simulated registry for any node that is not
 %% `node()`, so a pid coming back for one of those means the VM cannot resolve it
 %% and must not be asked to. See `register_name/3`.
-simulated_name({Name, Node}) when is_atom(Name), Node =/= node() ->
-    whereis_name(Node, Name) =/= undefined;
+simulated_name({Name, Node}) when is_atom(Name), Node =/= erlang:node() ->
+    is_pid(normalize({Name, Node}));
 simulated_name(_) ->
     false.
 
 %% Whether a `{Name, Node}` names a node the topology knows — whatever is or
 %% is not registered there. `place/2` records every node it is given.
-on_simulated_node({Name, Node}) when is_atom(Name), Node =/= node() ->
+on_simulated_node({Name, Node}) when is_atom(Name), Node =/= erlang:node() ->
     ets:member(?PLACE, {node, Node});
 on_simulated_node(_) ->
     false.
 
 %% What `erlang:monitor/2` puts in the DOWN message's `Object` position.
 object(Pid) when is_pid(Pid) -> Pid;
-object(Name) when is_atom(Name) -> {Name, node()};
+object(Name) when is_atom(Name) -> {Name, erlang:node()};
 object({Name, Node}) when is_atom(Name), is_atom(Node) -> {Name, Node};
 object(Other) -> Other.
 
@@ -1585,6 +2223,7 @@ notify_exit(Pid, Reason) ->
             %% that has already exited answers `noproc` without asking the VM. See
             %% `simulate_monitor/4`.
             true = ets:insert(?DEAD, {Pid}),
+            true = ets:delete(?PLACE, {sub, Pid}),
             _ = [fire(M, Reason) || M <- monitors_on(Pid)],
             %% Whatever it was watching, it is not watching any more.
             true = ets:match_delete(?MONS, {'_', Pid, '_', '_', '_', '_'}),
@@ -1735,6 +2374,14 @@ one that had to be hand-rolled from two `cut/2` calls and a fan-out before. The
 cut itself stays symmetric: a lost link loses both directions whether or not
 anyone has realised.
 
+## Connections
+
+When `A` and `B` are nodes, the partition disconnects them, and the
+`monitor_nodes/1` subscribers on each side that learns of it receive
+`{nodedown, Other}` after the DOWNs and before the signal. That is the event a
+system watching `net_kernel` acts on, so it is usually all a run needs: `signal`
+is for a system that learns some other way. See "Node identity" in the module doc.
+
 ## Monitors
 
 Every simulated monitor held across the partition fires exactly one
@@ -1770,8 +2417,9 @@ matters, and `learns` for delivering it to one side only.
 
 **Resurrects nothing.** A monitor that fired `noconnection` is gone, exactly as
 it would be in real Erlang, and a system that wants to keep watching its peer has
-to monitor it again. Healing a link is not undoing the failure; it is a second
-event.
+to monitor it again. The nodes stay disconnected until something connects them —
+`connect_node/1`, or a plain send. Healing a link is not undoing the failure; it
+is a second event.
 """.
 -endif.
 -spec heal_partition(dest(), dest(), event_opts()) -> ok.
@@ -1780,10 +2428,15 @@ heal_partition(A, B, Opts) ->
     ok = heal(B, A),
     signals(A, B, Opts).
 
-%% A link between A and B has failed: retire the monitors that crossed it, then
-%% announce it. Shared by `partition/3` and, in a one-sided form, `kill_node/2`.
+%% A link between A and B has failed: retire the monitors that crossed it, tell
+%% the `monitor_nodes` subscribers, then deliver any signal.
 link_event(A, B, Opts) ->
     ok = sever(endpoints(A), endpoints(B), learns(Opts)),
+    ok =
+        case {resolve(A), resolve(B)} of
+            {{node, X}, {node, Y}} -> link_down(X, Y, learns(Opts), net_tick_timeout);
+            _ -> ok
+        end,
     signals(A, B, Opts).
 
 %% Fires `noconnection` at every simulated monitor with one end on each side.
@@ -1890,7 +2543,7 @@ events that death produces.
 eta_net:kill_node(nb, #{signal => nodedown}).
 ```
 
-Five things happen, in this order, and the order is the point — a harness that
+Six things happen, in this order, and the order is the point — a harness that
 hand-rolls this from `place/2`, `exit/2` and `partition/3` gets it subtly wrong,
 usually by killing first:
 
@@ -1900,7 +2553,9 @@ usually by killing first:
 3. Messages in flight to or from the node are cancelled, as a failing node loses
    what was on the wire.
 4. Every located process on the node — placed *and* attached — is killed.
-5. Surviving located processes receive `{Signal, Node}`.
+5. Every node connected to it is disconnected, and its `monitor_nodes/1`
+   subscribers receive `{nodedown, Node}`.
+6. Surviving located processes receive `{Signal, Node}`.
 
 ## The asymmetry in step 1
 
@@ -1965,6 +2620,7 @@ kill_node(Node, Opts) ->
     ok = forget_monitors(Dying),
     ok = cancel_touching(Dying),
     ok = kill_all(Dying),
+    ok = node_down(Node, Dying),
     case maps:find(signal, Opts) of
         error -> ok;
         {ok, Sig} -> emit(Survivors, derive(Sig, Node))
@@ -2208,6 +2864,7 @@ escaped_or_foreign(Dest, _Stepping) ->
 route(From, Dest, Msg, Tag) ->
     case classify(From, Dest) of
         scheduled ->
+            ok = autoconnect(From, Dest),
             route_managed(From, Dest, Msg, Tag);
         escaped ->
             bump(unmanaged),

@@ -10,8 +10,26 @@
 - Added `eta_ets`, which the parse_transform uses so that iterating a hash-based ETS
   table is stable under a run. Keys holding references or pids otherwise iterate in
   a different order in every VM, which `audit/1` cannot see.
+- The parse_transform points node identity and membership at `eta_net`:
+  `node/0,1`, `nodes/0,1`, `is_alive/0`, `net_kernel:monitor_nodes/1,2`,
+  `connect_node/1`, `disconnect_node/1`, `net_adm:ping/1`, `send_nosuspend/2,3`
+  and their Elixir `Node` forms. `eta_net` answers from its topology and keeps
+  connections as distribution does, so a system on a simulated node needs no seam
+  of its own for them. `node()` in a guard is handled; `node(X)` in a guard is
+  refused at compile time.
+- `eta_net` delivers `nodeup`/`nodedown` to `monitor_nodes/1` subscribers on
+  `connect_node/1`, `disconnect_node/1`, `partition/3` and `kill_node/2`.
+- Added a busy-link fault to `eta_net`'s policy, `busy_p` and `busy_ms`:
+  `send_nosuspend` returns `false` while the link is busy. Counted as `busy`.
+- `eta_net:register_name/3` takes `{local, Name}`, an alias resolved at each send,
+  and `{Name, Node}` resolves a real registered name held by a process on `Node`.
+- Added `eta_net:with_node/2`, for a harness reading a node's state through the
+  system's API.
 
 ### Bug fixes
+
+- `eta_net:send/3` honours `noconnect` and `nosuspend` between simulated nodes.
+  It ignored both, so a send that real distribution would refuse was delivered.
 
 - A gated start now returns `{error, Reason}` when the child is killed before it
   acknowledges. A parent trapping exits, which includes every supervisor, and any
