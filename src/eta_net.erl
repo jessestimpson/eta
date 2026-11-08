@@ -1186,13 +1186,15 @@ crosses_link(From, Dest) ->
 %% A reference to cut or partition: a node if it names one, otherwise a process.
 %% Only an atom is ambiguous — a node named the same as a registered process — and
 %% nodes win; pass a pid to disambiguate.
-resolve(Ref) when is_atom(Ref) ->
+%% Any term can name a node, because `place/2` takes any term: a system whose node
+%% names are binaries partitions them the same way as one using atoms.
+resolve(Ref) when is_pid(Ref) ->
+    {pid, Ref};
+resolve(Ref) ->
     case ets:member(?PLACE, {node, Ref}) of
         true -> {node, Ref};
         false -> {pid, normalize(Ref)}
-    end;
-resolve(Ref) ->
-    {pid, normalize(Ref)}.
+    end.
 
 %% Every process on a node, for delivering a link signal, **in placement order**.
 %%

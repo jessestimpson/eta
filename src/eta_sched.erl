@@ -180,7 +180,7 @@ releasing, not after.
 %% Client functions eta cannot gate yet — Elixir's `Task` and `Agent`, which
 %% spawn and wait inside the Elixir stdlib. Raise while a scheduler is active,
 %% delegate otherwise. See `unsupported/2`.
--export([unsupported/2]).
+-export([unsupported/2, instrumented/1]).
 
 %% The distributed forms, which raise while a run is active. See `no_dist/3`.
 -export([
@@ -675,13 +675,14 @@ no_dist(true, MFA, _Delegate) ->
 %% `no_dist/3` takes on the distributed spawns and `eta_net:unsupported/2`
 %% takes on the unroutable sends, for the same reason: there is no honest
 %% local substitute, and letting the call through would mean a run reporting
-%% determinism it does not have.
+%% determinism it does not have. A module `Eta.Beam.instrument/1` has rewritten
+%% no longer has the hazard, so its calls go through; see `instrumented/1`.
 %%
 %% Gated on `active()` rather than on a network, because the hazard is the
 %% scheduler's — a run without a network still cannot afford an ungated spawn.
 -spec unsupported({module(), atom(), arity()}, [term()]) -> term().
 unsupported({M, F, _A} = MFA, Args) ->
-    case active() of
+    case active() andalso not persistent_term:get({?MODULE, instrumented, M}, false) of
         false ->
             apply(M, F, Args);
         true ->
@@ -696,6 +697,14 @@ unsupported({M, F, _A} = MFA, Args) ->
                     >>}}
             )
     end.
+
+%% Records modules `Eta.Beam.instrument/1` has rewritten. The hazard behind
+%% `unsupported/2` is that a module's spawns and waits sit where no transform
+%% reaches; once the module itself has been rewritten they do not, and its calls
+%% go through.
+-spec instrumented([module()]) -> ok.
+instrumented(Mods) ->
+    lists:foreach(fun(M) -> persistent_term:put({?MODULE, instrumented, M}, true) end, Mods).
 
 %% Computed in the *parent*, because `$ancestors` is the parent's list with the
 %% parent on the front and the child cannot see it.
@@ -922,7 +931,9 @@ gated_start(Name, Mod, Args, Kind, Entry) ->
         case Kind of
             monitor -> erlang:spawn_monitor(?MODULE, Entry, MFA);
             link -> {erlang:spawn_link(?MODULE, Entry, MFA), undefined};
-            plain -> {erlang:spawn(?MODULE, Entry, MFA), undefined}
+            %% Monitored for the length of the start. Nothing else would tell the
+            %% parent about a child killed before it acknowledged.
+            plain -> erlang:spawn_monitor(?MODULE, Entry, MFA)
         end,
     await_start(Pid, Ref, Kind).
 
@@ -955,13 +966,20 @@ await_start(Pid, Ref, Kind) ->
     receive
         {'$eta_started', Pid, {ok, Pid}} ->
             case Kind of
-                monitor -> {ok, {Pid, Ref}};
-                _ -> {ok, Pid}
+                monitor ->
+                    {ok, {Pid, Ref}};
+                _ ->
+                    _ = drop_monitor(Ref),
+                    {ok, Pid}
             end;
         {'$eta_started', Pid, Other} ->
             _ = drop_monitor(Ref),
             Other;
         {'DOWN', Ref, process, Pid, Reason} ->
+            {error, Reason};
+        %% A parent that traps exits, which every supervisor does, learns of a
+        %% child killed mid-start this way, as it does from `proc_lib`.
+        {'EXIT', Pid, Reason} when Kind =:= link ->
             {error, Reason}
     end.
 
@@ -1005,6 +1023,13 @@ register_name(Other) ->
 gated_init(Parent, Name, Mod, Args) ->
     case Mod:init(Args) of
         {ok, State} ->
+            Parent ! {'$eta_started', self(), {ok, self()}},
+            enter_loop(Mod, Name, State);
+        %% OTP 28's `supervisor` asks to hibernate after an idle second, on every
+        %% start. That changes how it waits and nothing about what it does, so
+        %% dropping the request here costs memory and no behaviour. It is the one
+        %% time-out action let through: any other could fire and change the run.
+        {ok, State, {timeout, _Idle, {hibernate, _Tag}}} when Mod =:= supervisor ->
             Parent ! {'$eta_started', self(), {ok, self()}},
             enter_loop(Mod, Name, State);
         {ok, State, {continue, C}} ->

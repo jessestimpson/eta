@@ -697,7 +697,74 @@ sitting on the real clock. Every entry point is rewritten to raise while a
 scheduler is active — `{eta_sched, {unsupported, {Task, :async, 1}, ...}}` —
 and to call the original otherwise, so ordinary builds and tests are
 unaffected. Under simulation, use a plain `spawn/1` (which is gated) or a
-`GenServer` for the same job.
+`GenServer` for the same job, or instrument them; see the next section.
+
+### Instrument what you cannot opt in
+
+`use Eta` reaches only code you can edit. A system also runs on dependencies,
+`Registry`, `Supervisor`, `Task`, `:pg` and OTP's `:supervisor`, and a process
+those spawn is adopted but never released: its mailbox is empty, so nothing ever
+makes it runnable, and the run ends looking quiet and clean. `Eta.Beam.instrument/1`
+rewrites them in memory, once per VM, before the first run:
+
+```elixir
+Eta.Beam.instrument([:supervisor, Supervisor, Supervisor.Default, DynamicSupervisor,
+                     Registry, Registry.Partition, Registry.Supervisor,
+                     Task, Task.Supervisor, Task.Supervised, Enum])
+```
+
+Nothing on disk changes, and the rewrites are inert outside a run. `Enum` is on
+that list for `Enum.shuffle/1` and `Enum.random/1`, which draw from `:rand` inside
+the stdlib.
+
+### Operation bodies need the transform too
+
+A harness is driver code and carries no `use Eta`, but a function passed to
+`eta_run:spawn_op/1` runs as part of the system. Written in the harness, its
+`Process.sleep/1` is on the real clock, so it does not wake during a virtual run,
+and its `GenServer.call/2` is not routed. Put operation bodies in a module that
+opts in.
+
+### Operations cannot carry pids
+
+A trace records operations, and a replay executes them again. A pid in an operation
+is a pid from the original run, so the replay acts on a dead process and diverges,
+on every seed. Name things by an id the harness keeps, and resolve it in `execute/2`.
+
+The same goes for what a test compares after a replay. A value derived from
+`:erlang.unique_integer/0` differs between a run and its replay, so compare a
+violation's `property` rather than its whole detail.
+
+### Spread the workload, and prove it
+
+`eta_run` injects an operation whenever nothing is runnable, so at the default
+`quiet_p` a whole workload can land in the first virtual second. A partition then
+heals before anyone could notice, and the run passes. Raise `quiet_p` until time
+passes between operations, and count the events a scenario exists to cause. Assert
+that each happened: a failure detector that never fired is a scenario that tested
+nothing, and no invariant will tell you so.
+
+### Check a seed in a fresh VM
+
+A strict replay in the same VM proves less than it looks like it does. Reference and
+pid values differ between VMs, and a run can depend on them without escaping the
+schedule, so `audit/1` passes and so does the replay. Run the seed twice, in 2 fresh
+VMs, and compare the traces. Run it alone, too: teardown happens in real time, so a
+run can also inherit the pid and reference values left behind by the run before it.
+
+If a system compares references, or keeps them in keys it iterates, start the VM with
+one scheduler, `ELIXIR_ERL_OPTIONS="+S 1:1"`. Each scheduler thread makes references
+in its own sequence, so with several of them a seed can fork 2 ways at random. Setting
+`schedulers_online` from inside a running VM did not fix this when we tried it.
+
+### Killing a tree is not one event
+
+`Process.exit(supervisor, :kill)` spreads through links in real time, outside any
+step, so which processes are alive at the next decision depends on the wall clock.
+It reproduces for most seeds and diverges on a few. Kill the whole tree from
+`execute/2`, while everything is suspended, and wait for each `DOWN`. With a network,
+`eta_net:kill_node/2` does this; without one, walk the links and do the same, calling
+`eta_time:forget/1` on each pid.
 
 ### The stdlib boundary is the transform boundary
 

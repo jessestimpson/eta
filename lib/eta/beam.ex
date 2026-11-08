@@ -33,9 +33,8 @@ defmodule Eta.Beam do
     `Task` and `Agent` are the named gap**: their spawns and waits happen
     inside Elixir's stdlib where nothing can gate them, so their entry points
     raise while a scheduler is active (`eta_sched:unsupported/2`) rather than
-    quietly running outside the schedule. This module is the delivery
-    mechanism; that table grows separately, and it is the same work under any
-    mechanism.
+    quietly running outside the schedule, until `instrument/1` has rewritten
+    the module itself.
   - The rewritten beam is compiled fresh from forms, so the Elixir-specific
     chunks (`Docs`, `ExCk`) are dropped. Harmless in a `:dst` profile, whose
     beams exist to be simulated, not documented.
@@ -79,6 +78,62 @@ defmodule Eta.Beam do
       File.write!(path, bin)
       reload(mod, file, bin)
       :transformed
+    end
+  end
+
+  @doc """
+  Rewrites modules the project does not own, in memory, for this VM only.
+
+  `use Eta` reaches only code you can edit. Everything else a system runs on —
+  a dependency's GenServers, `Registry`, `Task`, OTP's `:supervisor` and `:pg` —
+  spawns and waits where no transform of your code goes, and a process spawned
+  that way is adopted but never released: it has no mailbox traffic to make it
+  runnable. This puts those modules under the same rewrite, from the outside.
+
+  Each module's code is read from the code path, transformed and loaded with
+  `:code.load_binary/3`. Nothing on disk changes, so a dependency's source and
+  its compiled beams stay exactly as they were. The rewrites are inert outside
+  a run, so the rest of the VM, which shares these modules, is unaffected.
+
+  Call it once, before the first run. Returns `{module, outcome}` per module.
+  """
+  @spec instrument([module()]) :: [{module(), :instrumented | :already_transformed | term()}]
+  def instrument(modules) when is_list(modules) do
+    results = Enum.map(modules, &{&1, instrument_one(&1)})
+    :eta_sched.instrumented(for {m, :instrumented} <- results, do: m)
+    results
+  end
+
+  defp instrument_one(mod) do
+    with false <- loaded_stamped?(mod),
+         {^mod, bin, file} <- object_code(mod),
+         {:ok, attrs} <- attributes(bin),
+         false <- Keyword.has_key?(attrs, @stamp),
+         {:ok, ^mod, forms} <- abstract_code(bin),
+         {:ok, rewritten} <- run_transform(mod, forms),
+         {:ok, ^mod, out} <- compile(stamp(rewritten)) do
+      # `kernel` and `stdlib` live in sticky directories, which refuse a load.
+      :code.unstick_mod(mod)
+      :code.purge(mod)
+      {:module, ^mod} = :code.load_binary(mod, file, out)
+      :instrumented
+    else
+      true -> :already_transformed
+      other -> other
+    end
+  end
+
+  # Both copies count. This rewrite never reaches the disk, so a module instrumented
+  # here is stamped only once loaded, and one `mix compile.eta` rewrote is stamped
+  # on disk, loaded or not.
+  defp loaded_stamped?(mod) do
+    :erlang.module_loaded(mod) and Keyword.has_key?(mod.module_info(:attributes), @stamp)
+  end
+
+  defp object_code(mod) do
+    case :code.get_object_code(mod) do
+      {^mod, _bin, _file} = found -> found
+      :error -> {:error, {:no_object_code, mod}}
     end
   end
 

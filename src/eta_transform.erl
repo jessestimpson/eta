@@ -314,6 +314,13 @@ while a scheduler is active and calls the original otherwise.
     {rand, normal, 2} => eta_rand,
     {rand, seed, 1} => eta_rand,
     {rand, seed, 2} => eta_rand,
+    %% A hash-based table iterates in an order that depends on the bits of its keys,
+    %% and a reference or a pid has different bits in every VM. See `eta_ets`.
+    {ets, tab2list, 1} => eta_ets,
+    {ets, select, 2} => eta_ets,
+    {ets, match, 2} => eta_ets,
+    {ets, match_object, 2} => eta_ets,
+    {ets, foldl, 3} => eta_ets,
     %% Spawning. A child spawned plainly runs on the real scheduler until
     %% `set_on_spawn` adoption catches it; `eta_sched:spawn/1` starts it blocked
     %% instead, so there is no window. See `eta_sched:spawn/1`.
@@ -451,8 +458,9 @@ while a scheduler is active and calls the original otherwise.
     {'Elixir.Date', utc_today, 1} => {'Elixir.Eta.Calendar', date_utc_today}
 }).
 
-%% Elixir client functions eta cannot gate yet, rewritten to raise **while a
-%% scheduler is active** and delegate otherwise — `eta_sched:unsupported/2`.
+%% Elixir client functions eta cannot gate unless their own module has been
+%% rewritten by `Eta.Beam.instrument/1`. They raise **while a scheduler is active**
+%% and delegate otherwise — `eta_sched:unsupported/2`.
 %%
 %% `Task` spawns inside the Elixir stdlib (so the child would run outside the
 %% schedule) and `Task.await/2` is a `receive ... after` in a module no

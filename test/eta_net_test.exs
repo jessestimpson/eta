@@ -1023,6 +1023,24 @@ defmodule EtaNetTest do
   # Cuts and partitions
   # ---------------------------------------------------------------------------
 
+  describe "node names" do
+    test "a binary name partitions like an atom" do
+      :ok = @net.start(%{seed: 1})
+      a = sink()
+      b = sink()
+      :ok = @net.place("a", [a])
+      :ok = @net.place("b", [b])
+
+      :ok = @net.partition("a", "b")
+      assert @net.faultable(a)
+      assert :ets.member(:eta_net_chan, {:node_cut, "a", "b"})
+      assert :ets.member(:eta_net_chan, {:node_cut, "b", "a"})
+
+      :ok = @net.heal_partition("a", "b")
+      refute :ets.member(:eta_net_chan, {:node_cut, "a", "b"})
+    end
+  end
+
   describe "cuts" do
     test "cut/2 is one-directional and heal/2 restores it" do
       :ok = @net.start(%{seed: 1})

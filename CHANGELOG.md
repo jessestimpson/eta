@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Enhancements
+
+- Added `Eta.Beam.instrument/1`, which rewrites modules a project does not own in
+  memory, for dependencies and for the OTP and Elixir stdlib modules a system runs
+  on. `Task` and `Agent` no longer raise once their modules have been instrumented.
+- Added `eta_ets`, which the parse_transform uses so that iterating a hash-based ETS
+  table is stable under a run. Keys holding references or pids otherwise iterate in
+  a different order in every VM, which `audit/1` cannot see.
+
+### Bug fixes
+
+- A gated start now returns `{error, Reason}` when the child is killed before it
+  acknowledges. A parent trapping exits, which includes every supervisor, and any
+  parent of an unlinked start used to wait forever.
+- A gated `supervisor` starts on OTP 28, whose `init/1` asks to hibernate when idle.
+- `eta_net` recognises any placed term as a node name. `partition/2` and its
+  relatives took only atoms, so a binary name cut nothing and still returned `ok`.
+
 ## 0.1.1 (2026-09-04)
 
 ### Enhancements

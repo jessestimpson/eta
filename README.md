@@ -148,10 +148,12 @@ Early and under development.
 
 ### Known gaps, roughly by size
 
-- **Elixir's `Task` and `Agent` are not simulated.** Both spawn and wait
-  inside the Elixir standard library, where the scheduler cannot gate them,
+- **Elixir's `Task` and `Agent` are not simulated by default.** Both spawn and
+  wait inside the Elixir standard library, where the scheduler cannot gate them,
   so under a run their entry points raise by name rather than quietly running
-  outside the schedule. `GenServer`, `:gen_statem`, timers, clock reads
+  outside the schedule. `Eta.Beam.instrument/1` lifts that for a module by
+  rewriting it in memory, along with whatever else the system runs on that it
+  does not own. `GenServer`, `:gen_statem`, timers, clock reads
   (`DateTime.utc_now/0` included), `receive ... after`, spawns and monitors
   are all covered; see the Elixir section of `eta_transform`'s docs for the
   boundary.
