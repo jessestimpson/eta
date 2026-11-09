@@ -39,29 +39,40 @@ This all happens at test time; the code that gets deployed to prod is untouched.
 
 ## Getting Started
 
-A system under test provides some **strictly deterministic** callbacks (see `eta_harness`), and a run is one
-call, with a seed. In this example the seed is `7`:
+<!-- tabs-open -->
+
+### Erlang
+
+An Erlang module opts in to DST by including the header file. This configures the `parse_transform`
+to operate on that module. We encourage using a wrapper to keep build dependencies clean.
 
 ```erlang
-#{outcome := Outcome, trace := Trace} =
-    eta_run:run(my_harness, #{seed => 7, max_ops => 25, max_steps => 20000, preload => [my_app]}).
+-module(my_server).
+-behaviour(gen_server).
+
+%% your wrapper: includes eta.hrl in the DST build, nothing anywhere else
+-include("myapp_eta.hrl").
+-eta_observe(all).
+
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+init(_) ->
+    _ = erlang:send_after(50, self(), tick),   % rewritten to the virtual clock
+    {ok, #{count => 0}}.
+
+handle_call(_Req, _From, State) -> {reply, ok, State}.
+handle_cast(_Msg, State) -> {noreply, State}.
+
+handle_info(tick, State = #{count := N}) ->
+    _ = erlang:send_after(50, self(), tick),
+    {noreply, State#{count := N + 1}}.
 ```
 
-When a run fails, shrink it:
+### Elixir
 
-```erlang
-#{trace := Minimal, verified := true} =
-    eta_shrink:shrink(my_harness, Trace, #{seed => 7, max_ops => 25, preload => [my_app]}).
-```
-
-The seed produces the same trace each time, and the shrink reduces the size of that trace.
-
-Elixir is supported, and the code stays idiomatic — no renamed call sites, no
-facade. Elixir compiles to the same abstract format the parse transform
-rewrites, so a Mix compiler (`mix compile.eta`) applies the very same
-transform to each opted-in module after compilation. A module opts in with
-`use Eta`, via a wrapper of your own that keeps `eta` out of every other
-build:
+Elixir is supported via an addition mix compiler step. The eta compiler operates on
+the BEAM files on disk and applies the same transformations as the `parse_transform`.
+A module opts in to DST with `use Eta`, via a wrapper module.
 
 ```elixir
 defmodule MyServer do
@@ -81,13 +92,34 @@ defmodule MyServer do
 end
 ```
 
-See [Setting up a project](docs/02-setting-up.md) for the Elixir build
-configuration.
+<!-- tabs-close -->
+
+See [Setting up a project](docs/02-setting-up.md) for the Erlang and Elixir build
+configurations.
+
+A system under test provides some **strictly deterministic** callbacks (see `eta_harness`), and a run is one
+call, with a seed. In this example the seed is `7`:
+
+```erlang
+#{outcome := Outcome, trace := Trace} =
+    eta_run:run(my_harness, #{seed => 7, max_ops => 25, max_steps => 20000, preload => [my_app]}).
+```
+
+When a run fails, shrink it:
+
+```erlang
+#{trace := Minimal, verified := true} =
+    eta_shrink:shrink(my_harness, Trace, #{seed => 7, max_ops => 25, preload => [my_app]}).
+```
+
+The seed produces the same trace each time, and the shrink reduces the size of that trace.
+
+## Examples
 
 `eta` includes some simple distributed systems in order to illustrate DST:
 
 1. A [two-phase commit implementation](test/support/eta_2pc.erl), which is used in `eta`'s own tests.
-2. An [ABD Qurom Register](docs/06-a-journey-through-dst.md), that is written as an end-to-end walkthrough.
+2. An [ABD Qurom Register in Erlang](docs/06-a-journey-through-dst.md) and [in Elixir](docs/07-a-journey-through-dst-elixir.md), that is written as an end-to-end walkthrough.
 3. A [leader election by heartbeat lease](test/support/eta_elect.erl), for which correctness relies heavily on the clock, unlike the first two examples.
 
 ## Documentation

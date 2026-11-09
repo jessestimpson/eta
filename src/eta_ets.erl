@@ -28,6 +28,8 @@ Inert unless a scheduler is active: every function delegates to `ets` otherwise.
 
 `first/1`, `next/2` and the continuation forms of `select` are left alone. They
 walk a table one step at a time, and sorting cannot be done from inside that walk.
+
+*This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
 

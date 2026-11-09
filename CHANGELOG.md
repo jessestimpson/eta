@@ -1,12 +1,15 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 (TBD)
 
 ### Enhancements
 
+- Elixir support via a mix compiler step. It uses the same mechanism as the parse_transform,
+  but operates on BEAM files on disk.
 - Added `Eta.Beam.instrument/1`, which rewrites modules a project does not own in
   memory, for dependencies and for the OTP and Elixir stdlib modules a system runs
   on. `Task` and `Agent` no longer raise once their modules have been instrumented.
+  This feature is not supported for Erlang.
 - Added `eta_ets`, which the parse_transform uses so that iterating a hash-based ETS
   table is stable under a run. Keys holding references or pids otherwise iterate in
   a different order in every VM, which `audit/1` cannot see.

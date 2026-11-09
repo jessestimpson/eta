@@ -157,7 +157,7 @@ The network pass rewrites, unless the module declares `-eta_net(false)`:
 | `erlang:node/0,1`, `nodes/0,1`, `is_alive/0`, `disconnect_node/1` | `eta_net`, same names |
 | `erlang:send_nosuspend/2,3` | `eta_net:send_nosuspend/2,3` |
 | `net_kernel:monitor_nodes/1,2`, `connect_node/1` | `eta_net`, same names |
-| `net_kernel:disconnect/1` | `eta_net:disconnect_node/1` |
+| `net_kernel:disconnect(Node)` | `eta_net:disconnect_node/1` |
 | `net_adm:ping/1` | `eta_net:ping/1` |
 | Elixir's `Node.self/0`, `list/0,1`, `connect/1`, `disconnect/1`, `ping/1`, `alive?/0` | `eta_net`'s equivalents |
 

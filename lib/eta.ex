@@ -56,6 +56,8 @@ defmodule Eta do
   `include/eta.hrl` does without `DST`, stranded-variable gotcha included: a
   variable used only inside a `log` becomes unused when the call compiles
   away, so bind it to `_` if it exists for the log alone.
+
+  *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
   """
 
   @options [:net, :after, :observe]
