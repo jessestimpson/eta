@@ -1306,10 +1306,10 @@ answers from its topology, keeps connections the way distribution does — expli
 lost on a partition or a kill, re-made by `connect_node/1` or a plain send — and
 delivers `nodeup`/`nodedown` to `monitor_nodes/1` subscribers itself.
 
-The one-VM part is still the system's to handle, and it is smaller: give each
-node's instance its own local names, and alias them with `register_name/3`'s
-`{local, Name}` form so `{Name, Node}` addressing still works. Group's seam came
-down to one compile-time option, the name its streams carry on the wire.
+The one-VM part went the same way. Each simulated node now has its own registered
+names, named ETS tables and `persistent_term` keys (`eta_ns`), and `rpc` runs on
+the node it names (`eta_rpc`), so a system runs under the same names on every
+node. With that, Group needed no seam beyond two guards, and ra none at all.
 
 ## Effort
 

@@ -182,7 +182,11 @@ releasing, not after.
 %% delegate otherwise. See `unsupported/2`.
 -export([unsupported/2, instrumented/1]).
 
-%% The distributed forms, which raise while a run is active. See `no_dist/3`.
+%% `erlang:is_process_alive/1` for a system under simulation. See `is_alive/1`.
+-export([is_alive/1]).
+
+%% The distributed forms. Between simulated nodes they spawn on the named node;
+%% anywhere else they raise while a run is active. See `dist/5`.
 -export([
     spawn/2, spawn/4,
     spawn_link/2, spawn_link/4,
@@ -199,6 +203,10 @@ releasing, not after.
     plib_spawn/1, plib_spawn/3,
     plib_spawn_link/1, plib_spawn_link/3,
     plib_spawn_opt/2, plib_spawn_opt/4,
+    plib_start/3, plib_start/4, plib_start/5,
+    plib_start_link/3, plib_start_link/4, plib_start_link/5,
+    plib_start_monitor/3, plib_start_monitor/4, plib_start_monitor/5,
+    gen_start/5, gen_start/6,
     gated_plib/2, gated_plib/4
 ]).
 
@@ -607,55 +615,310 @@ plib_spawn_opt(M, F, A, Opts) ->
         true -> erlang:spawn_opt(?MODULE, gated_plib, [M, F, A, plib_ctx(M, F, A)], Opts)
     end.
 
+%% `proc_lib:start/3,4,5`, `start_link/3,4,5` and `start_monitor/3,4,5`.
+%%
+%% `proc_lib` spawns the child itself, inside OTP, so it is adopted with nothing
+%% in its mailbox and nothing ever makes it runnable: the parent waits for an ack
+%% from a child that never runs a line. Spawned here instead, gated like any
+%% other start (see `plib_spawn_opt/4`), and waited for the way `proc_lib`'s own
+%% `sync_start/2` waits, with a timeout on the virtual clock.
+-spec plib_start(module(), atom(), [term()]) -> term().
+plib_start(M, F, A) -> plib_start(M, F, A, infinity).
+
+-spec plib_start(module(), atom(), [term()], timeout()) -> term().
+plib_start(M, F, A, T) -> plib_start(M, F, A, T, []).
+
+-spec plib_start(module(), atom(), [term()], timeout(), list()) -> term().
+plib_start(M, F, A, T, Opts) ->
+    case gate_start() of
+        false -> proc_lib:start(M, F, A, T, Opts);
+        true -> plib_sync(plib_gated(M, plain, [monitor | Opts], F, A), T)
+    end.
+
+-spec plib_start_link(module(), atom(), [term()]) -> term().
+plib_start_link(M, F, A) -> plib_start_link(M, F, A, infinity).
+
+-spec plib_start_link(module(), atom(), [term()], timeout()) -> term().
+plib_start_link(M, F, A, T) -> plib_start_link(M, F, A, T, []).
+
+-spec plib_start_link(module(), atom(), [term()], timeout(), list()) -> term().
+plib_start_link(M, F, A, T, Opts) ->
+    case gate_start() of
+        false -> proc_lib:start_link(M, F, A, T, Opts);
+        true -> plib_sync(plib_gated(M, link, [link, monitor | Opts], F, A), T)
+    end.
+
+-spec plib_start_monitor(module(), atom(), [term()]) -> term().
+plib_start_monitor(M, F, A) -> plib_start_monitor(M, F, A, infinity).
+
+-spec plib_start_monitor(module(), atom(), [term()], timeout()) -> term().
+plib_start_monitor(M, F, A, T) -> plib_start_monitor(M, F, A, T, []).
+
+-spec plib_start_monitor(module(), atom(), [term()], timeout(), list()) -> term().
+plib_start_monitor(M, F, A, T, Opts) ->
+    case gate_start() of
+        false ->
+            proc_lib:start_monitor(M, F, A, T, Opts);
+        true ->
+            {_Pid, Ref} = Started = plib_gated(M, monitor, [monitor | Opts], F, A),
+            {plib_sync(Started, T, keep), Ref}
+    end.
+
+%% `gen:start/5,6`, the start every behaviour built on `gen` goes through:
+%% `gen_server` and `gen_statem` inside OTP, and libraries' own behaviours such as
+%% `gen_batch_server`. `gen` spawns with `proc_lib` inside OTP, so the child
+%% would never run (see `plib_start/5`), and registers a local name in the VM's
+%% namespace rather than the node's. Here the child is gated, and runs `gen`'s own
+%% `init_it` with the name already in the caller's namespace (see `eta_ns`).
+%%
+%% `{global, _}` and `{via, _, _}` register through a process outside the
+%% schedule, and are refused, as `register_name/1` refuses them.
+-spec gen_start(module(), atom(), term(), module(), term(), list()) -> term().
+gen_start(GenMod, LinkP, Name, Mod, Args, Opts) ->
+    case gate_start() of
+        false ->
+            gen:start(GenMod, LinkP, Name, Mod, Args, Opts);
+        true ->
+            case server_name(Name) of
+                {local, N} = Real ->
+                    case erlang:whereis(N) of
+                        undefined -> gen_spawn(GenMod, LinkP, [Real, Mod, Args, Opts], Opts);
+                        Pid -> {error, {already_started, Pid}}
+                    end;
+                Other ->
+                    {error, {?MODULE, unsupported_server_name, Other}}
+            end
+    end.
+
+-spec gen_start(module(), atom(), module(), term(), list()) -> term().
+gen_start(GenMod, LinkP, Mod, Args, Opts) ->
+    case gate_start() of
+        false -> gen:start(GenMod, LinkP, Mod, Args, Opts);
+        true -> gen_spawn(GenMod, LinkP, [Mod, Args, Opts], Opts)
+    end.
+
+%% `gen:do_spawn/5,6`, through the gated `proc_lib` starts.
+gen_spawn(GenMod, link, Rest, Opts) ->
+    plib_start_link(gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts));
+gen_spawn(GenMod, monitor, Rest, Opts) ->
+    case plib_start_monitor(gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)) of
+        {{ok, Pid}, Mon} when is_pid(Pid) ->
+            {ok, {Pid, Mon}};
+        {Error, Mon} ->
+            receive
+                {'DOWN', Mon, process, _, _} -> ok
+            end,
+            Error
+    end;
+gen_spawn(GenMod, _Nolink, Rest, Opts) ->
+    plib_start(gen, init_it, [GenMod, self(), self | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)).
+
+gen_timeout(Opts) -> proplists:get_value(timeout, Opts, infinity).
+gen_spawn_opts(Opts) -> proplists:get_value(spawn_opt, Opts, []).
+
+plib_gated(M, Kind, Opts, F, A) ->
+    ok = assert_stepping(M, Kind),
+    plib_spawn_opt(M, F, A, Opts).
+
+plib_sync(Started, T) -> plib_sync(Started, T, drop).
+
+%% `proc_lib:sync_start/2`. A start monitor keeps its monitor; the others drop it.
+plib_sync({Pid, Ref}, Timeout, Monitor) ->
+    Tag = make_ref(),
+    TRef =
+        case eta_time:running() of
+            true -> eta_time:arm_after(Timeout, Tag);
+            false -> undefined
+        end,
+    Real =
+        case TRef of
+            undefined -> Timeout;
+            _ -> infinity
+        end,
+    Result =
+        receive
+            {ack, Pid, Return} ->
+                _ = Monitor =:= drop andalso erlang:demonitor(Ref, [flush]),
+                Return;
+            {nack, Pid, Return} ->
+                flush_exit(Pid),
+                await_down(Pid, Ref),
+                Return;
+            {'DOWN', Ref, process, Pid, Reason} ->
+                flush_exit(Pid),
+                {error, Reason};
+            {'$eta_after', G} when G =:= Tag ->
+                plib_timeout(Pid, Ref)
+        after Real ->
+            plib_timeout(Pid, Ref)
+        end,
+    ok = eta_time:disarm_after(TRef, Tag),
+    Result.
+
+plib_timeout(Pid, Ref) ->
+    true = exit(Pid, kill),
+    flush_exit(Pid),
+    await_down(Pid, Ref),
+    {error, timeout}.
+
+flush_exit(Pid) ->
+    receive
+        {'EXIT', Pid, _} -> ok
+    after 0 -> ok
+    end.
+
+await_down(Pid, Ref) ->
+    receive
+        {'DOWN', Ref, process, Pid, _} -> ok
+    end.
+
 %% ---------------------------------------------------------------------------
 %% The distributed forms
 %% ---------------------------------------------------------------------------
 
-%% `spawn(Node, Fun)` and its relatives ask for a process on another node, and
-%% `eta` does not simulate distribution. There is no honest rewrite: running the
-%% child here would silently put it on the wrong node, and letting it through
-%% would put it outside the schedule entirely. So while a run is active these
-%% raise, which turns a system that cannot be simulated into a loud failure at
-%% the call rather than a quiet loss of determinism 200 steps later.
+%% `spawn(Node, Fun)` and its relatives ask for a process on another node.
 %%
-%% With no run in progress they delegate, so a module built with the transform
-%% still works normally outside a simulation.
-spawn(N, F) -> no_dist(active(), {erlang, spawn, 2}, fun() -> erlang:spawn(N, F) end).
-spawn(N, M, F, A) -> no_dist(active(), {erlang, spawn, 4}, fun() -> erlang:spawn(N, M, F, A) end).
+%% **Between simulated nodes they are simulated**, the way `eta_rpc` simulates an
+%% `rpc`: the child is an ordinary gated spawn here, placed on `Node`, so its
+%% `node()` is `Node`, its names are `Node`'s, and it dies with `Node`. As in
+%% distribution the spawn connects the two nodes first. If it cannot — a node
+%% that was killed, or one across a cut — the child still comes back as a pid,
+%% and exits `noconnection` as soon as it runs, which is how a spawn to an
+%% unreachable node looks to a caller that links to or monitors it.
+%%
+%% A spawn to the caller's own node is a local spawn.
+%%
+%% Anywhere else — a caller on no simulated node, or a `Node` the network has
+%% never heard of — there is still no honest rewrite: running the child here
+%% would silently put it on the wrong node, and letting it through would put it
+%% outside the schedule. So while a run is active those raise, which turns a
+%% system that cannot be simulated into a loud failure at the call rather than a
+%% quiet loss of determinism 200 steps later. With no run in progress they
+%% delegate, so a module built with the transform still works normally outside a
+%% simulation.
+%%
+%% `spawn_opt`'s `monitor` and `link` options are the VM's own, as they are for
+%% the local forms, so a cut does not fire them. Monitor with `erlang:monitor/2`,
+%% which the transform points at `eta_net`, when a partition has to be seen.
+spawn(N, F) ->
+    dist(N, {erlang, spawn, 2}, {fn, F}, fun spawn_body/1, fun() -> erlang:spawn(N, F) end).
+
+spawn(N, M, F, A) ->
+    dist(N, {erlang, spawn, 4}, {mfa, M, F, A}, fun spawn_body/1, fun() ->
+        erlang:spawn(N, M, F, A)
+    end).
+
 spawn_link(N, F) ->
-    no_dist(active(), {erlang, spawn_link, 2}, fun() -> erlang:spawn_link(N, F) end).
+    dist(N, {erlang, spawn_link, 2}, {fn, F}, fun spawn_link_body/1, fun() ->
+        erlang:spawn_link(N, F)
+    end).
 
 spawn_link(N, M, F, A) ->
-    no_dist(active(), {erlang, spawn_link, 4}, fun() -> erlang:spawn_link(N, M, F, A) end).
+    dist(N, {erlang, spawn_link, 4}, {mfa, M, F, A}, fun spawn_link_body/1, fun() ->
+        erlang:spawn_link(N, M, F, A)
+    end).
 
 spawn_monitor(N, F) ->
-    no_dist(active(), {erlang, spawn_monitor, 2}, fun() -> erlang:spawn_monitor(N, F) end).
+    dist(N, {erlang, spawn_monitor, 2}, {fn, F}, fun spawn_monitor_body/1, fun() ->
+        erlang:spawn_monitor(N, F)
+    end).
 
 spawn_monitor(N, M, F, A) ->
-    no_dist(active(), {erlang, spawn_monitor, 4}, fun() -> erlang:spawn_monitor(N, M, F, A) end).
+    dist(N, {erlang, spawn_monitor, 4}, {mfa, M, F, A}, fun spawn_monitor_body/1, fun() ->
+        erlang:spawn_monitor(N, M, F, A)
+    end).
 
 spawn_opt(N, F, O) ->
-    no_dist(active(), {erlang, spawn_opt, 3}, fun() -> erlang:spawn_opt(N, F, O) end).
+    dist(N, {erlang, spawn_opt, 3}, {fn, F}, fun(B) -> spawn_opt_body(B, O) end, fun() ->
+        erlang:spawn_opt(N, F, O)
+    end).
 
 spawn_opt(N, M, F, A, O) ->
-    no_dist(active(), {erlang, spawn_opt, 5}, fun() -> erlang:spawn_opt(N, M, F, A, O) end).
+    dist(N, {erlang, spawn_opt, 5}, {mfa, M, F, A}, fun(B) -> spawn_opt_body(B, O) end, fun() ->
+        erlang:spawn_opt(N, M, F, A, O)
+    end).
 
-plib_spawn(N, F) -> no_dist(active(), {proc_lib, spawn, 2}, fun() -> proc_lib:spawn(N, F) end).
+plib_spawn(N, F) ->
+    dist(N, {proc_lib, spawn, 2}, {fn, F}, fun plib_spawn_body/1, fun() -> proc_lib:spawn(N, F) end).
 
 plib_spawn(N, M, F, A) ->
-    no_dist(active(), {proc_lib, spawn, 4}, fun() -> proc_lib:spawn(N, M, F, A) end).
+    dist(N, {proc_lib, spawn, 4}, {mfa, M, F, A}, fun plib_spawn_body/1, fun() ->
+        proc_lib:spawn(N, M, F, A)
+    end).
 
 plib_spawn_link(N, F) ->
-    no_dist(active(), {proc_lib, spawn_link, 2}, fun() -> proc_lib:spawn_link(N, F) end).
+    dist(N, {proc_lib, spawn_link, 2}, {fn, F}, fun plib_spawn_link_body/1, fun() ->
+        proc_lib:spawn_link(N, F)
+    end).
 
 plib_spawn_link(N, M, F, A) ->
-    no_dist(active(), {proc_lib, spawn_link, 4}, fun() -> proc_lib:spawn_link(N, M, F, A) end).
+    dist(N, {proc_lib, spawn_link, 4}, {mfa, M, F, A}, fun plib_spawn_link_body/1, fun() ->
+        proc_lib:spawn_link(N, M, F, A)
+    end).
 
 plib_spawn_opt(N, F, O) ->
-    no_dist(active(), {proc_lib, spawn_opt, 3}, fun() -> proc_lib:spawn_opt(N, F, O) end).
+    dist(N, {proc_lib, spawn_opt, 3}, {fn, F}, fun(B) -> plib_spawn_opt_body(B, O) end, fun() ->
+        proc_lib:spawn_opt(N, F, O)
+    end).
 
 plib_spawn_opt(N, M, F, A, O) ->
-    no_dist(active(), {proc_lib, spawn_opt, 5}, fun() -> proc_lib:spawn_opt(N, M, F, A, O) end).
+    dist(N, {proc_lib, spawn_opt, 5}, {mfa, M, F, A}, fun(B) -> plib_spawn_opt_body(B, O) end, fun() ->
+        proc_lib:spawn_opt(N, M, F, A, O)
+    end).
+
+%% The local gated form each distributed form becomes, applied to a body.
+spawn_body({fn, F}) -> ?MODULE:spawn(F);
+spawn_body({mfa, M, F, A}) -> ?MODULE:spawn(M, F, A).
+spawn_link_body({fn, F}) -> ?MODULE:spawn_link(F);
+spawn_link_body({mfa, M, F, A}) -> ?MODULE:spawn_link(M, F, A).
+spawn_monitor_body({fn, F}) -> ?MODULE:spawn_monitor(F);
+spawn_monitor_body({mfa, M, F, A}) -> ?MODULE:spawn_monitor(M, F, A).
+spawn_opt_body({fn, F}, O) -> ?MODULE:spawn_opt(F, O);
+spawn_opt_body({mfa, M, F, A}, O) -> ?MODULE:spawn_opt(M, F, A, O).
+plib_spawn_body({fn, F}) -> ?MODULE:plib_spawn(F);
+plib_spawn_body({mfa, M, F, A}) -> ?MODULE:plib_spawn(M, F, A).
+plib_spawn_link_body({fn, F}) -> ?MODULE:plib_spawn_link(F);
+plib_spawn_link_body({mfa, M, F, A}) -> ?MODULE:plib_spawn_link(M, F, A).
+plib_spawn_opt_body({fn, F}, O) -> ?MODULE:plib_spawn_opt(F, O);
+plib_spawn_opt_body({mfa, M, F, A}, O) -> ?MODULE:plib_spawn_opt(M, F, A, O).
+
+-type body() :: {fn, fun()} | {mfa, module(), atom(), [term()]}.
+-spec dist(
+    term(),
+    {module(), atom(), arity()},
+    body(),
+    fun((body()) -> pid() | {pid(), reference()}),
+    fun(() -> pid() | {pid(), reference()})
+) -> pid() | {pid(), reference()}.
+dist(Node, MFA, Body, Spawn, Delegate) ->
+    case eta_net:local_node() of
+        undefined ->
+            no_dist(active(), MFA, Delegate);
+        Node ->
+            %% Where the parent is and as faultable, as the scheduler would place
+            %% it on adoption — said here as well because with no scheduler
+            %% running nothing adopts it.
+            Result = Spawn(Body),
+            ok = eta_net:inherit(self(), child(Result)),
+            Result;
+        _Here ->
+            case eta_net:is_node(Node) of
+                false ->
+                    no_dist(active(), MFA, Delegate);
+                true ->
+                    Run =
+                        case eta_net:connect_node(Node) of
+                            true -> Body;
+                            _ -> {mfa, erlang, exit, [noconnection]}
+                        end,
+                    Result = Spawn(Run),
+                    ok = eta_net:place(Node, [child(Result)]),
+                    Result
+            end
+    end.
+
+child({Pid, _Ref}) -> Pid;
+child(Pid) -> Pid.
 
 no_dist(false, _MFA, Delegate) ->
     Delegate();
@@ -663,7 +926,7 @@ no_dist(true, MFA, _Delegate) ->
     error(
         {eta_sched,
             {no_distribution, MFA,
-                <<"eta does not simulate distribution; run the nodes as processes in one VM">>}}
+                <<"eta simulates distribution only between simulated nodes; place the caller and the target with eta_net">>}}
     ).
 
 %% `M:F(A, B)` becomes `eta_sched:unsupported({M, F, 2}, [A, B])`, for the
@@ -808,21 +1071,21 @@ Inert with no scheduler running: delegates straight to `gen_server`.
 -spec start_monitor(module(), term(), list()) ->
     {ok, {pid(), reference()}} | ignore | {error, term()}.
 start_monitor(Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_server:start_monitor(Mod, Args, Options);
         true -> gated_start(undefined, Mod, Args, monitor)
     end.
 
 -spec start_link(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_server:start_link(Mod, Args, Options);
         true -> gated_start(undefined, Mod, Args, link)
     end.
 
 -spec start(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
 start(Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_server:start(Mod, Args, Options);
         true -> gated_start(undefined, Mod, Args, plain)
     end.
@@ -833,7 +1096,7 @@ start(Mod, Args, Options) ->
 -spec start_monitor(gen_server:server_name(), module(), term(), list()) ->
     {ok, {pid(), reference()}} | ignore | {error, term()}.
 start_monitor(Name, Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_server:start_monitor(Name, Mod, Args, Options);
         true -> gated_start(Name, Mod, Args, monitor)
     end.
@@ -841,7 +1104,7 @@ start_monitor(Name, Mod, Args, Options) ->
 -spec start_link(gen_server:server_name(), module(), term(), list()) ->
     {ok, pid()} | ignore | {error, term()}.
 start_link(Name, Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_server:start_link(Name, Mod, Args, Options);
         true -> gated_start(Name, Mod, Args, link)
     end.
@@ -849,7 +1112,7 @@ start_link(Name, Mod, Args, Options) ->
 -spec start(gen_server:server_name(), module(), term(), list()) ->
     {ok, pid()} | ignore | {error, term()}.
 start(Name, Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_server:start(Name, Mod, Args, Options);
         true -> gated_start(Name, Mod, Args, plain)
     end.
@@ -876,21 +1139,21 @@ Inert with no scheduler running: delegates straight to `gen_statem`.
 -spec statem_start_monitor(module(), term(), list()) ->
     {ok, {pid(), reference()}} | ignore | {error, term()}.
 statem_start_monitor(Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_statem:start_monitor(Mod, Args, Options);
         true -> gated_start(undefined, Mod, Args, monitor, statem_gated)
     end.
 
 -spec statem_start_link(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
 statem_start_link(Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_statem:start_link(Mod, Args, Options);
         true -> gated_start(undefined, Mod, Args, link, statem_gated)
     end.
 
 -spec statem_start(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
 statem_start(Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_statem:start(Mod, Args, Options);
         true -> gated_start(undefined, Mod, Args, plain, statem_gated)
     end.
@@ -898,7 +1161,7 @@ statem_start(Mod, Args, Options) ->
 -spec statem_start_monitor(gen_statem:server_name(), module(), term(), list()) ->
     {ok, {pid(), reference()}} | ignore | {error, term()}.
 statem_start_monitor(Name, Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_statem:start_monitor(Name, Mod, Args, Options);
         true -> gated_start(Name, Mod, Args, monitor, statem_gated)
     end.
@@ -906,7 +1169,7 @@ statem_start_monitor(Name, Mod, Args, Options) ->
 -spec statem_start_link(gen_statem:server_name(), module(), term(), list()) ->
     {ok, pid()} | ignore | {error, term()}.
 statem_start_link(Name, Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_statem:start_link(Name, Mod, Args, Options);
         true -> gated_start(Name, Mod, Args, link, statem_gated)
     end.
@@ -914,7 +1177,7 @@ statem_start_link(Name, Mod, Args, Options) ->
 -spec statem_start(gen_statem:server_name(), module(), term(), list()) ->
     {ok, pid()} | ignore | {error, term()}.
 statem_start(Name, Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_statem:start(Name, Mod, Args, Options);
         true -> gated_start(Name, Mod, Args, plain, statem_gated)
     end.
@@ -960,6 +1223,21 @@ assert_stepping(Mod, Kind) ->
             )
     end.
 
+%% Whether a start should be gated. Not when there is no scheduler, and not when
+%% the caller is a process the scheduler doesn't own: a VM service such as
+%% `kernel_safe_sup`, running a `supervisor` that `Eta.Beam.instrument/1`
+%% rewrote, starting a child of its own because something in the run asked it to.
+%% Such a caller can only be running while another process holds the step, since
+%% every process the scheduler owns is suspended unless it is the one stepping.
+%% Its child belongs to the VM, not the run, so it starts the way OTP starts it.
+gate_start() ->
+    active() andalso
+        case stepping() of
+            undefined -> true;
+            Self when Self =:= self() -> true;
+            _Other -> false
+        end.
+
 %% `infinity`, deliberately: see the note on start timeouts above. The child cannot
 %% run until the scheduler adopts it, and the scheduler is not waiting on us.
 await_start(Pid, Ref, Kind) ->
@@ -989,8 +1267,9 @@ drop_monitor(Ref) -> erlang:demonitor(Ref, [flush]).
 -if(?DOCATTRS).
 -doc false.
 -endif.
-gated(Parent, Ancestors, Name, Mod, Args) ->
+gated(Parent, Ancestors, Name0, Mod, Args) ->
     _ = wait_for_token(),
+    Name = server_name(Name0),
     %% What proc_lib:init_p/3 would have set. Without these the process is not an
     %% OTP process: no crash-report formatting, and `sys` cannot introspect it.
     put('$ancestors', Ancestors),
@@ -1002,6 +1281,12 @@ gated(Parent, Ancestors, Name, Mod, Args) ->
             Parent ! {'$eta_started', self(), Err},
             exit(normal)
     end.
+
+%% A local name on a simulated node goes into that node's namespace, so the same
+%% server can be started once per node. Resolved here, in the child, which already
+%% sits on its parent's node. See `eta_ns`.
+server_name({local, N}) -> {local, eta_ns:name(N)};
+server_name(Other) -> Other.
 
 %% `{local, N}` only. `{global, _}` and `{via, _, _}` both register through a
 %% service process the scheduler does not own, so a start would block on
@@ -1032,6 +1317,17 @@ gated_init(Parent, Name, Mod, Args) ->
         {ok, State, {timeout, _Idle, {hibernate, _Tag}}} when Mod =:= supervisor ->
             Parent ! {'$eta_started', self(), {ok, self()}},
             enter_loop(Mod, Name, State);
+        %% The instrumented `supervisor`, which `eta_transform` stops asking to
+        %% hibernate. `infinity` is no time-out at all.
+        {ok, State, infinity} ->
+            Parent ! {'$eta_started', self(), {ok, self()}},
+            enter_loop(Mod, Name, State);
+        %% Hibernating changes how the server waits for its next message and
+        %% nothing about what it does, and it involves no clock. Dropped, at the
+        %% cost of memory.
+        {ok, State, hibernate} ->
+            Parent ! {'$eta_started', self(), {ok, self()}},
+            enter_loop(Mod, Name, State);
         {ok, State, {continue, C}} ->
             Parent ! {'$eta_started', self(), {ok, self()}},
             gated_continue(Mod, Name, C, State);
@@ -1042,9 +1338,9 @@ gated_init(Parent, Name, Mod, Args) ->
             Parent ! {'$eta_started', self(), ignore},
             exit(normal);
         Other ->
-            %% `{ok, State, Timeout}` and `{ok, State, hibernate}` land here.
-            %% Both are real-clock behaviours that would need simulating, and
-            %% guessing at them would be a stand-in that lies.
+            %% `{ok, State, Timeout}` lands here. A time-out that fires when the
+            %% server has been idle is a real-clock behaviour that would need
+            %% simulating, and guessing at it would be a stand-in that lies.
             Parent ! {'$eta_started', self(), {error, {eta_sched, unsupported_init, Other}}},
             exit({eta_sched, unsupported_init, Other})
     end.
@@ -1067,8 +1363,9 @@ gated_continue(Mod, Name, C, State) ->
 -if(?DOCATTRS).
 -doc false.
 -endif.
-statem_gated(Parent, Ancestors, Name, Mod, Args) ->
+statem_gated(Parent, Ancestors, Name0, Mod, Args) ->
     _ = wait_for_token(),
+    Name = server_name(Name0),
     put('$ancestors', Ancestors),
     put('$initial_call', {Mod, init, 1}),
     case register_name(Name) of
@@ -1122,14 +1419,14 @@ guessed at.
 -endif.
 -spec fsm_start_link(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
 fsm_start_link(Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_fsm:start_link(Mod, Args, Options);
         true -> gated_start(undefined, Mod, Args, link, fsm_gated)
     end.
 
 -spec fsm_start(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
 fsm_start(Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_fsm:start(Mod, Args, Options);
         true -> gated_start(undefined, Mod, Args, plain, fsm_gated)
     end.
@@ -1137,7 +1434,7 @@ fsm_start(Mod, Args, Options) ->
 -spec fsm_start_link(gen_server:server_name(), module(), term(), list()) ->
     {ok, pid()} | ignore | {error, term()}.
 fsm_start_link(Name, Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_fsm:start_link(Name, Mod, Args, Options);
         true -> gated_start(Name, Mod, Args, link, fsm_gated)
     end.
@@ -1145,7 +1442,7 @@ fsm_start_link(Name, Mod, Args, Options) ->
 -spec fsm_start(gen_server:server_name(), module(), term(), list()) ->
     {ok, pid()} | ignore | {error, term()}.
 fsm_start(Name, Mod, Args, Options) ->
-    case active() of
+    case gate_start() of
         false -> gen_fsm:start(Name, Mod, Args, Options);
         true -> gated_start(Name, Mod, Args, plain, fsm_gated)
     end.
@@ -1153,8 +1450,9 @@ fsm_start(Name, Mod, Args, Options) ->
 -if(?DOCATTRS).
 -doc false.
 -endif.
-fsm_gated(Parent, Ancestors, Name, Mod, Args) ->
+fsm_gated(Parent, Ancestors, Name0, Mod, Args) ->
     _ = wait_for_token(),
+    Name = server_name(Name0),
     put('$ancestors', Ancestors),
     put('$initial_call', {Mod, init, 1}),
     case register_name(Name) of
@@ -2181,6 +2479,22 @@ queue_len(Pid) ->
     end.
 
 -spec status(pid()) -> atom().
+-if(?DOCATTRS).
+-doc """
+`erlang:is_process_alive/1`, without asking the process.
+
+`is_process_alive/1` on another process is a signal the target answers when it
+next runs, and under a run every process the scheduler owns is suspended unless
+it is the one stepping. So a process asking whether another is alive waits for an
+answer that only comes once the scheduler happens to resume the other one, and
+the schedule hangs on it. `eta_transform` points the call here, which reads the
+answer the way the scheduler does, with `process_info/2`.
+""".
+-endif.
+-spec is_alive(pid()) -> boolean().
+is_alive(Pid) ->
+    status(Pid) =/= dead.
+
 status(Pid) ->
     case erlang:process_info(Pid, status) of
         {status, Status} -> Status;

@@ -19,10 +19,15 @@
 %%     `check_final/2' returns.</dd>
 %%   <dt>`tick_ms'</dt><dd>if set, a process that rearms a timer forever, so the
 %%     run can never reach `quiescent' and has to end on `settle_budget'.</dd>
+%%   <dt>`done_ticks'</dt><dd>if set, `settle_done/1' answers `true' once the
+%%     ticker has ticked that many times.</dd>
+%%   <dt>`spin'</dt><dd>if `true', two processes that pass a message back and
+%%     forth forever, so one of them is always runnable and the clock never moves
+%%     unless `busy_steps' moves it.</dd>
 %% </dl>
 
 -export([init/2, processes/1, generate/2, execute/2, check/1, check_final/2,
-         terminate/1]).
+         settle_done/1, terminate/1]).
 
 -define(TAB, eta_final_sut).
 
@@ -33,22 +38,38 @@ init(_Seed, Config) ->
     Tab = ets:new(?TAB, [public, set, named_table]),
     ets:insert(Tab, {ops, 0}),
     Pid = spawn(fun idle/0),
+    ets:insert(Tab, {ticks, 0}),
     Ticker =
         case maps:get(tick_ms, Config, undefined) of
             undefined -> undefined;
             Ms -> spawn(fun() -> tick(Ms) end)
         end,
-    {ok, #{tab => Tab, pid => Pid, ticker => Ticker,
-           final => maps:get(final, Config, ok)}}.
+    Spinner =
+        case maps:get(spin, Config, false) of
+            true ->
+                %% The ball is thrown by the first operation, once the scheduler
+                %% owns both: thrown here, they would pass it back and forth on
+                %% the real VM until the run took them over.
+                [spawn(fun spin/0), spawn(fun spin/0)];
+            false ->
+                []
+        end,
+    {ok, #{tab => Tab, pid => Pid, ticker => Ticker, spinner => Spinner,
+           final => maps:get(final, Config, ok),
+           done_ticks => maps:get(done_ticks, Config, undefined)}}.
 
-processes(#{pid := Pid, ticker := undefined}) -> [Pid];
-processes(#{pid := Pid, ticker := T}) -> [Pid, T].
+processes(#{pid := Pid, ticker := T, spinner := S}) ->
+    [P || P <- [Pid, T | S], P =/= undefined].
 
 generate(_Sut, Rand) ->
     {noop, Rand}.
 
-execute(noop, Sut = #{tab := Tab}) ->
+execute(noop, Sut = #{tab := Tab, spinner := Spinner}) ->
     _ = ets:update_counter(Tab, ops, 1),
+    case Spinner of
+        [A, B] -> A ! {ball, B};
+        [] -> ok
+    end,
     Sut.
 
 check(_Sut) ->
@@ -64,12 +85,13 @@ check_final(Settled, #{tab := Tab, final := Final}) ->
         crash -> error(deliberate)
     end.
 
-terminate(#{pid := Pid, ticker := T}) ->
-    exit(Pid, kill),
-    case T of
-        undefined -> ok;
-        _ -> exit(T, kill)
-    end,
+settle_done(#{done_ticks := undefined}) ->
+    false;
+settle_done(#{tab := Tab, done_ticks := N}) ->
+    ets:lookup_element(Tab, ticks, 2) >= N.
+
+terminate(#{pid := Pid, ticker := T, spinner := S}) ->
+    _ = [exit(P, kill) || P <- [Pid, T | S], P =/= undefined],
     ok.
 
 idle() ->
@@ -81,5 +103,14 @@ idle() ->
 %% has somewhere to go and the run can only end on its settle budget.
 tick(Ms) ->
     receive
-    after Ms -> tick(Ms)
+    after Ms ->
+        _ = ets:update_counter(?TAB, ticks, 1),
+        tick(Ms)
+    end.
+
+spin() ->
+    receive
+        {ball, Other} ->
+            Other ! {ball, self()},
+            spin()
     end.

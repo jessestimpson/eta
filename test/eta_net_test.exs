@@ -1411,6 +1411,19 @@ defmodule EtaNetTest do
       assert taken(b) == [], "the side that did not notice fired a monitor anyway"
     end
 
+    test "the side that did not notice learns when the link heals", %{a: a, b: b} do
+      _from_a = monitor_from(a, b)
+      from_b = monitor_from(b, a)
+
+      :ok = @net.partition(:na, :nb, %{learns: :a})
+      _ = taken(a)
+      assert taken(b) == []
+
+      :ok = @net.heal_partition(:nb, :na)
+      assert taken(b) == [{:DOWN, from_b, :process, a, :noconnection}]
+      assert taken(a) == [], "a already knew"
+    end
+
     test "can be cancelled, and then a partition fires nothing", %{a: a, b: b} do
       mref = monitor_from(a, b)
       assert demonitor_from(a, mref) == true
@@ -1643,6 +1656,30 @@ defmodule EtaNetTest do
 
       @time.advance(100)
       assert drained(s) == [:first, :second]
+    end
+
+    test "nothing overtakes a delayed message on the same node-to-node link, whoever sent it" do
+      # Distribution carries everything from one node to another on a single
+      # connection, in the order it was handed over. A process sending on
+      # another's behalf (ra's leader does this when its own send would block)
+      # must not see its message overtaken by its principal's later ones.
+      :ok = @time.start(%{start_ms: 0})
+      :ok = @net.start(%{seed: 1, policy: %{delay_p: 1.0, max_delay: 50}})
+      s = sink()
+      me = self()
+      helper = spawn(fn -> receive do: (:go -> @net.send(s, :from_helper); send(me, :sent)) end)
+      :ok = @net.place(:na, [me, helper])
+      :ok = @net.place(:nb, [s])
+
+      send(helper, :go)
+      assert_receive :sent
+      :ok = @net.set_policy(%{delay_p: 0.0})
+      @net.send(s, :from_me)
+
+      assert drained(s) == [], "a later message overtook a delayed one on the same link"
+
+      @time.advance(100)
+      assert drained(s) == [:from_helper, :from_me]
     end
 
     test "with no virtual clock the delay is a real one, so the module works outside a run" do

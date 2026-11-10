@@ -96,21 +96,26 @@ because two of them are not written down anywhere near each other:
   process, between two of `gen_statem`'s receives, so the message is sitting in
   the mailbox where a selective receive can take it.
 
+## Generic time-outs
+
+`{{timeout, Name}, Time, Content}` is owned the same way, one entry per name,
+and delivered as a `{timeout, Name}` event. Two of the rules differ, as they do
+in `gen_statem`: a state change does not cancel one, and setting one replaces only
+the time-out of the same name. A machine that stops drops all of them, so none is
+left behind as a stray.
+
 ## What is not owned here, and what happens if you ask
 
-Event time-outs (`{timeout, Time, Content}`, or a bare integer action) and
-generic time-outs (`{{timeout, Name}, Time, Content}`) are **not** virtualised,
-and raise while a clock is running rather than quietly staying on the wall
-clock. Same position `eta_net` takes on the messaging it cannot route: the
-boundary is discoverable by using it rather than by reading a table.
+Event time-outs (`{timeout, Time, Content}`, or a bare integer action) are **not**
+virtualised, and raise while a clock is running rather than quietly staying on
+the wall clock. Same position `eta_net` takes on the messaging it cannot route:
+the boundary is discoverable by using it rather than by reading a table.
 
 They are not merely unimplemented, they are unsafe to leave alone here. Every
 event `gen_statem` processes cancels a running event time-out, and delivery
 above spends one — the `info` event carrying `{'$eta_statem', Ref}`. So a
 machine holding both would find its event time-out cancelled by this module's
-own traffic. Raising is the honest answer until they are owned too, and the
-shape of this module is meant to take them: the arming table is keyed by
-time-out type, and `{timeout, Name}` is a key like any other.
+own traffic.
 
 `hibernate` is untouched and unsupported for the same reasons as before.
 
@@ -144,12 +149,11 @@ does.
 %% dictionary is where `eta_observe` already keeps that kind of thing. It also
 %% dies with the machine, which is the correct lifetime.
 %%
-%% A map keyed by time-out **type**, not a single entry, so the two kinds this
-%% module does not own yet need no new shape when they arrive. `state_timeout` is
-%% the only key written today.
+%% A map keyed by time-out **type**: `state_timeout`, and `{timeout, Name}` for
+%% each generic time-out.
 -define(ARMED, '$eta_statem_timeouts').
 
--type timeout_type() :: state_timeout.
+-type timeout_type() :: state_timeout | {timeout, term()}.
 
 %% Who holds the one state time-out. The first shape is a virtual deadline this
 %% module armed; the second is a zero time-out `gen_statem` has queued and not yet
@@ -204,12 +208,10 @@ return(EventType, State, Ret) ->
 %% Only an OTP-owned entry needs clearing. An eta-owned one was taken by `fire/1`
 %% on the way in, which is the same moment for the same reason: `gen_statem`
 %% removes a time-out from its table before delivering it.
-delivered(state_timeout) ->
-    case table() of
-        #{state_timeout := #{otp := true}} = Table ->
-            put_table(maps:remove(state_timeout, Table));
-        _ ->
-            ok
+delivered(Type) when Type =:= state_timeout; element(1, Type) =:= timeout ->
+    case maps:find(Type, table()) of
+        {ok, #{otp := true}} -> put_table(maps:remove(Type, table()));
+        _ -> ok
     end;
 delivered(_EventType) ->
     ok.
@@ -297,7 +299,7 @@ transition(State, Ret) ->
             %% that has exited is a stray: it stops being able to make anything
             %% runnable while still being a reason the clock moved. See
             %% `eta_time:advance_to_next/1`.
-            _ = drop(state_timeout),
+            _ = [drop(Type) || Type <- maps:keys(table())],
             Ret;
         keep ->
             Ret
@@ -356,24 +358,24 @@ action({state_timeout, Time, Content}) ->
     arm(state_timeout, Time, Content, []);
 action({state_timeout, Time, Content, Opts}) ->
     arm(state_timeout, Time, Content, Opts);
-%% The two kinds this module does not own. See the moduledoc for why these raise
-%% rather than being passed through to `gen_statem`.
-%%
-%% The three-tuples cover the `update` form as well as a plain time, and the
-%% two-tuples are the `cancel` form. Every one of them raises, so the overlap
-%% costs nothing but the clauses are worth having separate: when these are owned
-%% they will each need a different answer.
+%% Generic time-outs: one per name, set and cancelled only by name, and left
+%% running across a state change. Owned the same way as the state time-out,
+%% keyed by `{timeout, Name}`.
+action({{timeout, _} = Type, cancel}) ->
+    forward(Type, drop(Type));
+action({{timeout, _} = Type, update, Content}) ->
+    update(Type, Content);
+action({{timeout, _} = Type, Time, Content}) ->
+    arm(Type, Time, Content, []);
+action({{timeout, _} = Type, Time, Content, Opts}) ->
+    arm(Type, Time, Content, Opts);
+%% Event time-outs are not owned. See the moduledoc for why these raise rather
+%% than being passed through to `gen_statem`.
 action({timeout, _, _} = A) ->
     unsupported(A);
 action({timeout, _, _, _} = A) ->
     unsupported(A);
 action({timeout, cancel} = A) ->
-    unsupported(A);
-action({{timeout, _}, _, _} = A) ->
-    unsupported(A);
-action({{timeout, _}, _, _, _} = A) ->
-    unsupported(A);
-action({{timeout, _}, cancel} = A) ->
     unsupported(A);
 %% The bare form of an event time-out: an action that is just a time. Matched
 %% last among the time-outs so the tuples above win, and guarded so `postpone`
@@ -387,12 +389,13 @@ unsupported(Action) ->
     error(
         {eta_statem,
             {unsupported_timeout, Action, <<
-                "eta virtualises gen_statem's state_timeout and not yet its event "
-                "or generic time-outs, and this one would stay on the real clock "
+                "eta virtualises gen_statem's state and generic time-outs and not "
+                "yet its event time-outs, and this one would stay on the real clock "
                 "while the rest of the run did not - so when it fired would be "
                 "decided by machine load. It cannot be left alone either: every "
-                "event cancels a running event time-out, and delivering a state "
-                "time-out spends one. Use state_timeout, or run without a clock"
+                "event cancels a running event time-out, and delivering one of the "
+                "others spends one. Use state_timeout or a generic time-out, or run "
+                "without a clock"
             >>}}
     ).
 
@@ -530,7 +533,7 @@ put_armed(Type, Armed) ->
     put_table(maps:put(Type, Armed, table())).
 
 %% Which time-out a delivered ref belongs to, removing it. Linear in the number
-%% of armed time-outs, which is at most one today and will not be many.
+%% of armed time-outs: one state time-out and a generic one per name.
 take_ref(Ref) ->
     Table = table(),
     case [{T, C} || T := #{ref := R, content := C} <- Table, R =:= Ref] of

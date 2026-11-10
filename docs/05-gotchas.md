@@ -234,23 +234,32 @@ process the scheduler isn't stepping. The second is counted as
 `rand.unmanaged` in the run result and `audit/1` reports it, the same way
 `net.unmanaged` reports a send from outside the schedule.
 
-### The distributed spawn forms raise
+### The distributed spawn forms work between simulated nodes only
 
-`spawn(Node, Fun)` and its relatives ask for a process on another node, and
-`eta` does not simulate distribution. There is no honest rewrite: running the
-child locally puts it on the wrong node, and letting it through puts it
-outside the schedule entirely.
+`spawn(Node, Fun)` and its relatives ask for a process on another node. When
+the caller is on a simulated node and `Node` is one too, the spawn is simulated
+the way `eta_rpc` simulates an `rpc`: the child is a gated spawn placed on
+`Node`, so its `node()` and its registered names are `Node`'s, and the spawn
+connects the two nodes first. A spawn across a cut still returns a pid, and the
+child exits `noconnection` as soon as it runs, which is what a caller linked to
+or monitoring it would see in a real cluster.
 
-So while a run is active they raise:
+Anywhere else there is no honest rewrite: running the child locally puts it on
+the wrong node, and letting it through puts it outside the schedule entirely.
+So a spawn from a process on no simulated node, or to a node the network has
+never heard of, raises while a run is active:
 
 ```erlang
 {eta_sched, {no_distribution, {erlang, spawn, 2},
-             <<"eta does not simulate distribution; run the nodes as processes in one VM">>}}
+             <<"eta simulates distribution only between simulated nodes; place the caller and the target with eta_net">>}}
 ```
 
-With no run in progress they delegate, so a module built with the transform
-still works normally outside a simulation. A multi-node system under `eta`
-runs its nodes as processes in one VM.
+With no run in progress those delegate, so a module built with the transform
+still works normally outside a simulation.
+
+The bare forms are rewritten as well as the qualified ones, since all of them
+are auto-imported: `spawn(Node, M, F, A)` written without `erlang:` used to run
+ungated, and showed up only as `adopted_late`.
 
 ### suspend_process/1 is documented for debuggers
 
@@ -681,26 +690,26 @@ can't make them milder.
 
 ## Distribution hazards
 
-### Every simulated node is one VM
+### Every simulated node is one VM, with a namespace each
 
-`node()`, `nodes()` and `net_kernel`'s events are answered by `eta_net`, so a
-system can ask who it is and who it can reach as it would on a real cluster. Its
-names are another matter. There is one registry, one ETS namespace and one
-`persistent_term` for the whole VM, so two nodes' instances that register the same
-local name collide on the second start.
+`node()`, `nodes()` and `net_kernel`'s events are answered by `eta_net`, and each
+simulated node has its own registered names, named ETS tables and
+`persistent_term` keys (see `eta_ns`). So a system runs under the same names on
+every node, as it would on a real cluster.
 
-Give each node's instance its own names. Then the system addresses a peer as
-`{Name, Node}` using the name *its own* instance has, which on the peer belongs to
-nobody. Alias it there:
+Three things are still one per VM:
 
-```erlang
-eta_net:register_name(node_b, myapp_a_server, {local, myapp_b_server}).
-```
-
-The alias is looked up at each send, so it follows the server across restarts and
-resolves to nothing while its node is down. Anything that has to agree between
-nodes and contains the instance's name, such as an id a peer compares, still needs
-a seam: the name on the wire can't be the local one.
+- **Applications.** `application_controller` is shared, so an application can't be
+  started once per node. Start its top supervisor on each node instead, and start
+  the application itself before the run only if the system insists on it being
+  running; `eta_app` answers that without a call.
+- **Anything the VM itself started.** A node that looks up a name it hasn't
+  registered finds the VM's process of that name, if there is one, and that
+  process runs outside the schedule. If the system's own applications are running
+  in the VM (`mix test` starts them), a node can reach them while its own copies
+  are still starting, and seeds stop reproducing. Run with `--no-start`.
+- **Code not rewritten.** A name passed to a module the transform never saw is
+  looked up in the VM's namespace. Instrument the dependencies too.
 
 ### node(X) in a guard is refused
 
@@ -773,6 +782,13 @@ Eta.Beam.instrument([:supervisor, Supervisor, Supervisor.Default, DynamicSupervi
 Nothing on disk changes, and the rewrites are inert outside a run. `Enum` is on
 that list for `Enum.shuffle/1` and `Enum.random/1`, which draw from `:rand` inside
 the stdlib.
+
+On OTP 28, instrument `:supervisor` even if every child starts without it. A
+supervisor that handles a call asks `gen_server` to hibernate it after an idle
+second, and `gen_server` arms a real timer for that. When the timer fires, the
+supervisor becomes runnable at whatever step the run has reached, so a run that
+started a child late doesn't replay. The instrumented `:supervisor` never asks
+to hibernate.
 
 ### Operation bodies need the transform too
 

@@ -59,6 +59,10 @@ init({Owner, Actions}) ->
 handle_event(state_timeout, Content, State, #{owner := Owner}) ->
     Owner ! {fired, State, Content},
     keep_state_and_data;
+%% Generic time-outs, reported with their name and the state they arrived in.
+handle_event({timeout, Name}, Content, State, #{owner := Owner}) ->
+    Owner ! {generic, Name, State, Content},
+    keep_state_and_data;
 handle_event({call, From}, sync, _State, _Data) ->
     {keep_state_and_data, [{reply, From, synced}]};
 handle_event({call, From}, state, State, _Data) ->

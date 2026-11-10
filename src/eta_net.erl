@@ -68,6 +68,14 @@ per ordered pair this module may **deliver**, **drop**, **delay**, or **cut** th
 channel until healed. It never reorders within a pair; injecting that would
 manufacture counterexamples the real system cannot produce.
 
+Between two simulated nodes the guarantee is wider, because distribution gives
+it: every message from node A to node B travels on one connection, in the order
+it was handed over, whoever sent it. So a message is never delivered ahead of one
+scheduled earlier on the same node-to-node link. A delay holds up what follows it
+on the link, as it would on TCP. Without that, a process that sends on another's
+behalf, as ra's leader does when its own send would block, could have its message
+overtaken by its principal's later ones.
+
 A perfect policy is exactly the behaviour of no network at all, which is what
 makes `drop_p => 0.0` usable as a control run.
 
@@ -155,12 +163,12 @@ A process on no simulated node — a harness, an observer, anything a test spawn
 without placing — gets the real BIFs, so a network changes nothing for it.
 `with_node/2` lets such a process ask on a node's behalf.
 
-**What is still one VM.** A simulated node has no registry, ETS namespace or
-`persistent_term` of its own, so two instances of a system that register the same
-local name collide. Give each node's instance its own names, and use
-`register_name/3`'s `{local, Name}` form so `{Name, Node}` still finds the right
-one. `node(X)` in a guard cannot be redirected here and is refused at compile
-time; see `eta_transform`.
+**Names are per node.** A process on a simulated node registers names, creates
+named ETS tables and writes `persistent_term` keys in that node's namespace, so a
+system can run under the same names on every node, and `{Name, Node}` finds the
+process holding `Name` on `Node`. See `eta_ns`. `rpc` and `erpc` to a simulated
+node run there; see `eta_rpc`. `node(X)` in a guard cannot be redirected here and
+is refused at compile time; see `eta_transform`.
 
 Delay is virtual — a delayed message becomes a deadline in `eta_time`'s wheel — so
 waiting one out costs no real time.
@@ -228,12 +236,17 @@ waiting one out costs no real time.
     is_alive/0,
     monitor_nodes/1,
     monitor_nodes/2,
+    monitor_node/2,
+    monitor_node/3,
     connect_node/1,
     disconnect_node/1,
     ping/1,
     send_nosuspend/2,
     send_nosuspend/3,
-    with_node/2
+    with_node/2,
+    local_node/0,
+    is_node/1,
+    await/3
 ]).
 
 %% Targeted faults.
@@ -736,6 +749,15 @@ sim_call(To, Dest, Req, Timeout) ->
 %% cannot match because nothing will ever send it, and the real `after` is the
 %% deadline. Writing it as one receive rather than two keeps the reply and `DOWN`
 %% clauses from being stated twice, which is where a divergence would hide.
+-if(?DOCATTRS).
+-doc false.
+-endif.
+%% `wait/3` for `eta_rpc`, which waits on a worker the same way a call waits on a
+%% server.
+-spec await(term(), reference(), timeout()) -> {reply, term()} | {down, term()} | timeout.
+await(Tag, Mon, Timeout) ->
+    wait(Tag, Mon, Timeout).
+
 wait(Tag, Mon, Timeout) ->
     Ref = make_ref(),
     {TRef, Real} =
@@ -952,17 +974,33 @@ unsupported({M, F, _A} = MFA, Args) ->
 %% it **and is located on that node**. A system whose instances already have
 %% distinct local names then needs no `register_name/3` at all, and a process
 %% that restarts under the same name is found again without the harness noticing.
+%%
+%% A name is looked up in the sender's namespace first (see `eta_ns`), and
+%% `{Name, Node}` for another simulated node in that node's.
 normalize(Pid) when is_pid(Pid) -> Pid;
-normalize(Name) when is_atom(Name) -> erlang:whereis(Name);
-normalize({Name, Node}) when is_atom(Name), Node =:= erlang:node() -> erlang:whereis(Name);
+normalize(Name) when is_atom(Name) -> eta_ns:whereis(Name);
+normalize({Name, Node}) when is_atom(Name), Node =:= erlang:node() -> eta_ns:whereis(Name);
 normalize({Name, Node}) when is_atom(Name) ->
     case whereis_name(Node, Name) of
-        undefined -> located_name(Name, Node);
-        Pid -> Pid
+        undefined ->
+            case running() andalso local_node() of
+                Node -> eta_ns:whereis(Name);
+                _ -> located_name(Name, Node)
+            end;
+        Pid ->
+            Pid
     end;
 normalize(_) -> undefined.
 
+%% A process holding `Name` in `Node`'s namespace, or holding the bare name while
+%% located on `Node`.
 located_name(Name, Node) ->
+    case running() andalso erlang:whereis(eta_ns:name(Node, Name)) of
+        Pid when is_pid(Pid) -> Pid;
+        _ -> located_bare(Name, Node)
+    end.
+
+located_bare(Name, Node) ->
     case running() andalso erlang:whereis(Name) of
         Pid when is_pid(Pid) ->
             case placement(Pid) of
@@ -1281,7 +1319,9 @@ Places `Child` where `Parent` is, with the same faultability. Called by
 -endif.
 -spec inherit(pid(), pid()) -> ok.
 inherit(Parent, Child) ->
-    case running() andalso placement(Parent) of
+    %% A child placed before the scheduler adopted it keeps that placement: it
+    %% was put there on purpose, as `eta_rpc` does with its workers.
+    case running() andalso placement(Child) =:= undefined andalso placement(Parent) of
         {Node, Faultable} ->
             true = ets:insert(?PLACE, {{pid, Child}, Node, Faultable, seq_of(Child)}),
             true = ets:insert(?PLACE, {{home, Child}, Node}),
@@ -1506,6 +1546,58 @@ subscribe(false, _Node, Pid, Opts) ->
     end.
 
 -if(?DOCATTRS).
+-doc "`erlang:monitor_node/2`. See `monitor_node/3`.".
+-endif.
+-spec monitor_node(term(), boolean()) -> true.
+monitor_node(Node, Flag) ->
+    monitor_node(Node, Flag, []).
+
+-if(?DOCATTRS).
+-doc """
+`erlang:monitor_node/3` for a process on a simulated node.
+
+`true` watches `Node` from the caller's node: when that connection is lost the
+caller receives `{nodedown, Node}`, once, and the watch is gone. As in
+distribution it tries to connect first, and a node it can't reach is reported
+down at once. Each call is a watch of its own, and `false` removes one. A node
+watching itself is never told anything.
+""".
+-endif.
+-spec monitor_node(term(), boolean(), list()) -> true.
+monitor_node(Node, Flag, Opts) ->
+    case local_node() of
+        undefined ->
+            erlang:monitor_node(Node, Flag, Opts);
+        Node ->
+            true;
+        Here when Flag ->
+            case ets:member(?PLACE, {conn, Here, Node}) orelse try_connect(Here, Node) of
+                true ->
+                    Key = {nmon, self()},
+                    Watched =
+                        case ets:lookup(?PLACE, Key) of
+                            [{_, _Here, W}] -> W;
+                            [] -> []
+                        end,
+                    true = ets:insert(?PLACE, {Key, Here, Watched ++ [Node]});
+                false ->
+                    _ = erlang:send(self(), {nodedown, Node}),
+                    true
+            end;
+        _Here ->
+            Key = {nmon, self()},
+            case ets:lookup(?PLACE, Key) of
+                [{_, H, W}] ->
+                    case lists:delete(Node, W) of
+                        [] -> true = ets:delete(?PLACE, Key);
+                        Left -> true = ets:insert(?PLACE, {Key, H, Left})
+                    end;
+                [] ->
+                    true
+            end
+    end.
+
+-if(?DOCATTRS).
 -doc """
 `net_kernel:connect_node/1` and Elixir's `Node.connect/1`.
 
@@ -1629,7 +1721,14 @@ with_node(Node, Fun) when is_function(Fun, 0) ->
         end
     end.
 
-%% The caller's simulated node, or `undefined` when it has none.
+-if(?DOCATTRS).
+-doc """
+The caller's simulated node, or `undefined` when it is on none: the node it is
+placed or attached on, or the one `with_node/2` names. `node/0` with the real node
+as the fallback.
+""".
+-endif.
+-spec local_node() -> term() | undefined.
 local_node() ->
     case running() of
         false ->
@@ -1645,6 +1744,13 @@ local_node() ->
                     Node
             end
     end.
+
+-if(?DOCATTRS).
+-doc "Whether `Node` is a simulated node: one something has been placed or attached on.".
+-endif.
+-spec is_node(term()) -> boolean().
+is_node(Node) ->
+    running() andalso ets:member(?PLACE, {node, Node}).
 
 %% `{Here, There}` when a send from the caller to `Dest` goes between two
 %% different simulated nodes, otherwise `false`.
@@ -1667,7 +1773,7 @@ dest_node({Name, Node}) when is_atom(Name) ->
         false -> undefined
     end;
 dest_node(Name) when is_atom(Name) ->
-    case erlang:whereis(Name) of
+    case eta_ns:whereis(Name) of
         Pid when is_pid(Pid) -> dest_node(Pid);
         _ -> undefined
     end;
@@ -1800,10 +1906,32 @@ disbelieve(X, Y, Reason) ->
     case ets:member(?PLACE, {conn, X, Y}) of
         true ->
             true = ets:delete(?PLACE, {conn, X, Y}),
+            ok = node_monitors_down(X, Y),
             node_event(X, nodedown, Y, Reason);
         false ->
             ok
     end.
+
+%% `monitor_node/2` watches on node `X` of node `Y`: each one fires once and goes.
+%% In watch order, like the subscriptions.
+node_monitors_down(X, Y) ->
+    Watchers = lists:sort([
+        {Pid, W}
+     || [Pid, W] <- ets:match(?PLACE, {{nmon, '$1'}, X, '$2'}), lists:member(Y, W)
+    ]),
+    lists:foreach(
+        fun({Pid, W}) ->
+            Fired = [N || N <- W, N =:= Y],
+            Left = [N || N <- W, N =/= Y],
+            _ = [(catch erlang:send(Pid, {nodedown, Y})) || _ <- Fired],
+            _ = [bump(signalled) || _ <- Fired],
+            case Left of
+                [] -> true = ets:delete(?PLACE, {nmon, Pid});
+                _ -> true = ets:insert(?PLACE, {{nmon, Pid}, X, Left})
+            end
+        end,
+        Watchers
+    ).
 
 drop_connection(Here, There) ->
     case ets:member(?PLACE, {conn, Here, There}) orelse ets:member(?PLACE, {conn, There, Here}) of
@@ -1827,6 +1955,7 @@ node_down(Node, Dying) ->
     lists:foreach(fun(Peer) -> disbelieve(Peer, Node, connection_closed) end, Peers),
     true = ets:match_delete(?PLACE, {{conn, Node, '_'}}),
     lists:foreach(fun(P) -> true = ets:delete(?PLACE, {sub, P}) end, Dying),
+    lists:foreach(fun(P) -> true = ets:delete(?PLACE, {nmon, P}) end, Dying),
     ok.
 
 %% Tells every subscriber on `Node`, in subscription order. Direct, as
@@ -1993,12 +2122,51 @@ do_monitor(Item, Opts) ->
                 false -> erlang:monitor(process, Item, Opts)
             end;
         undefined ->
-            %% An unregistered name, or a destination this module cannot identify
-            %% as a local process. `erlang:monitor/2` already does the right thing
-            %% with both — an immediate `noproc` for the first, a real distributed
-            %% monitor for the second — and neither is something to reimplement.
-            erlang:monitor(process, Item, Opts)
+            case unheld_simulated_name(Item) of
+                {true, Reason} ->
+                    %% `{Name, Node}` for a simulated node where nothing holds
+                    %% `Name`. The VM cannot be asked: `Node` is not a node it
+                    %% knows, so `erlang:monitor/3` answers `badarg` rather than
+                    %% the DOWN distribution delivers. The case that found it is
+                    %% a node that was killed and not restarted. A lock agent
+                    %% monitoring the lock server there crashed on the spot, where
+                    %% real distribution tells it the node is gone and it carries
+                    %% on with the others, and the election above it spun.
+                    Ref = make_ref(),
+                    ok = fire({Ref, Watcher, undefined, Item, down_tag(Opts), next_seq()}, Reason),
+                    Ref;
+                false ->
+                    %% An unregistered name, or a destination this module cannot
+                    %% identify as a local process. `erlang:monitor/2` already does
+                    %% the right thing with both — an immediate `noproc` for the
+                    %% first, a real distributed monitor for the second — and
+                    %% neither is something to reimplement.
+                    erlang:monitor(process, Item, Opts)
+            end
     end.
+
+%% What a monitor on `{Name, Node}` gets at once when `Node` is a simulated node
+%% and nothing there holds `Name`, asked by a process on a simulated node: as
+%% distribution does, it connects first, and the DOWN says `noconnection` if it
+%% cannot and `noproc` if it can. A name on the caller's own node is `noproc`.
+unheld_simulated_name({Name, Node}) when is_atom(Name) ->
+    case local_node() of
+        undefined ->
+            false;
+        Node ->
+            {true, noproc};
+        _Here ->
+            case is_node(Node) of
+                false -> false;
+                true ->
+                    case connect_node(Node) of
+                        true -> {true, noproc};
+                        _ -> {true, noconnection}
+                    end
+            end
+    end;
+unheld_simulated_name(_) ->
+    false.
 
 simulate_monitor(Watcher, Target, Item, Opts) ->
     Ref = make_ref(),
@@ -2224,6 +2392,7 @@ notify_exit(Pid, Reason) ->
             %% `simulate_monitor/4`.
             true = ets:insert(?DEAD, {Pid}),
             true = ets:delete(?PLACE, {sub, Pid}),
+            true = ets:delete(?PLACE, {nmon, Pid}),
             _ = [fire(M, Reason) || M <- monitors_on(Pid)],
             %% Whatever it was watching, it is not watching any more.
             true = ets:match_delete(?MONS, {'_', Pid, '_', '_', '_', '_'}),
@@ -2283,6 +2452,7 @@ cut(From0, To0) ->
             true = ets:insert(?CHAN, {{node_cut, A, B}}),
             %% Everything already in flight across the link is lost with it.
             _ = [cancel_pending(P, Q) || P <- on_node(A), Q <- on_node(B)],
+            true = ets:delete(?CHAN, {link_last, A, B}),
             ok;
         {{pid, From}, {pid, To}} ->
             true = ets:insert(?CHAN, {{cut, From, To}}),
@@ -2374,6 +2544,13 @@ one that had to be hand-rolled from two `cut/2` calls and a fan-out before. The
 cut itself stays symmetric: a lost link loses both directions whether or not
 anyone has realised.
 
+B finds out at the latest when the partition heals. `heal_partition/2,3` delivers
+B's side of the failure first, its DOWNs, `nodedown` and signal, then heals: A
+closed its end of the connection, so the first thing B hears once packets flow
+again is that the connection is gone. Without that, a call B made into the cut
+would wait out its whole time-out after the heal, which real distribution never
+does.
+
 ## Connections
 
 When `A` and `B` are nodes, the partition disconnects them, and the
@@ -2400,7 +2577,11 @@ process the scheduler owns runs in between, so no one can observe half of it.
 partition(A, B, Opts) ->
     ok = cut(A, B),
     ok = cut(B, A),
-    link_event(A, B, Opts).
+    ok = link_event(A, B, Opts),
+    case learns(Opts) of
+        both -> ok;
+        _ -> true = ets:insert(?CHAN, {{one_sided, A, B}, Opts}), ok
+    end.
 
 -if(?DOCATTRS).
 -doc "Heals both directions. See `heal_partition/3`.".
@@ -2424,9 +2605,30 @@ is a second event.
 -endif.
 -spec heal_partition(dest(), dest(), event_opts()) -> ok.
 heal_partition(A, B, Opts) ->
+    ok = learn_late(A, B),
+    ok = learn_late(B, A),
     ok = heal(A, B),
     ok = heal(B, A),
     signals(A, B, Opts).
+
+%% The side a one-sided partition left unaware learns of it now, before the link
+%% comes back. The side that noticed closed its end of the connection, so the
+%% first thing the other end hears once packets flow again is that its connection
+%% is gone: its monitors fire `noconnection` and its `monitor_nodes` subscribers
+%% get `nodedown`. Left unaware, a call it made into the cut would wait out its
+%% whole time-out after the heal, which real distribution never does.
+learn_late(A, B) ->
+    case ets:take(?CHAN, {one_sided, A, B}) of
+        [{_, Opts}] ->
+            Late =
+                case learns(Opts) of
+                    a -> b;
+                    b -> a
+                end,
+            link_event(A, B, Opts#{learns => Late});
+        [] ->
+            ok
+    end.
 
 %% A link between A and B has failed: retire the monitors that crossed it, tell
 %% the `monitor_nodes` subscribers, then deliver any signal.
@@ -3003,17 +3205,43 @@ draw() ->
 %% network does.
 schedule(From, Dest, Msg, Tag, Delay) ->
     Now = now_ms(),
-    {Last, Pending} = channel(From, Dest, Now),
+    {Last0, Pending} = channel(From, Dest, Now),
+    Link = link_key(From, Dest),
+    Last = max(Last0, link_last(Link, Now)),
     case max(Now + Delay, Last + 1) of
         At when At =< Now ->
             deliver(Dest, Msg);
         At ->
             Ref = eta_time:send_after(At - Now, Dest, Msg),
             true = ets:insert(?CHAN, {{chan, From, Dest}, At, [{At, Ref} | Pending]}),
+            ok = put_link_last(Link, At),
             bump(delayed),
             _ = eta_log:log({net, {delayed, At - Now}, Dest, Tag}),
             Msg
     end.
+
+%% The node-to-node link a message crosses, for the link-wide ordering guarantee in
+%% the module doc. `none` for anything that doesn't cross one.
+link_key(From, Dest) ->
+    case {placement(From), placement(Dest)} of
+        {{A, _}, {B, _}} when A =/= B -> {link_last, A, B};
+        _ -> none
+    end.
+
+%% The last delivery scheduled on a link, or one before `Now` if none is pending.
+link_last(none, Now) ->
+    Now - 1;
+link_last(Key, Now) ->
+    case ets:lookup(?CHAN, Key) of
+        [{_, At}] -> At;
+        [] -> Now - 1
+    end.
+
+put_link_last(none, _At) ->
+    ok;
+put_link_last(Key, At) ->
+    true = ets:insert(?CHAN, {Key, At}),
+    ok.
 
 %% Milliseconds on whichever clock is running.
 %%

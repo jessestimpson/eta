@@ -17,6 +17,7 @@
     alive/0,
     subscribe/0,
     subscribe_with_reason/0,
+    watch_node/1,
     connect/1,
     disconnect/1,
     ping/1,
@@ -46,6 +47,8 @@ alive() -> is_alive().
 subscribe() -> net_kernel:monitor_nodes(true).
 
 subscribe_with_reason() -> net_kernel:monitor_nodes(true, [nodedown_reason]).
+
+watch_node(Node) -> monitor_node(Node, true).
 
 connect(Node) -> net_kernel:connect_node(Node).
 

@@ -265,6 +265,60 @@ defmodule EtaStateTimeoutTest do
     end
   end
 
+  describe "generic time-outs" do
+    setup do
+      :ok = @time.start(%{start_ms: 0})
+      {:ok, pid} = @sut.start_link(self())
+      on_exit(fn -> stop(pid) end)
+      {:ok, pid: pid}
+    end
+
+    test "fire on the virtual clock, as a {timeout, Name} event", %{pid: pid} do
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :tick}, 60_000, :beat}})
+      assert @time.pending() == 1
+      @time.advance(60_000)
+      assert_receive {:generic, :tick, :a, :beat}
+    end
+
+    test "survive a state change", %{pid: pid} do
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :tick}, 100, :beat}})
+      :ok = @sut.drive(pid, {:next_state, :b})
+      @time.advance(100)
+      assert_receive {:generic, :tick, :b, :beat}
+    end
+
+    test "are one per name: a second replaces the first, and others run alongside", %{pid: pid} do
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :tick}, 100, :first}})
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :tick}, 200, :second}})
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :other}, 150, :other}})
+      :ok = @sut.drive(pid, {:arm, 120, :state})
+
+      @time.advance(200)
+      assert_receive {:fired, :a, :state}
+      assert_receive {:generic, :other, :a, :other}
+      assert_receive {:generic, :tick, :a, :second}
+      refute_received {:generic, :tick, :a, :first}
+    end
+
+    test "cancel by name, with cancel or infinity", %{pid: pid} do
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :one}, 100, :x}})
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :two}, 100, :y}})
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :one}, :cancel}})
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :two}, :infinity, :y}})
+      @time.advance(1_000)
+      refute_received {:generic, _, _, _}
+      assert @time.pending() == 0
+    end
+
+    test "update changes the content and keeps the deadline", %{pid: pid} do
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :tick}, 100, :old}})
+      @time.advance(50)
+      :ok = @sut.drive(pid, {:raw, {{:timeout, :tick}, :update, :new}})
+      @time.advance(50)
+      assert_receive {:generic, :tick, :a, :new}
+    end
+  end
+
   describe "the time-out kinds eta does not own" do
     @describetag :capture_log
 
@@ -275,7 +329,6 @@ defmodule EtaStateTimeoutTest do
 
     for {action, label} <- [
           {{:timeout, 100, :x}, "an event time-out"},
-          {{{:timeout, :name}, 100, :x}, "a generic time-out"},
           {100, "a bare time as an action"}
         ] do
       test "#{label} raises rather than staying on the real clock" do

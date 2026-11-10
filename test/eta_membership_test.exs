@@ -242,10 +242,14 @@ defmodule EtaMembershipTest do
       assert on(:a, &@m.peers/0) == []
       assert on(:b, &@m.peers/0) == [:a]
 
+      # a closed its end, so b hears the connection is gone once packets flow again.
       :ok = @net.heal_partition(:a, :b)
+      assert taken(wb) == [{:nodedown, :a}]
+      assert on(:b, &@m.peers/0) == []
+
       assert on(:a, fn -> @m.connect(:b) end)
       assert taken(wa) == [{:nodeup, :b}]
-      assert taken(wb) == [], "b never lost the connection, so it has nothing to hear"
+      assert taken(wb) == [{:nodeup, :a}]
     end
 
     test "a killed node goes down for its peers, and a replacement starts unconnected" do
@@ -308,6 +312,39 @@ defmodule EtaMembershipTest do
 
       :ok = @net.partition(:a, :b)
       assert %{signalled: 0} = @net.stats()
+    end
+  end
+
+  describe "monitor_node/2" do
+    test "fires once, when the connection is lost" do
+      mesh([:a, :b])
+      wa = watcher(:a, fn -> :ok end)
+      true = run_in(wa, fn -> @m.watch_node(:b) end)
+
+      :ok = @net.partition(:a, :b)
+      assert taken(wa) == [{:nodedown, :b}]
+
+      :ok = @net.heal_partition(:a, :b)
+      assert on(:a, fn -> @m.connect(:b) end)
+      :ok = @net.partition(:a, :b)
+      assert taken(wa) == [], "the watch went with the first nodedown"
+    end
+
+    test "a node it cannot reach is down at once" do
+      mesh([:a])
+      wa = watcher(:a, fn -> :ok end)
+      true = run_in(wa, fn -> @m.watch_node(:nowhere) end)
+      assert taken(wa) == [{:nodedown, :nowhere}]
+    end
+
+    test "connects first, as distribution does" do
+      :ok = @net.start(%{seed: 1})
+      on(:b, fn -> :ok end)
+      wa = watcher(:a, fn -> :ok end)
+      true = run_in(wa, fn -> @m.watch_node(:b) end)
+      assert on(:a, &@m.peers/0) == [:b]
+      :ok = @net.kill_node(:b)
+      assert taken(wa) == [{:nodedown, :b}]
     end
   end
 

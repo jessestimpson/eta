@@ -28,9 +28,66 @@
   and `{Name, Node}` resolves a real registered name held by a process on `Node`.
 - Added `eta_net:with_node/2`, for a harness reading a node's state through the
   system's API.
+- Added `eta_ns`: each simulated node has its own registered names, named ETS
+  tables and `persistent_term` keys, so a system can run under the same names on
+  every node. The parse_transform points the calls that name things at it.
+- Added `eta_rpc`: `rpc:call/4,5`, `rpc:cast/4`, `erpc:call/2..5` and
+  `erpc:cast/2,4` to a simulated node run on that node. The request crosses the
+  simulated network, and the result comes back in the worker's exit, as with
+  `erpc`, so a partition mid-call ends the call.
+- `gen_statem` generic time-outs, `{{timeout, Name}, Time, Content}`, are on the
+  virtual clock. Event time-outs still raise.
+- `erlang:monitor_node/2,3` is simulated between simulated nodes.
+- The parse_transform gates `proc_lib:start*` and `gen:start/5,6`, so a behaviour
+  built on `gen` (`gen_batch_server`, say) starts under the scheduler.
+- Added `eta_app`, `eta_file` and `eta_dets`, which the parse_transform points
+  `application` starts, `file_server`'s `file` and `filelib` functions, and `dets`
+  at, so none of them waits on a VM service outside the schedule. `eta_dets`
+  writes every change through to the table's file.
+- A gated `gen_server` whose `init/1` returns `{ok, State, hibernate}` starts.
+- Added an optional `settle_done/1` harness callback. A harness for a system that
+  never goes quiet can end the settle phase once its final read has finished,
+  instead of spending `settle_steps` on every run. The run ends as
+  `settle_done`.
+- Added a `busy_steps` run option. After that many actions without the clock
+  moving, the clock moves to the next deadline, so a system that spins in zero
+  time, like a client retrying a server that keeps redirecting it, can't stop its
+  own timers from firing.
+- A one-sided partition (`learns => a` or `b`) reaches the other side when it
+  heals. Its monitors fire `noconnection` and its `monitor_nodes` subscribers get
+  `nodedown`, as a real connection reset delivers them.
+- `spawn(Node, ...)` and the rest of the distributed spawn forms are simulated
+  between simulated nodes: the child is a gated spawn placed on `Node`, the spawn
+  connects the two nodes as distribution does, and a spawn across a cut gives a
+  child that exits `noconnection`. From a process on no simulated node, or to a
+  node the network doesn't know, they still raise while a run is active.
 
 ### Bug fixes
 
+- `monitor(process, {Name, Node})` from a process on a simulated node, to a
+  simulated node where nothing holds `Name`, delivers the DOWN distribution
+  would: `noconnection` if the two nodes cannot connect, as for a node that was
+  killed and not restarted, and `noproc` if they can. It fell through to
+  `erlang:monitor/3`, which raises `badarg` for a node the VM does not know, so
+  the caller crashed instead.
+- The bare distributed spawns, `spawn(Node, M, F, A)` and the other
+  auto-imported forms with a node argument, are rewritten. Only the local forms
+  were, so a bare distributed spawn ran ungated and was counted as
+  `adopted_late`.
+- `erlang:is_process_alive/1` no longer hangs a run. On another process it waits
+  for that process to run, and under a run it is suspended.
+- A start made by a process the scheduler doesn't own, such as `kernel_safe_sup`
+  running an instrumented `supervisor`, goes to OTP rather than waiting for a
+  token that never comes.
+- An instrumented OTP 28 `supervisor` no longer arms its one-second idle-hibernate
+  timer. The timer was real, so a supervisor that had taken a call (a
+  `start_child`, say) became runnable a wall-clock second later, at a different
+  point in each run, and the run didn't replay.
+- A message between two simulated nodes is never delivered ahead of one
+  scheduled earlier on the same node-to-node link, whoever sent it, as on
+  distribution's single connection. Ordering was kept only per pair of
+  processes, so a delayed message from one sender could be overtaken by a later
+  one from another and manufacture reorderings real distribution can't produce.
 - `eta_net:send/3` honours `noconnect` and `nosuspend` between simulated nodes.
   It ignored both, so a send that real distribution would refuse was delivered.
 

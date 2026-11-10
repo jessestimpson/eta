@@ -80,6 +80,8 @@ overlap.
   The system was *left alone* for that long; it may still be ticking. A system
   with a heartbeat never reaches `quiescent` and this is the strongest signal it
   will ever give.
+- `settle_done` — `settle_done/1` said the harness has what it was waiting for,
+  before `settle_steps` ran out. The same claim as `settle_budget`, made sooner.
 
 Take `quiescent` as proof and `settle_budget` as evidence, and be explicit about
 which one a given property needs. A harness that only trusts the first returns
@@ -90,6 +92,16 @@ does — `outcome` carries it and `terminate/1` still runs.
 
 `terminate(State)` — tear down. Called however the run ends, including on
 violation.
+
+`settle_done(State)` — **optional.** Asked after every step once the last
+operation is in. `true` ends the run there, as `settle_done`, rather than when
+`settle_steps` runs out. For a system that never goes quiet: its settle phase
+otherwise spends the whole budget on every run, so the budget has to be sized
+for the slowest recovery and every run pays for it. A harness whose final
+operation records that it has finished — a reader that waited for the cluster
+to catch up, say — answers from that record. Keep it to a read of the
+harness's own tables: it runs on the hot path, and it must not ask the system
+anything.
 
 `labels(State)` — **optional, and the fallback rather than the main road.** A
 `#{pid() => Name}` map, used when `eta_log:analyze/0` renders a run. Without a
@@ -126,7 +138,7 @@ becomes itself, `{Kind, N}` becomes `kind-n`, anything else falls back to `~p`.
 %% How a run reached its end, and how much a `check_final/2` may read into it.
 %% `quiescent' is proof the system stopped; `settle_budget' is only that it was
 %% left alone for `settle_steps'. See the module doc.
--type settled() :: quiescent | settle_budget.
+-type settled() :: quiescent | settle_budget | settle_done.
 
 -callback init(Seed :: integer(), Config :: map()) -> {ok, state()}.
 -callback processes(state()) -> [pid()].
@@ -136,5 +148,6 @@ becomes itself, `{Kind, N}` becomes `kind-n`, anything else falls back to `~p`.
 -callback terminate(state()) -> ok.
 -callback labels(state()) -> #{pid() => term()}.
 -callback check_final(settled(), state()) -> ok | {violation, violation()}.
+-callback settle_done(state()) -> boolean().
 
--optional_callbacks([labels/1, check_final/2]).
+-optional_callbacks([labels/1, check_final/2, settle_done/1]).

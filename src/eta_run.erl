@@ -170,7 +170,11 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
     since_check = 0 :: non_neg_integer(),
     trace = [] :: [entry()],
     steps = 0 :: non_neg_integer(),
-    ops = 0 :: non_neg_integer()
+    ops = 0 :: non_neg_integer(),
+    %% `busy_steps`: how many steps may pass without the clock moving before it
+    %% moves anyway, and how many have. See `busy/1`.
+    busy_limit = infinity :: pos_integer() | infinity,
+    busy = 0 :: non_neg_integer()
 }).
 
 %% ---------------------------------------------------------------------------
@@ -192,11 +196,17 @@ Options, all with defaults:
   injected. A system whose timers never stop — anything with a heartbeat — has no
   natural quiescence to wait for, and without this the only
   way such a run can end is the safety bound. Reaching the end of the settle phase
-  is a normal `ok`.
+  is a normal `ok`. A harness with `settle_done/1` can end it sooner; see
+  `eta_harness`.
 - `op_p` (0.3) — chance of injecting rather than stepping when both are possible.
 - `quiet_p` (0.3) — chance of letting time pass rather than injecting when nothing
   is runnable. See the module doc; this is not a tuning knob so much as the thing
   that makes quiet-period bugs reachable.
+- `busy_steps` (`infinity`) — after this many actions without the clock moving,
+  move it to the next deadline anyway. The clock otherwise moves only when
+  nothing is runnable, so a system that spins, such as a client retrying a
+  server that turns it away, stops time and starves the timer that would end the
+  spin. A real machine takes time to spin, and its timers fire through it.
 - `check_every` (1) — run the invariants every N actions.
 - `log` (`true`) — collect a `eta_log` record of the run. `false` suppresses the
   events but **not** the sequence numbers `log/1` hands out, so a harness that
@@ -614,7 +624,8 @@ drive(Mod, Opts, Source) ->
             op_p = maps:get(op_p, Opts, 0.3),
             quiet_p = maps:get(quiet_p, Opts, 0.3),
             check_every = maps:get(check_every, Opts, 1),
-            lenient = maps:get(lenient, Opts, false)
+            lenient = maps:get(lenient, Opts, false),
+            busy_limit = maps:get(busy_steps, Opts, infinity)
         },
         %% Startup's own processes belong to no entry, and are the one set whose
         %% ids a shrink can never disturb — nothing deletes `init/2`. Dropping
@@ -744,12 +755,48 @@ loop(R = #r{budget = 0}) ->
 %% quiet-period defects are reachable at all.
 loop(R = #r{ops_left = 0, settle_left = 0}) ->
     final(settle_budget, R);
+loop(R = #r{busy = Busy, busy_limit = Limit}) when Busy >= Limit ->
+    busy(R);
 loop(R = #r{sched = Sched, ops_left = OpsLeft}) ->
-    case choose(R, eta_sched:runnable(Sched), OpsLeft > 0) of
+    case OpsLeft =:= 0 andalso settle_done(R) of
+        true -> final(settle_done, R);
+        false -> loop_step(R, eta_sched:runnable(Sched), OpsLeft)
+    end.
+
+%% `busy_steps` steps have passed without the clock moving: it moves now, to the
+%% next deadline, as though those steps had taken the time.
+%%
+%% Time here passes only when nothing is runnable, which is right for a system
+%% that waits and wrong for one that spins. A client that retries the moment it
+%% is turned away keeps something runnable forever, so the timer that would end
+%% the spin never fires, and the run spends its budget at one instant. On a real
+%% machine the spin costs time like anything else, and timers fire through it.
+%% Recorded as a `clock` entry like any other advance, so a replay takes it in
+%% the same place.
+busy(R = #r{sched = Sched, trace = Trace}) ->
+    case eta_time:advance_to_next(schedulable(Sched)) of
+        true ->
+            Now = eta_time:now_ms(),
+            _ = eta_log:log({clock, Now}),
+            Created = eta_sched:take_adopted(Sched),
+            loop(spend(R#r{trace = [entry(clock, Now, Created) | Trace]}));
+        false ->
+            %% Nothing pending: spinning is all there is, and the budget will say so.
+            loop(R#r{busy = 0})
+    end.
+
+loop_step(R, Runnable, OpsLeft) ->
+    case choose(R, Runnable, OpsLeft > 0) of
         {step, Id, R1} -> after_action(do_step(R1, Id));
         {op, R1} -> after_action(do_op(R1));
         {idle, R1} -> idle(R1)
     end.
+
+%% Whether the harness says its settle phase has what it was waiting for. See
+%% `eta_harness`. Not asked during a replay, which ends where its trace's `final`
+%% entry says the run ended.
+settle_done(#r{mod = Mod, sut = Sut}) ->
+    erlang:function_exported(Mod, settle_done, 1) andalso Mod:settle_done(Sut) =:= true.
 
 %% What to do next. See the module doc on why the nothing-runnable case is the
 %% interesting one.
@@ -873,9 +920,16 @@ apply_op(R, Op) ->
         ops_left = R#r.ops_left - 1
     }).
 
-spend(R = #r{budget = B, since_check = N, ops_left = 0, settle_left = S}) ->
+spend(R = #r{trace = [{clock, _} | _]}) ->
+    spend1(R#r{busy = 0});
+spend(R = #r{trace = [{clock, _, _} | _]}) ->
+    spend1(R#r{busy = 0});
+spend(R = #r{busy = Busy}) ->
+    spend1(R#r{busy = Busy + 1}).
+
+spend1(R = #r{budget = B, since_check = N, ops_left = 0, settle_left = S}) ->
     R#r{budget = B - 1, since_check = N + 1, settle_left = max(0, S - 1)};
-spend(R = #r{budget = B, since_check = N}) ->
+spend1(R = #r{budget = B, since_check = N}) ->
     R#r{budget = B - 1, since_check = N + 1}.
 
 %% Invariants, every `check_every` actions.

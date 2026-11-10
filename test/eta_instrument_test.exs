@@ -230,4 +230,47 @@ defmodule EtaInstrumentTest do
     refute_receive {:forwarded, _}, 100
     GenServer.stop(pid)
   end
+  # OTP 28's supervisor arms a real one-second hibernate timer on every callback
+  # it returns. When that fires is up to the wall clock, so the supervisor
+  # becomes runnable wherever the run happens to be and the run doesn't replay.
+  describe "OTP's supervisor, instrumented" do
+    defp transformed(source) do
+      {:ok, tokens, _} = :erl_scan.string(String.to_charlist(source))
+
+      forms =
+        tokens
+        |> Enum.chunk_while([], fn
+          {:dot, _} = t, acc -> {:cont, Enum.reverse([t | acc]), []}
+          t, acc -> {:cont, [t | acc]}
+        end, fn acc -> {:cont, acc} end)
+        |> Enum.map(fn form -> {:ok, f} = :erl_parse.parse_form(form); f end)
+
+      :eta_transform.parse_transform(forms, [])
+    end
+
+    defp hibernate_clauses(forms) do
+      for {:function, _, :hibernate_after_action, 1, clauses} <- forms, do: clauses
+    end
+
+    test "never asks to hibernate" do
+      forms =
+        transformed("""
+        -module(supervisor).
+        hibernate_after_action(S) -> {timeout, element(2, S), {hibernate, make_ref()}}.
+        """)
+
+      assert [[{:clause, _, [{:var, _, :_}], [], [{:atom, _, :infinity}]}]] =
+               hibernate_clauses(forms)
+    end
+
+    test "leaves a function of that name alone in any other module" do
+      forms =
+        transformed("""
+        -module(not_supervisor).
+        hibernate_after_action(S) -> {timeout, element(2, S), {hibernate, make_ref()}}.
+        """)
+
+      assert [[{:clause, _, [{:var, _, :S}], [], [{:tuple, _, _}]}]] = hibernate_clauses(forms)
+    end
+  end
 end

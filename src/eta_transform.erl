@@ -137,6 +137,25 @@ simulation.
 | `timer:sleep/1` | `eta_time:sleep/1` |
 | `calendar:universal_time/0` | `eta_time:universal_time/0` |
 | `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`, `seed/1,2` | `eta_rand:*` |
+| `erlang:is_process_alive/1` | `eta_sched:is_alive/1` |
+| `proc_lib:start/3,4,5`, `start_link/3,4,5`, `start_monitor/3,4,5` | `eta_sched:plib_start*` |
+| `gen:start/5,6` | `eta_sched:gen_start/5,6` |
+| `application:start/1,2`, `ensure_all_started/1,2,3` | `eta_app:*` |
+| `file:read_file/1`, `write_file/2,3`, `make_dir/1`, `del_dir/1`, `delete/1`, `rename/2`, `list_dir/1`, `read_file_info/1,2`, `read_link_info/1,2`, `get_cwd/0` | `eta_file:*` |
+| `filelib:ensure_dir/1`, `is_file/1`, `is_dir/1`, `is_regular/1` | `eta_file:*` |
+| `dets:open_file/2`, `close/1`, `sync/1`, `lookup/2`, `member/2`, `insert/2`, `delete/2`, `delete_all_objects/1`, `select/2`, `select_delete/2`, `foldl/3`, `to_ets/2`, `info/2` | `eta_dets:*` |
+
+Each of the last group is a call that waits on a process the scheduler doesn't
+own, or a process that never runs:
+
+- **`is_process_alive/1`** on another process is a signal the target answers when
+  it next runs, and under a run it is suspended.
+- **`proc_lib`'s starts and `gen:start`** spawn inside OTP, so the child is adopted
+  with nothing in its mailbox and never runs. `gen:start` is the start every
+  `gen`-based behaviour goes through, a library's own included.
+- **`application` starts, `file_server`'s `file` functions and `dets`** are calls
+  into VM services: `application_controller`, `file_server_2`, and a DETS table's
+  own process.
 
 ## Sending
 
@@ -154,7 +173,7 @@ The network pass rewrites, unless the module declares `-eta_net(false)`:
 | `gen_fsm:reply/2` | `eta_net:reply/2` |
 | `erlang:monitor/2,3` | `eta_net:monitor/2,3` |
 | `erlang:demonitor/1,2` | `eta_net:demonitor/1,2` |
-| `erlang:node/0,1`, `nodes/0,1`, `is_alive/0`, `disconnect_node/1` | `eta_net`, same names |
+| `erlang:node/0,1`, `nodes/0,1`, `is_alive/0`, `disconnect_node/1`, `monitor_node/2,3` | `eta_net`, same names |
 | `erlang:send_nosuspend/2,3` | `eta_net:send_nosuspend/2,3` |
 | `net_kernel:monitor_nodes/1,2`, `connect_node/1` | `eta_net`, same names |
 | `net_kernel:disconnect(Node)` | `eta_net:disconnect_node/1` |
@@ -162,6 +181,23 @@ The network pass rewrites, unless the module declares `-eta_net(false)`:
 | Elixir's `Node.self/0`, `list/0,1`, `connect/1`, `disconnect/1`, `ping/1`, `alive?/0` | `eta_net`'s equivalents |
 
 `!` is the one rewrite that is not a call.
+
+**Namespaces and `rpc`.** The same pass gives each simulated node its own
+registered names, named ETS tables and `persistent_term` keys, and runs `rpc` and
+`erpc` on the node they name:
+
+| From | To |
+|---|---|
+| `erlang:register/2`, `unregister/1`, `whereis/1`, `registered/0`, `process_info/2` | `eta_ns`, same names |
+| `ets:new/2` | `eta_ns:ets_new/2` |
+| `ets:F(Tab, ...)`, for every function that takes a table | the same call, with `eta_ns:tab(Tab)` |
+| `persistent_term:get/1,2`, `put/2`, `erase/1` | `eta_ns:pt_get/1,2`, `pt_put/2`, `pt_erase/1` |
+| a name passed to `gen:call`, `sys`, `supervisor`, a `stop`, or a timer | the same call, with `eta_ns:dest(Name)` |
+| `rpc:call/4,5`, `rpc:cast/4` | `eta_rpc`, same names |
+| `erpc:call/2,3,4,5`, `erpc:cast/2,4` | `eta_rpc:erpc_call`, `erpc_cast` |
+
+`process_info/2` asking for anything but `registered_name` is left alone. See
+`eta_ns` and `eta_rpc`.
 
 **Why node identity is in this pass.** Every simulated node is the same real
 node, so a system asking `node()` gets one answer for the whole cluster, and one
@@ -238,7 +274,7 @@ discoverable by using it instead of by reading a table.
 | `gen_statem`'s `send_request`/`wait_response`/`receive_response`/`check_response` | the same |
 | `gen_fsm`'s `sync_send_event`/`sync_send_all_state_event` | the same |
 | every client-side function of `gen_event` | the same |
-| `erlang:monitor_node/2,3`, `erlang:nodes/2`, Elixir's `Node.monitor/2,3` | the same |
+| `erlang:nodes/2`, Elixir's `Node.monitor/2,3` | the same |
 | a module declaring `-behaviour(gen_event)` | at **compile** time |
 | `node(X)` in a guard | at **compile** time |
 
@@ -296,11 +332,11 @@ while a scheduler is active and calls the original otherwise.
 %% `{Module, Function, Arity} => Target`, where `Target` is either a module (the
 %% function name is kept) or `{Module, Function}` (both are replaced).
 %%
-%% The distributed forms — `spawn(Node, Fun)` and friends — are rewritten too, but
-%% to functions that **raise while a run is active**. `eta` does not simulate
-%% distribution, and there is no honest local rewrite: running the child here puts
-%% it on the wrong node, and letting it through puts it outside the schedule. See
-%% `eta_sched:no_dist/3`.
+%% The distributed forms — `spawn(Node, Fun)` and friends — are rewritten too.
+%% Between simulated nodes they spawn on the named node, as `eta_rpc` does for an
+%% `rpc`; anywhere else they **raise while a run is active**, because there is no
+%% honest local rewrite: running the child here puts it on the wrong node, and
+%% letting it through puts it outside the schedule. See `eta_sched:dist/5`.
 -define(REWRITES, #{
     {erlang, send_after, 3} => eta_time,
     {erlang, send_after, 4} => eta_time,
@@ -361,6 +397,21 @@ while a scheduler is active and calls the original otherwise.
     {proc_lib, spawn_link, 3} => {eta_sched, plib_spawn_link},
     {proc_lib, spawn_opt, 2} => {eta_sched, plib_spawn_opt},
     {proc_lib, spawn_opt, 4} => {eta_sched, plib_spawn_opt},
+    %% `proc_lib`'s starts spawn inside OTP too, so the child would be adopted
+    %% with an empty mailbox and never run. See `eta_sched:plib_start/5`.
+    {proc_lib, start, 3} => {eta_sched, plib_start},
+    {proc_lib, start, 4} => {eta_sched, plib_start},
+    {proc_lib, start, 5} => {eta_sched, plib_start},
+    {proc_lib, start_link, 3} => {eta_sched, plib_start_link},
+    {proc_lib, start_link, 4} => {eta_sched, plib_start_link},
+    {proc_lib, start_link, 5} => {eta_sched, plib_start_link},
+    {proc_lib, start_monitor, 3} => {eta_sched, plib_start_monitor},
+    {proc_lib, start_monitor, 4} => {eta_sched, plib_start_monitor},
+    {proc_lib, start_monitor, 5} => {eta_sched, plib_start_monitor},
+    %% The start every `gen`-based behaviour goes through. See
+    %% `eta_sched:gen_start/6`.
+    {gen, start, 5} => {eta_sched, gen_start},
+    {gen, start, 6} => {eta_sched, gen_start},
     %% `gen_server` starts its child inside OTP, where no transform reaches — the
     %% chain is gen:do_spawn/5 -> proc_lib:start_monitor/5 -> erlang:spawn_opt.
     %% `eta_sched` builds an equivalent child instead, gated from birth. See
@@ -380,6 +431,50 @@ while a scheduler is active and calls the original otherwise.
     {proc_lib, spawn_link, 4} => {eta_sched, plib_spawn_link},
     {proc_lib, spawn_opt, 3} => {eta_sched, plib_spawn_opt},
     {proc_lib, spawn_opt, 5} => {eta_sched, plib_spawn_opt},
+    %% A DETS table is a process of its own under `kernel`, and every call a
+    %% message to it. See `eta_dets`.
+    {dets, open_file, 2} => eta_dets,
+    {dets, close, 1} => eta_dets,
+    {dets, sync, 1} => eta_dets,
+    {dets, lookup, 2} => eta_dets,
+    {dets, member, 2} => eta_dets,
+    {dets, insert, 2} => eta_dets,
+    {dets, delete, 2} => eta_dets,
+    {dets, delete_all_objects, 1} => eta_dets,
+    {dets, select, 2} => eta_dets,
+    {dets, select_delete, 2} => eta_dets,
+    {dets, foldl, 3} => eta_dets,
+    {dets, to_ets, 2} => eta_dets,
+    {dets, info, 2} => eta_dets,
+    %% These ask `file_server`, which the scheduler doesn't own. `prim_file`
+    %% does the same work in the calling process. See `eta_file`.
+    {file, read_file, 1} => eta_file,
+    {file, write_file, 2} => eta_file,
+    {file, write_file, 3} => eta_file,
+    {file, make_dir, 1} => eta_file,
+    {file, del_dir, 1} => eta_file,
+    {file, delete, 1} => eta_file,
+    {file, rename, 2} => eta_file,
+    {file, list_dir, 1} => eta_file,
+    {file, read_file_info, 1} => eta_file,
+    {file, read_file_info, 2} => eta_file,
+    {file, read_link_info, 1} => eta_file,
+    {file, read_link_info, 2} => eta_file,
+    {file, get_cwd, 0} => eta_file,
+    {filelib, ensure_dir, 1} => eta_file,
+    {filelib, is_file, 1} => eta_file,
+    {filelib, is_dir, 1} => eta_file,
+    {filelib, is_regular, 1} => eta_file,
+    %% Asking whether another process is alive waits for that process to run,
+    %% and under a run it is suspended. See `eta_sched:is_alive/1`.
+    {erlang, is_process_alive, 1} => {eta_sched, is_alive},
+    %% Starting an application is a call into `application_controller`, which
+    %% the scheduler does not own. See `eta_app`.
+    {application, start, 1} => eta_app,
+    {application, start, 2} => eta_app,
+    {application, ensure_all_started, 1} => eta_app,
+    {application, ensure_all_started, 2} => eta_app,
+    {application, ensure_all_started, 3} => eta_app,
     %% `logger` hands every event to a handler process the scheduler does not own,
     %% and under load that handoff turns synchronous. See `eta_logger`.
     {logger, emergency, 1} => eta_logger,
@@ -575,7 +670,33 @@ parse_transform(Forms, _Options) ->
     %% last also means its own wrapper sits outermost, which is the right order —
     %% the state is published and the replies are sent before the action list is
     %% read for time-outs.
-    fsm_timeout_pass(statem_timeout_pass(observe_pass(after_pass(net_pass(Rewritten, Locals))))).
+    fsm_timeout_pass(
+        statem_timeout_pass(
+            observe_pass(after_pass(net_pass(supervisor_pass(Rewritten), Locals)))
+        )
+    ).
+
+%% OTP 28's `supervisor` hibernates after a second without a message: every
+%% callback it returns carries `{timeout, 1000, {hibernate, Tag}}`, which
+%% `gen_server` arms with a real `erlang:start_timer/3`. When it fires is up to
+%% the wall clock, so a supervisor that took a call becomes runnable a second of
+%% *real* time later, wherever the run has got to by then, and the run doesn't
+%% replay. Hibernating changes how the supervisor waits and nothing about what it
+%% does, so the instrumented `supervisor` never asks: the action is `infinity`.
+supervisor_pass(Forms) ->
+    case lists:keyfind(module, 3, [F || {attribute, _, module, _} = F <- Forms]) of
+        {attribute, _, module, supervisor} ->
+            [never_hibernate(F) || F <- Forms];
+        _ ->
+            Forms
+    end.
+
+never_hibernate({function, Anno, hibernate_after_action, 1, _}) ->
+    {function, Anno, hibernate_after_action, 1, [
+        {clause, Anno, [{var, Anno, '_'}], [], [{atom, Anno, infinity}]}
+    ]};
+never_hibernate(Form) ->
+    Form.
 
 %% Every `{Name, Arity}` the module defines itself. Needed to decide whether an
 %% unqualified `spawn(F)` is the auto-imported BIF or the module's own function.
@@ -607,15 +728,31 @@ walk(Node, _Locals) ->
 %%
 %% Guarded on the module not defining the name itself, which is the condition the
 %% original rule was really protecting.
+%% Auto-imported BIFs other than the spawns that the unconditional pass rewrites
+%% when written bare, on the same terms: the module must not define the name.
+-define(AUTO_BIFS, #{{is_process_alive, 1} => {eta_sched, is_alive}}).
+
+%%
+%% The distributed forms are auto-imported too, and the same argument applies:
+%% a bare `spawn(Node, M, F, A)` left alone runs ungated. `locks` writes its
+%% watcher spawn that way.
 -define(AUTO_SPAWNS, [
     {spawn, 1},
+    {spawn, 2},
     {spawn, 3},
+    {spawn, 4},
     {spawn_link, 1},
+    {spawn_link, 2},
     {spawn_link, 3},
+    {spawn_link, 4},
     {spawn_monitor, 1},
+    {spawn_monitor, 2},
     {spawn_monitor, 3},
+    {spawn_monitor, 4},
     {spawn_opt, 2},
-    {spawn_opt, 4}
+    {spawn_opt, 3},
+    {spawn_opt, 4},
+    {spawn_opt, 5}
 ]).
 
 %% `erlang:apply(M, F, Args)` with literal `M` and `F` — the shape kernel's
@@ -667,7 +804,15 @@ rewrite({call, Anno, {atom, FAnno, Fun}, Args}, Locals) ->
         true ->
             {call, Anno, {remote, Anno, {atom, Anno, eta_sched}, {atom, FAnno, Fun}}, Args};
         false ->
-            {call, Anno, {atom, FAnno, Fun}, Args}
+            case maps:find(Key, ?AUTO_BIFS) of
+                {ok, {M, F}} ->
+                    case sets:is_element(Key, Locals) of
+                        false -> {call, Anno, {remote, Anno, {atom, Anno, M}, {atom, FAnno, F}}, Args};
+                        true -> {call, Anno, {atom, FAnno, Fun}, Args}
+                    end;
+                error ->
+                    {call, Anno, {atom, FAnno, Fun}, Args}
+            end
     end;
 rewrite(Node, _Locals) ->
     Node.
@@ -747,6 +892,8 @@ rewrite(Node, _Locals) ->
     {erlang, nodes, 1} => eta_net,
     {erlang, is_alive, 0} => eta_net,
     {erlang, disconnect_node, 1} => eta_net,
+    {erlang, monitor_node, 2} => eta_net,
+    {erlang, monitor_node, 3} => eta_net,
     {erlang, send_nosuspend, 2} => eta_net,
     {erlang, send_nosuspend, 3} => eta_net,
     {net_kernel, monitor_nodes, 1} => eta_net,
@@ -763,15 +910,114 @@ rewrite(Node, _Locals) ->
     {'Elixir.Node', connect, 1} => {eta_net, connect_node},
     {'Elixir.Node', disconnect, 1} => {eta_net, disconnect_node},
     {'Elixir.Node', ping, 1} => {eta_net, ping},
-    {'Elixir.Node', 'alive?', 0} => {eta_net, is_alive}
+    {'Elixir.Node', 'alive?', 0} => {eta_net, is_alive},
+    %% A namespace per simulated node: one VM has one registry, one ETS namespace
+    %% and one `persistent_term`, so a system that runs on every node collides
+    %% with itself. See `eta_ns`. ETS calls that name a table keep their target
+    %% and have the table argument wrapped instead; see `?NET_WRAP`.
+    {erlang, register, 2} => eta_ns,
+    {erlang, unregister, 1} => eta_ns,
+    {erlang, whereis, 1} => eta_ns,
+    {erlang, registered, 0} => eta_ns,
+    {erlang, process_info, 2} => eta_ns,
+    {ets, new, 2} => {eta_ns, ets_new},
+    {persistent_term, get, 1} => {eta_ns, pt_get},
+    {persistent_term, get, 2} => {eta_ns, pt_get},
+    {persistent_term, put, 2} => {eta_ns, pt_put},
+    {persistent_term, erase, 1} => {eta_ns, pt_erase},
+    %% `rpc` and `erpc` to a simulated node run on it, over the network. See
+    %% `eta_rpc`.
+    {rpc, call, 4} => eta_rpc,
+    {rpc, call, 5} => eta_rpc,
+    {rpc, cast, 4} => eta_rpc,
+    {erpc, call, 2} => {eta_rpc, erpc_call},
+    {erpc, call, 3} => {eta_rpc, erpc_call},
+    {erpc, call, 4} => {eta_rpc, erpc_call},
+    {erpc, call, 5} => {eta_rpc, erpc_call},
+    {erpc, cast, 2} => {eta_rpc, erpc_cast},
+    {erpc, cast, 4} => {eta_rpc, erpc_cast}
 }).
+
+%% Calls that keep their target but have one argument resolved in the caller's
+%% namespace first: `{Position, Resolver}`, where the resolver is an `eta_ns`
+%% function. `tab` for an ETS table, `dest` for a process a call sends to without
+%% going through `eta_net`, and `name` for a name being registered.
+%%
+%% Wrapping rather than retargeting, because these are many functions with one
+%% thing in common: a name that means something different on each simulated node.
+-define(ETS_TABLE_FIRST, [
+    {delete, 1}, {delete, 2}, {delete_all_objects, 1}, {delete_object, 2},
+    {first, 1}, {first_lookup, 1}, {give_away, 3}, {info, 1}, {info, 2},
+    {insert, 2}, {insert_new, 2}, {last, 1}, {last_lookup, 1}, {lookup, 2},
+    {lookup_element, 3}, {lookup_element, 4}, {match, 2}, {match, 3},
+    {match_delete, 2}, {match_object, 2}, {match_object, 3}, {member, 2},
+    {next, 2}, {next_lookup, 2}, {prev, 2}, {prev_lookup, 2}, {rename, 2},
+    {safe_fixtable, 2}, {select, 2}, {select, 3}, {select_count, 2},
+    {select_delete, 2}, {select_replace, 2}, {select_reverse, 2},
+    {select_reverse, 3}, {setopts, 2}, {slot, 2}, {tab2file, 2}, {tab2file, 3},
+    {tab2list, 1}, {take, 2}, {update_counter, 3}, {update_counter, 4},
+    {update_element, 3}, {update_element, 4}, {whereis, 1}
+]).
+
+-define(SYS_FIRST, [
+    {get_state, 1}, {get_state, 2}, {get_status, 1}, {get_status, 2},
+    {replace_state, 2}, {replace_state, 3}, {suspend, 1}, {suspend, 2},
+    {resume, 1}, {resume, 2}, {terminate, 2}, {terminate, 3}, {trace, 2},
+    {statistics, 2}
+]).
+
+-define(SUP_FIRST, [
+    {start_child, 2}, {restart_child, 2}, {delete_child, 2},
+    {terminate_child, 2}, {which_children, 1}, {count_children, 1},
+    {get_childspec, 2}
+]).
+
+net_wrap() ->
+    maps:from_list(
+        [{{ets, F, A}, {1, tab}} || {F, A} <- ?ETS_TABLE_FIRST] ++
+            [
+                {{ets, foldl, 3}, {3, tab}},
+                {{ets, foldr, 3}, {3, tab}},
+                %% The ETS reads `?REWRITES` already pointed at `eta_ets`.
+                {{eta_ets, tab2list, 1}, {1, tab}},
+                {{eta_ets, select, 2}, {1, tab}},
+                {{eta_ets, match, 2}, {1, tab}},
+                {{eta_ets, match_object, 2}, {1, tab}},
+                {{eta_ets, foldl, 3}, {3, tab}},
+                %% Timers, already `eta_time`'s by the time this pass runs, keep
+                %% a name a name, so it is resolved when the timer fires.
+                {{eta_time, send_after, 3}, {2, dest}},
+                {{eta_time, send_after, 4}, {2, dest}},
+                {{eta_time, start_timer, 3}, {2, dest}},
+                {{eta_time, start_timer, 4}, {2, dest}},
+                {{gen, call, 3}, {1, dest}},
+                {{gen, call, 4}, {1, dest}},
+                {{gen_server, stop, 1}, {1, dest}},
+                {{gen_server, stop, 3}, {1, dest}},
+                {{gen_statem, stop, 1}, {1, dest}},
+                {{gen_statem, stop, 3}, {1, dest}},
+                {{proc_lib, stop, 1}, {1, dest}},
+                {{proc_lib, stop, 3}, {1, dest}},
+                {{'Elixir.GenServer', stop, 1}, {1, dest}},
+                {{'Elixir.GenServer', stop, 2}, {1, dest}},
+                {{'Elixir.GenServer', stop, 3}, {1, dest}},
+                {{'Elixir.GenServer', whereis, 1}, {1, dest}},
+                {{'Elixir.Process', whereis, 1}, {1, dest}},
+                {{'Elixir.Process', register, 2}, {2, name}}
+            ] ++
+            [{{sys, F, A}, {1, dest}} || {F, A} <- ?SYS_FIRST] ++
+            [{{supervisor, F, A}, {1, dest}} || {F, A} <- ?SUP_FIRST] ++
+            [{{'Elixir.Supervisor', F, A}, {1, dest}} || {F, A} <- ?SUP_FIRST]
+    ).
+
+
 
 %% Client-side messaging `eta_net` does not implement yet.
 %%
 %% Each is rewritten to `eta_net:unsupported/2`, which raises **while a network is
 %% running** and otherwise calls the original. Same position `eta_sched` takes on
-%% the distributed spawn forms, and for the same reason: there is no honest local
-%% rewrite, and silently letting the call through would mean a run states a fault
+%% a distributed spawn it cannot place on a simulated node, and for the same
+%% reason: there is no honest local rewrite, and silently letting the call through would mean a run states a fault
 %% model that quietly does not cover a channel.
 %%
 %% Raising at runtime rather than at compile time is deliberate. A module may hold
@@ -846,10 +1092,25 @@ rewrite(Node, _Locals) ->
     {gen_event, receive_response, 3},
     {gen_event, check_response, 2},
     {gen_event, check_response, 3},
-    %% Per-node monitoring and `nodes/2`'s info lists: membership `eta_net` does
-    %% not model yet. `monitor_nodes/1,2` is the supported way to watch nodes.
-    {erlang, monitor_node, 2},
-    {erlang, monitor_node, 3},
+    %% `rpc` and `erpc` beyond a single call or cast. See `eta_rpc`.
+    {rpc, multicall, 3},
+    {rpc, multicall, 4},
+    {rpc, multicall, 5},
+    {rpc, block_call, 4},
+    {rpc, block_call, 5},
+    {rpc, async_call, 4},
+    {rpc, abcast, 2},
+    {rpc, abcast, 3},
+    {rpc, sbcast, 2},
+    {rpc, sbcast, 3},
+    {erpc, multicall, 2},
+    {erpc, multicall, 3},
+    {erpc, multicall, 4},
+    {erpc, multicall, 5},
+    {erpc, send_request, 2},
+    {erpc, send_request, 4},
+    %% `nodes/2`'s info lists and Elixir's `Node.monitor/2,3`: membership `eta_net`
+    %% does not model yet.
     {erlang, nodes, 2},
     {'Elixir.Node', monitor, 2},
     {'Elixir.Node', monitor, 3}
@@ -1141,7 +1402,14 @@ net_walk(Node, _Locals) ->
     {nodes, 0},
     {nodes, 1},
     {is_alive, 0},
-    {disconnect_node, 1}
+    {disconnect_node, 1},
+    {monitor_node, 2},
+    {monitor_node, 3},
+    {register, 2},
+    {unregister, 1},
+    {whereis, 1},
+    {registered, 0},
+    {process_info, 2}
 ]).
 
 %% `Dest ! Msg` is `{op, Anno, '!', Dest, Msg}` — the one rewrite here that is not
@@ -1161,7 +1429,8 @@ net_rewrite({call, Anno, {atom, FAnno, Fun}, Args}, Locals) ->
     Key = {Fun, length(Args)},
     case lists:member(Key, ?NET_AUTO) andalso not sets:is_element(Key, Locals) of
         true ->
-            {call, Anno, {remote, Anno, {atom, Anno, eta_net}, {atom, FAnno, Fun}}, Args};
+            %% A bare BIF is the `erlang` one, so it goes wherever that would.
+            net_rewrite_known(Anno, Anno, Anno, FAnno, erlang, Fun, Args);
         false ->
             {call, Anno, {atom, FAnno, Fun}, Args}
     end;
@@ -1364,7 +1633,19 @@ unsupported_call(Anno, Target, {M, F, A}, Args) ->
     ),
     {call, Anno, {remote, Anno, {atom, Anno, Target}, {atom, Anno, unsupported}}, [MFA, List]}.
 
-net_rewrite_known(Anno, RAnno, MAnno, FAnno, Mod, Fun, Args) ->
+%% `process_info/2` only has a namespace to answer for when it is asked for
+%% `registered_name`, so a call naming any other item stays the BIF — which is what
+%% lets a module measure its own stack without a frame of ours in the way.
+net_rewrite_known(Anno, RAnno, MAnno, FAnno, erlang, process_info, [_, {atom, _, Item}] = Args) when
+    Item =/= registered_name
+->
+    {call, Anno, {remote, RAnno, {atom, MAnno, erlang}, {atom, FAnno, process_info}}, Args};
+net_rewrite_known(Anno, RAnno, MAnno, FAnno, Mod, Fun, Args0) ->
+    Args =
+        case maps:find({Mod, Fun, length(Args0)}, net_wrap()) of
+            {ok, {Pos, Resolver}} -> wrap_arg(Anno, Pos, Resolver, Args0);
+            error -> Args0
+        end,
     case maps:find({Mod, Fun, length(Args)}, ?NET_REWRITES) of
         {ok, {Target, TargetFun}} ->
             {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, TargetFun}}, Args};
@@ -1373,6 +1654,11 @@ net_rewrite_known(Anno, RAnno, MAnno, FAnno, Mod, Fun, Args) ->
         error ->
             {call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}
     end.
+
+wrap_arg(Anno, Pos, Resolver, Args) ->
+    {Before, [Arg | After]} = lists:split(Pos - 1, Args),
+    Wrapped = {call, Anno, {remote, Anno, {atom, Anno, eta_ns}, {atom, Anno, Resolver}}, [Arg]},
+    Before ++ [Wrapped | After].
 
 %% ---------------------------------------------------------------------------
 %% Receive-timeout pass — applied only to a module declaring `-eta_after(true)`

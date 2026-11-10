@@ -65,7 +65,8 @@ start_link_named(Name, Owner) -> gen_server:start_link(Name, ?MODULE, Owner, [])
 start_named(Name, Owner) -> gen_server:start(Name, ?MODULE, Owner, []).
 start_monitor_named(Name, Owner) -> gen_server:start_monitor(Name, ?MODULE, Owner, []).
 
-%% The distributed forms. Every one of these must raise while a run is active.
+%% The distributed forms. Called from a process on no simulated node, every one
+%% of these must raise while a run is active.
 remote(Node, To) -> erlang:spawn(Node, fun() -> announce(To) end).
 remote_mfa(Node, To) -> erlang:spawn(Node, ?MODULE, announce, [To]).
 remote_link(Node, To) -> erlang:spawn_link(Node, fun() -> announce(To) end).

@@ -304,6 +304,32 @@ defmodule DstRunTest do
     end
   end
 
+  describe "busy_steps" do
+    # The clock moves only when nothing is runnable. A process that is always
+    # runnable holds it still, and the ticker beside it never ticks.
+    @busy %{seed: 1, max_ops: 1, max_steps: 20_000, settle_steps: 2_000}
+
+    defp ticks, do: :ets.lookup_element(:eta_final_sut, :ticks, 2)
+
+    test "without it, a spinning process stops the clock" do
+      config = %{tick_ms: 5, spin: true}
+      assert %{outcome: :ok} = @run.run(:eta_final_sut, Map.put(@busy, :config, config))
+      # The operation that starts the spin may wait for the clock once first.
+      # After it, nothing ticks.
+      assert ticks() <= 1
+    end
+
+    test "with it, time passes through the spin and timers fire" do
+      opts = Map.merge(@busy, %{config: %{tick_ms: 5, spin: true}, busy_steps: 100})
+      original = @run.run(:eta_final_sut, opts)
+      assert original.outcome == :ok
+      assert ticks() > 1, "the clock never moved through the spin"
+
+      replayed = @run.replay(:eta_final_sut, original.trace, opts)
+      assert replayed.trace == original.trace
+    end
+  end
+
   describe "check_final" do
     # The callback for properties that are only true once the system has stopped
     # being driven. "Exactly one leader per partition" is false for a moment
@@ -330,6 +356,26 @@ defmodule DstRunTest do
 
       assert [{:final_called, :settle_budget}] =
                :ets.lookup(:eta_final_sut, :final_called)
+    end
+
+    test "settle_done/1 ends the settle phase when the harness has what it needs" do
+      # A system that never stops would otherwise spend the whole settle budget
+      # on every run, sized for its slowest recovery.
+      assert %{outcome: :ok, steps: steps} =
+               final_run(%{tick_ms: 5, done_ticks: 3}, %{settle_steps: 10_000})
+
+      assert [{:final_called, :settle_done}] = :ets.lookup(:eta_final_sut, :final_called)
+      assert steps < 100
+    end
+
+    test "a run that ended on settle_done replays to the same ending" do
+      opts = Map.merge(@final, %{config: %{tick_ms: 5, done_ticks: 3}, settle_steps: 10_000})
+      original = @run.run(:eta_final_sut, opts)
+      assert List.last(original.trace) == {:final, :settle_done}
+
+      replayed = @run.replay(:eta_final_sut, original.trace, opts)
+      assert replayed.outcome == original.outcome
+      assert replayed.trace == original.trace
     end
 
     test "its violation ends the run like any other" do

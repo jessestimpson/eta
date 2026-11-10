@@ -186,7 +186,7 @@ defmodule EtaSpawnTest do
   end
 
   describe "the distributed forms" do
-    test "raise while a run is active, rather than running locally" do
+    test "raise while a run is active, from a process on no simulated node" do
       sched = :eta_sched.new(%{seed: 1})
 
       try do
@@ -210,7 +210,7 @@ defmodule EtaSpawnTest do
           end
 
         assert mfa == {:erlang, :spawn, 2}
-        assert hint =~ "does not simulate distribution"
+        assert hint =~ "only between simulated nodes"
       after
         :eta_sched.release(sched)
       end
