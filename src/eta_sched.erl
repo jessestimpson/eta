@@ -1907,6 +1907,11 @@ do_register(St = #st{ids = Ids, gated = Gated}, Pid) when is_pid(Pid) ->
             %% would otherwise take the run down for something that is nothing.
             try
                 erlang:trace(Pid, true, ?TRACE_FLAGS),
+                %% Before the suspend, and from here rather than from whoever
+                %% first sends to it: finding out who spawned a process means
+                %% asking it, and an asker that is being stepped ends its step
+                %% by waiting for the answer. See `eta_net:introduce/1`.
+                ok = eta_net:introduce(Pid),
                 erlang:suspend_process(Pid),
                 St1 = adopt(St, Pid),
                 %% A gated child is waiting for a token only the scheduler can

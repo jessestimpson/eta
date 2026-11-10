@@ -104,6 +104,77 @@ defmodule EtaNetTest do
     :ok
   end
 
+  # Runs `fun` in a fresh process and returns `{result, calls}`, where `calls`
+  # is every call that process made to the function `mfa` names, as argument
+  # lists. Call tracing rather than sampling, so "it did not ask" is an
+  # observation and not the absence of one.
+  defp calls_to({m, f, a} = mfa, fun) do
+    me = self()
+    ref = make_ref()
+
+    pid =
+      spawn(fn ->
+        receive do
+          :go -> send(me, {ref, fun.()})
+        end
+      end)
+
+    _ = :erlang.trace_pattern(mfa, true, [:global])
+    1 = :erlang.trace(pid, true, [:call])
+    send(pid, :go)
+
+    result =
+      receive do
+        {^ref, result} -> result
+      after
+        2_000 -> flunk("no answer from the traced process")
+      end
+
+    delivered = :erlang.trace_delivered(pid)
+
+    receive do
+      {:trace_delivered, ^pid, ^delivered} -> :ok
+    after
+      2_000 -> flunk("trace was not delivered")
+    end
+
+    _ = :erlang.trace_pattern(mfa, false, [:global])
+    {result, traced_calls(pid, m, f, a, [])}
+  end
+
+  defp traced_calls(pid, m, f, a, acc) do
+    receive do
+      {:trace, ^pid, :call, {^m, ^f, args}} when length(args) == a ->
+        traced_calls(pid, m, f, a, [args | acc])
+    after
+      0 -> :lists.reverse(acc)
+    end
+  end
+
+  # A process `spawner` spawned, which nothing has placed.
+  defp child_of(spawner) do
+    me = self()
+    send(spawner, {:__spawn__, me})
+
+    receive do
+      {:__spawned__, child} -> child
+    after
+      2_000 -> flunk("no child from the spawner")
+    end
+  end
+
+  defp spawner do
+    spawn(fn -> spawner_loop() end)
+  end
+
+  defp spawner_loop do
+    receive do
+      {:__spawn__, to} ->
+        send(to, {:__spawned__, spawn(fn -> Process.sleep(:infinity) end)})
+        spawner_loop()
+    end
+  end
+
   # Issue a call *from* a placed process, and report what happened. The refusal is
   # an `error/1` raised in the caller, so it has to be caught where it is raised.
   defp call_from(from, dest, msg) do
@@ -853,6 +924,99 @@ defmodule EtaNetTest do
     end
   end
 
+  describe "who spawned a process" do
+    # `node_of/1` answers for an unplaced process with its spawner's node, and
+    # the only way to learn a spawner is `process_info/2`. Against a process
+    # the scheduler has suspended that is a signal and a wait: the asker parks
+    # in `erts_internal:await_result/1`, the scheduler reads a parked process
+    # as one whose step is over, and the step ends in the middle of whatever
+    # the asker was doing. Every routed send asks, through `node_cut/2`. So
+    # the question is put once, by whoever can afford to wait, and remembered.
+
+    test "a process the scheduler owns is not asked" do
+      :ok = @net.start(%{seed: 1})
+      parent = spawner()
+      :ok = @net.place(:a, [parent])
+      child = child_of(parent)
+
+      sched = @sched.new(%{seed: 1})
+      @sched.register(sched, [child])
+
+      {node, asked} =
+        calls_to({:erlang, :process_info, 2}, fn ->
+          # A message first, as a sender has always just sent one: a process
+          # with a signal waiting is the one `process_info/2` cannot read
+          # without asking.
+          send(child, :hello)
+          @net.node_of(child)
+        end)
+
+      @sched.release(sched)
+
+      assert node == :a
+      assert asked == [], "node_of/1 asked a suspended process: #{inspect(asked)}"
+    end
+
+    test "a process nobody has introduced is asked once" do
+      :ok = @net.start(%{seed: 1})
+      parent = spawner()
+      :ok = @net.place(:a, [parent])
+      child = child_of(parent)
+
+      {nodes, asked} =
+        calls_to({:erlang, :process_info, 2}, fn ->
+          [@net.node_of(child), @net.node_of(child), @net.node_of(child)]
+        end)
+
+      assert nodes == [:a, :a, :a]
+      assert asked == [[child, :parent]]
+    end
+
+    test "the answer follows a spawner that is placed afterwards" do
+      # What is remembered is who spawned it, which never changes, and not
+      # where that was, which can.
+      :ok = @net.start(%{seed: 1})
+      parent = spawner()
+      child = child_of(parent)
+
+      assert @net.node_of(child) == :undefined
+      :ok = @net.place(:a, [parent])
+      assert @net.node_of(child) == :a
+      :ok = @net.place(:b, [parent])
+      assert @net.node_of(child) == :b
+    end
+
+    test "a child adopted from an unplaced parent is not asked either" do
+      # `eta_sched` reports every spawn it sees through `inherit/2`, parent
+      # placed or not, and that is the same fact.
+      :ok = @net.start(%{seed: 1})
+      parent = sink()
+      child = sink()
+      :ok = @net.inherit(parent, child)
+      :ok = @net.place(:a, [parent])
+
+      {node, asked} =
+        calls_to({:erlang, :process_info, 2}, fn -> @net.node_of(child) end)
+
+      assert node == :a
+      assert asked == []
+    end
+
+    test "remembering spawners is not a topology" do
+      # With nothing placed every link is faultable, and a table of who
+      # spawned whom must not count as something placed.
+      :ok = @net.start(%{seed: 1, policy: %{drop_p: 1.0}})
+      a = sink()
+      b = sink()
+      :ok = @net.inherit(a, b)
+      _ = @net.node_of(b)
+
+      :ok = send_from(a, b, :lost)
+      assert drained(b) == []
+      assert %{dropped: 1} = @net.stats()
+    end
+  end
+
   describe "simulated name registration" do
     # What lets a system under test keep its own addressing. Distributed Erlang
     # says `{Name, Node}` and lets the VM resolve it; one VM holds one registry,
@@ -974,6 +1138,64 @@ defmodule EtaNetTest do
       @net.stop()
 
       assert @net.whereis_name(:na, :the_server) == :undefined
+    end
+  end
+
+  describe "a name on a simulated node with nobody behind it" do
+    # The server died with its node, or was never started. `call/3` already
+    # answers `noproc` for this. The sends used to be handed to OTP instead,
+    # which takes `{Name, Node}` for a real node: `gen_server:cast/2` spawns a
+    # process to connect to it, outside the schedule, and a plain send tries
+    # the connection itself.
+
+    setup do
+      :ok = @net.start(%{seed: 1})
+      a = sink()
+      :ok = @net.place(:na, [a])
+      :ok = @net.place(:nb, [sink()])
+      :ok
+    end
+
+    test "a cast is dropped, and gen_server is not asked to deliver it" do
+      {result, handed_on} =
+        calls_to({:gen_server, :cast, 2}, fn -> @net.cast({:nobody_here, :nb}, :msg) end)
+
+      assert result == :ok
+      assert handed_on == []
+    end
+
+    test "a send is dropped, and returns the message as a send does" do
+      {result, handed_on} =
+        calls_to({:erlang, :send, 2}, fn -> @net.send({:nobody_here, :nb}, :msg) end)
+
+      assert result == :msg
+      # The traced process also sends its answer back to the test.
+      assert for([{:nobody_here, _}, _] = call <- handed_on, do: call) == []
+    end
+
+    test "gen_fsm events are dropped the same way" do
+      {result, handed_on} =
+        calls_to({:gen_fsm, :send_event, 2}, fn ->
+          @net.send_event({:nobody_here, :nb}, :ev)
+        end)
+
+      assert {result, handed_on} == {:ok, []}
+
+      {result, handed_on} =
+        calls_to({:gen_fsm, :send_all_state_event, 2}, fn ->
+          @net.send_all_state_event({:nobody_here, :nb}, :ev)
+        end)
+
+      assert {result, handed_on} == {:ok, []}
+    end
+
+    test "a name on a node the network has never heard of is still OTP's" do
+      # Not simulated, so not this module's to swallow.
+      {result, handed_on} =
+        calls_to({:gen_server, :cast, 2}, fn -> @net.cast({:nobody_here, :not_a_node}, :msg) end)
+
+      assert result == :ok
+      assert handed_on == [[{:nobody_here, :not_a_node}, :msg]]
     end
   end
 
