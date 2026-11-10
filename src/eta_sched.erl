@@ -699,9 +699,15 @@ gen_start(GenMod, LinkP, Mod, Args, Opts) ->
 
 %% `gen:do_spawn/5,6`, through the gated `proc_lib` starts.
 gen_spawn(GenMod, link, Rest, Opts) ->
-    plib_start_link(gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts));
+    plib_start_link(
+        gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)
+    );
 gen_spawn(GenMod, monitor, Rest, Opts) ->
-    case plib_start_monitor(gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)) of
+    case
+        plib_start_monitor(
+            gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)
+        )
+    of
         {{ok, Pid}, Mon} when is_pid(Pid) ->
             {ok, {Pid, Mon}};
         {Error, Mon} ->
@@ -711,7 +717,9 @@ gen_spawn(GenMod, monitor, Rest, Opts) ->
             Error
     end;
 gen_spawn(GenMod, _Nolink, Rest, Opts) ->
-    plib_start(gen, init_it, [GenMod, self(), self | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)).
+    plib_start(
+        gen, init_it, [GenMod, self(), self | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)
+    ).
 
 gen_timeout(Opts) -> proplists:get_value(timeout, Opts, infinity).
 gen_spawn_opts(Opts) -> proplists:get_value(spawn_opt, Opts, []).
@@ -862,9 +870,15 @@ plib_spawn_opt(N, F, O) ->
     end).
 
 plib_spawn_opt(N, M, F, A, O) ->
-    dist(N, {proc_lib, spawn_opt, 5}, {mfa, M, F, A}, fun(B) -> plib_spawn_opt_body(B, O) end, fun() ->
-        proc_lib:spawn_opt(N, M, F, A, O)
-    end).
+    dist(
+        N,
+        {proc_lib, spawn_opt, 5},
+        {mfa, M, F, A},
+        fun(B) -> plib_spawn_opt_body(B, O) end,
+        fun() ->
+            proc_lib:spawn_opt(N, M, F, A, O)
+        end
+    ).
 
 %% The local gated form each distributed form becomes, applied to a body.
 spawn_body({fn, F}) -> ?MODULE:spawn(F);

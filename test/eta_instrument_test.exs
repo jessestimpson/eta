@@ -230,6 +230,7 @@ defmodule EtaInstrumentTest do
     refute_receive {:forwarded, _}, 100
     GenServer.stop(pid)
   end
+
   # OTP 28's supervisor arms a real one-second hibernate timer on every callback
   # it returns. When that fires is up to the wall clock, so the supervisor
   # becomes runnable wherever the run happens to be and the run doesn't replay.
@@ -239,11 +240,18 @@ defmodule EtaInstrumentTest do
 
       forms =
         tokens
-        |> Enum.chunk_while([], fn
-          {:dot, _} = t, acc -> {:cont, Enum.reverse([t | acc]), []}
-          t, acc -> {:cont, [t | acc]}
-        end, fn acc -> {:cont, acc} end)
-        |> Enum.map(fn form -> {:ok, f} = :erl_parse.parse_form(form); f end)
+        |> Enum.chunk_while(
+          [],
+          fn
+            {:dot, _} = t, acc -> {:cont, Enum.reverse([t | acc]), []}
+            t, acc -> {:cont, [t | acc]}
+          end,
+          fn acc -> {:cont, acc} end
+        )
+        |> Enum.map(fn form ->
+          {:ok, f} = :erl_parse.parse_form(form)
+          f
+        end)
 
       :eta_transform.parse_transform(forms, [])
     end

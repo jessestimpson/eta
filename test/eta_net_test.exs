@@ -1667,7 +1667,14 @@ defmodule EtaNetTest do
       :ok = @net.start(%{seed: 1, policy: %{delay_p: 1.0, max_delay: 50}})
       s = sink()
       me = self()
-      helper = spawn(fn -> receive do: (:go -> @net.send(s, :from_helper); send(me, :sent)) end)
+
+      helper =
+        spawn(fn ->
+          receive do: (:go ->
+                         @net.send(s, :from_helper)
+                         send(me, :sent))
+        end)
+
       :ok = @net.place(:na, [me, helper])
       :ok = @net.place(:nb, [s])
 

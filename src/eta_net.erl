@@ -990,7 +990,8 @@ normalize({Name, Node}) when is_atom(Name) ->
         Pid ->
             Pid
     end;
-normalize(_) -> undefined.
+normalize(_) ->
+    undefined.
 
 %% A process holding `Name` in `Node`'s namespace, or holding the bare name while
 %% located on `Node`.
@@ -2157,7 +2158,8 @@ unheld_simulated_name({Name, Node}) when is_atom(Name) ->
             {true, noproc};
         _Here ->
             case is_node(Node) of
-                false -> false;
+                false ->
+                    false;
                 true ->
                     case connect_node(Node) of
                         true -> {true, noproc};
@@ -2579,8 +2581,11 @@ partition(A, B, Opts) ->
     ok = cut(B, A),
     ok = link_event(A, B, Opts),
     case learns(Opts) of
-        both -> ok;
-        _ -> true = ets:insert(?CHAN, {{one_sided, A, B}, Opts}), ok
+        both ->
+            ok;
+        _ ->
+            true = ets:insert(?CHAN, {{one_sided, A, B}, Opts}),
+            ok
     end.
 
 -if(?DOCATTRS).
