@@ -699,9 +699,15 @@ gen_start(GenMod, LinkP, Mod, Args, Opts) ->
 
 %% `gen:do_spawn/5,6`, through the gated `proc_lib` starts.
 gen_spawn(GenMod, link, Rest, Opts) ->
-    plib_start_link(gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts));
+    plib_start_link(
+        gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)
+    );
 gen_spawn(GenMod, monitor, Rest, Opts) ->
-    case plib_start_monitor(gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)) of
+    case
+        plib_start_monitor(
+            gen, init_it, [GenMod, self(), self() | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)
+        )
+    of
         {{ok, Pid}, Mon} when is_pid(Pid) ->
             {ok, {Pid, Mon}};
         {Error, Mon} ->
@@ -711,7 +717,9 @@ gen_spawn(GenMod, monitor, Rest, Opts) ->
             Error
     end;
 gen_spawn(GenMod, _Nolink, Rest, Opts) ->
-    plib_start(gen, init_it, [GenMod, self(), self | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)).
+    plib_start(
+        gen, init_it, [GenMod, self(), self | Rest], gen_timeout(Opts), gen_spawn_opts(Opts)
+    ).
 
 gen_timeout(Opts) -> proplists:get_value(timeout, Opts, infinity).
 gen_spawn_opts(Opts) -> proplists:get_value(spawn_opt, Opts, []).
@@ -862,9 +870,15 @@ plib_spawn_opt(N, F, O) ->
     end).
 
 plib_spawn_opt(N, M, F, A, O) ->
-    dist(N, {proc_lib, spawn_opt, 5}, {mfa, M, F, A}, fun(B) -> plib_spawn_opt_body(B, O) end, fun() ->
-        proc_lib:spawn_opt(N, M, F, A, O)
-    end).
+    dist(
+        N,
+        {proc_lib, spawn_opt, 5},
+        {mfa, M, F, A},
+        fun(B) -> plib_spawn_opt_body(B, O) end,
+        fun() ->
+            proc_lib:spawn_opt(N, M, F, A, O)
+        end
+    ).
 
 %% The local gated form each distributed form becomes, applied to a body.
 spawn_body({fn, F}) -> ?MODULE:spawn(F);
@@ -1893,6 +1907,11 @@ do_register(St = #st{ids = Ids, gated = Gated}, Pid) when is_pid(Pid) ->
             %% would otherwise take the run down for something that is nothing.
             try
                 erlang:trace(Pid, true, ?TRACE_FLAGS),
+                %% Before the suspend, and from here rather than from whoever
+                %% first sends to it: finding out who spawned a process means
+                %% asking it, and an asker that is being stepped ends its step
+                %% by waiting for the answer. See `eta_net:introduce/1`.
+                ok = eta_net:introduce(Pid),
                 erlang:suspend_process(Pid),
                 St1 = adopt(St, Pid),
                 %% A gated child is waiting for a token only the scheduler can

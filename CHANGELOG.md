@@ -97,6 +97,18 @@
 - A gated `supervisor` starts on OTP 28, whose `init/1` asks to hibernate when idle.
 - `eta_net` recognises any placed term as a node name. `partition/2` and its
   relatives took only atoms, so a binary name cut nothing and still returned `ok`.
+- `eta_net` no longer asks a suspended process who spawned it in the middle of a
+  send. `node_of/1` answers for an unplaced process with its spawner's node, and
+  found the spawner with `process_info/2` on every routed send. A stepped process
+  waiting for that answer looks like one whose step has finished, so the step
+  ended partway through a callback, with `timeouts` still 0. `eta_sched` now asks
+  once, from its own process, as it takes each process on, and the answer is
+  remembered. A run with unplaced processes on a network no longer loses about one
+  seed in forty to this.
+- A cast, a send or a `gen_fsm` event to `{Name, Node}`, where `Node` is a
+  simulated node and nothing is registered as `Name` there, is dropped. It was
+  handed to OTP, which took `Node` for a real node: `gen_server:cast/2` spawned a
+  process outside the schedule to connect to it. `call/3` already answered `noproc`.
 
 ## 0.1.1 (2026-09-04)
 

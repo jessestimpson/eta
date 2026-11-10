@@ -58,7 +58,8 @@ defmodule EtaNsTest do
     end
   end
 
-  # A process on `node` that stays alive, registered as `name` by itself.
+  # A process on `node` that stays alive for the rest of the test, registered as
+  # `name` by itself.
   defp registered_on(node, name) do
     parent = self()
 
@@ -68,25 +69,30 @@ defmodule EtaNsTest do
           :go ->
             true = @f.reg(name)
             send(parent, :registered)
-            hold()
+            hold(parent)
         end
       end)
 
+    # Killed with its test, so a message that arrives later lands nowhere.
+    on_exit(fn -> Process.exit(pid, :kill) end)
     :ok = @net.place(node, [pid])
     send(pid, :go)
     assert_receive :registered
     pid
   end
 
-  defp hold do
+  # Anything it receives goes to the test that started it. Never to itself: it
+  # would take its own report as a message, report that, and so on, building an
+  # ever-deeper term until the VM runs out of memory.
+  defp hold(owner) do
     receive do
       {:__take__, from, ref} ->
         send(from, {ref, :taken})
-        hold()
+        hold(owner)
 
       msg ->
-        send(Process.get(:owner, self()), {:held, self(), msg})
-        hold()
+        send(owner, {:held, self(), msg})
+        hold(owner)
     end
   end
 
@@ -120,6 +126,7 @@ defmodule EtaNsTest do
       refute name in on(:b, &@f.names/0)
 
       pid = registered_on(:b, name)
+
       assert on(:b, fn -> :eta_ns.process_info(pid, :registered_name) end) ==
                {:registered_name, name}
     end
@@ -304,7 +311,10 @@ defmodule EtaNsTest do
 
     test "reports what the function did, as rpc and erpc each do" do
       assert on(:a, fn -> @f.rpc(:b, @f, :raise, [:throw]) end) == :thrown
-      assert {:badrpc, {:EXIT, {:broken, [_ | _]}}} = on(:a, fn -> @f.rpc(:b, @f, :raise, [:error]) end)
+
+      assert {:badrpc, {:EXIT, {:broken, [_ | _]}}} =
+               on(:a, fn -> @f.rpc(:b, @f, :raise, [:error]) end)
+
       assert on(:a, fn -> @f.rpc(:b, @f, :raise, [:exit]) end) == {:badrpc, {:EXIT, :gone}}
 
       assert on(:a, fn -> catch_throw(@f.erpc(:b, @f, :raise, [:throw])) end) == :thrown
@@ -341,7 +351,7 @@ defmodule EtaNsTest do
     end
 
     test "a call to a node the network does not know is the real one" do
-      assert on(:a, fn -> @f.rpc(:"nowhere@nohost", @f, :whoami, []) end) == {:badrpc, :nodedown}
+      assert on(:a, fn -> @f.rpc(:nowhere@nohost, @f, :whoami, []) end) == {:badrpc, :nodedown}
     end
   end
 
@@ -414,7 +424,7 @@ defmodule EtaNsTest do
 
     test "a node the network does not know is the real spawn" do
       # No run is active, so it delegates to the VM, which cannot reach it.
-      assert on(:a, fn -> @f.spawn_monitor_on(:"nowhere@nohost") end) == :noconnection
+      assert on(:a, fn -> @f.spawn_monitor_on(:nowhere@nohost) end) == :noconnection
     end
   end
 end

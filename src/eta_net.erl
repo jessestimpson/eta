@@ -213,7 +213,8 @@ waiting one out costs no real time.
     whereis_name/2,
     node_of/1,
     faultable/1,
-    inherit/2
+    inherit/2,
+    introduce/1
 ]).
 
 %% Monitors. What `eta_transform` points a system's `erlang:monitor/2,3` at, so a
@@ -280,6 +281,11 @@ waiting one out costs no real time.
 %% Pids the scheduler has reported as exited. See `simulate_monitor/4` for why
 %% this exists rather than asking the VM.
 -define(DEAD, eta_net_dead).
+%% Who spawned whom, as far as anybody has said or been asked. Its own table,
+%% not rows in `?PLACE`: an empty `?PLACE` is how "no topology was declared" is
+%% told apart from "nothing is on the wire", and a spawner is not a placement.
+%% See `spawner/1`.
+-define(SPAWNERS, eta_net_spawners).
 
 -type dest() :: pid() | atom().
 
@@ -360,6 +366,7 @@ start(Opts) ->
     ?CALLS = ets:new(?CALLS, [named_table, public, set]),
     ?MONS = ets:new(?MONS, [named_table, public, set]),
     ?DEAD = ets:new(?DEAD, [named_table, public, set]),
+    ?SPAWNERS = ets:new(?SPAWNERS, [named_table, public, set]),
     Seed = maps:get(seed, Opts, 0),
     ets:insert(?STATE, [
         {rand, rand:seed_s(exsss, {Seed, Seed + 11, Seed + 23})},
@@ -409,7 +416,7 @@ stop() ->
                 error:badarg -> ok
             end
         end,
-        [?STATE, ?CHAN, ?PLACE, ?CALLS, ?MONS, ?DEAD]
+        [?STATE, ?CHAN, ?PLACE, ?CALLS, ?MONS, ?DEAD, ?SPAWNERS]
     ),
     ok.
 
@@ -438,8 +445,13 @@ simulate distribution.
 -spec send(dest() | term(), term()) -> term().
 send(Dest, Msg) ->
     case running() andalso normalize(Dest) of
-        To when is_pid(To) -> route(self(), To, Msg);
-        _ -> erlang:send(Dest, Msg)
+        To when is_pid(To) ->
+            route(self(), To, Msg);
+        _ ->
+            case nobody(Dest) of
+                true -> Msg;
+                false -> erlang:send(Dest, Msg)
+            end
     end.
 
 -if(?DOCATTRS).
@@ -482,7 +494,10 @@ cast(Dest, Msg) ->
             catch route(self(), To, {'$gen_cast', Msg}, tag(Msg)),
             ok;
         _ ->
-            gen_server:cast(Dest, Msg)
+            case nobody(Dest) of
+                true -> ok;
+                false -> gen_server:cast(Dest, Msg)
+            end
     end.
 
 -if(?DOCATTRS).
@@ -498,7 +513,10 @@ send_event(Dest, Event) ->
             catch route(self(), To, {'$gen_event', Event}, tag(Event)),
             ok;
         _ ->
-            gen_fsm:send_event(Dest, Event)
+            case nobody(Dest) of
+                true -> ok;
+                false -> gen_fsm:send_event(Dest, Event)
+            end
     end.
 
 -if(?DOCATTRS).
@@ -511,7 +529,10 @@ send_all_state_event(Dest, Event) ->
             catch route(self(), To, {'$gen_all_state_event', Event}, tag(Event)),
             ok;
         _ ->
-            gen_fsm:send_all_state_event(Dest, Event)
+            case nobody(Dest) of
+                true -> ok;
+                false -> gen_fsm:send_all_state_event(Dest, Event)
+            end
     end.
 
 -if(?DOCATTRS).
@@ -615,6 +636,24 @@ call(Dest, Req, Timeout0) ->
                 false -> gen_server:call(Dest, Req, Timeout)
             end
     end.
+
+%% A `{Name, Node}` that names a simulated node and resolved to no process:
+%% the server died with its node, or was never started. A message to it goes
+%% nowhere, as one to an unregistered name on a live node does.
+%%
+%% It must not be handed to OTP, which takes the node for a real one.
+%% `gen_server:cast/2` answers a node it is not connected to by spawning a
+%% process to connect and send, and that process is one nothing gated: it is
+%% adopted late and runs on the real scheduler. A plain send tries the
+%% connection in the sender, on the real clock. `call/3` has always refused
+%% for the same reason; this is the same rule for the sends, which cannot
+%% refuse and so drop.
+%%
+%% Nothing is counted. `dropped` is what a fault-vacuity guard asserts on, and
+%% this is not a fault: the network delivered to a node where nobody was
+%% listening.
+nobody(Dest) ->
+    running() andalso on_simulated_node(Dest).
 
 %% Whether a deadline armed by *this* process will actually be reached.
 %%
@@ -990,7 +1029,8 @@ normalize({Name, Node}) when is_atom(Name) ->
         Pid ->
             Pid
     end;
-normalize(_) -> undefined.
+normalize(_) ->
+    undefined.
 
 %% A process holding `Name` in `Node`'s namespace, or holding the bare name while
 %% located on `Node`.
@@ -1262,6 +1302,11 @@ its `init/1` during the harness's `init/2` — which is on its parent's node in
 every sense but the table's. It is *not* placed by being asked about: it stays
 off the wire and outside `kill_node/2`'s reach, which is why the harness should
 still return from `init/2` with such children finished.
+
+Who spawned a process is learned once and remembered; where the spawner is, is
+read each time, so the answer follows a spawner that is placed or moved later.
+The learning is done ahead of time for every process `eta_sched` owns, so that
+this function asks a suspended process nothing. See `introduce/1`.
 """.
 -endif.
 -spec node_of(dest()) -> term() | undefined.
@@ -1276,10 +1321,65 @@ node_of_pid(Pid) ->
         {Node, _Faultable} ->
             Node;
         undefined ->
-            case erlang:process_info(Pid, parent) of
-                {parent, Parent} when is_pid(Parent) -> node_of_pid(Parent);
-                _ -> undefined
+            case spawner(Pid) of
+                Parent when is_pid(Parent) -> node_of_pid(Parent);
+                undefined -> undefined
             end
+    end.
+
+%% Who spawned `Pid`, or `undefined`. Remembered, because it cannot change and
+%% because finding out is not free.
+%%
+%% `erlang:process_info/2` is a signal against a live target that has signals
+%% of its own waiting: the caller asks, and parks in
+%% `erts_internal:await_result/1` until the target answers. Against a process
+%% `eta_sched` has suspended, asked by the process it is stepping, that is a
+%% step that ends where the wall clock says. A parked process is `waiting`,
+%% `waiting` is what a finished step looks like, and the scheduler moves on
+%% with the asker in the middle of a callback. Nothing counts it: it is not a
+%% step timeout, the process did block. And the asker is always a process with
+%% signals outstanding at its target, because it is `node_cut/2` asking on
+%% behalf of a send, and the send before it was to the same place.
+%%
+%% Measured in isolation, outside any of this: a process that sends to a
+%% suspended one and then asks for its `parent` is seen parked in about one
+%% trial in two hundred by a sampler that mostly misses it.
+%%
+%% So the question is put by somebody who can wait. `eta_sched` introduces
+%% every process it is handed (`introduce/1`) from its own process, between
+%% steps, and reports every spawn it sees (`inherit/2`), which is the same
+%% fact without a question at all. What is left for the lookup below to ask is
+%% a process nobody introduced, and then only once.
+spawner(Pid) ->
+    case ets:lookup(?SPAWNERS, Pid) of
+        [{_, Spawner}] ->
+            Spawner;
+        [] ->
+            Spawner =
+                case erlang:process_info(Pid, parent) of
+                    {parent, Parent} when is_pid(Parent) -> Parent;
+                    _ -> undefined
+                end,
+            _ = ets:insert_new(?SPAWNERS, {Pid, Spawner}),
+            Spawner
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Learns who spawned `Pid`, and who spawned that, up to the first ancestor that
+is placed. Called by `eta_sched` for every process it is handed; a harness does
+not call this.
+
+It is the asking half of `node_of/1`, done here so that it is never done by a
+process the scheduler is stepping. See `spawner/1` for what goes wrong
+otherwise. Inert with no network running.
+""".
+-endif.
+-spec introduce(pid()) -> ok.
+introduce(Pid) when is_pid(Pid) ->
+    case running() andalso placement(Pid) =:= undefined andalso spawner(Pid) of
+        Spawner when is_pid(Spawner) -> introduce(Spawner);
+        _ -> ok
     end.
 
 -if(?DOCATTRS).
@@ -1319,6 +1419,10 @@ Places `Child` where `Parent` is, with the same faultability. Called by
 -endif.
 -spec inherit(pid(), pid()) -> ok.
 inherit(Parent, Child) ->
+    %% Who spawned it is worth keeping whether or not the parent is anywhere:
+    %% the parent may be placed later, and `node_of/1` would otherwise have to
+    %% ask the child. See `spawner/1`.
+    _ = running() andalso ets:insert_new(?SPAWNERS, {Child, Parent}),
     %% A child placed before the scheduler adopted it keeps that placement: it
     %% was put there on purpose, as `eta_rpc` does with its workers.
     case running() andalso placement(Child) =:= undefined andalso placement(Parent) of
@@ -2157,7 +2261,8 @@ unheld_simulated_name({Name, Node}) when is_atom(Name) ->
             {true, noproc};
         _Here ->
             case is_node(Node) of
-                false -> false;
+                false ->
+                    false;
                 true ->
                     case connect_node(Node) of
                         true -> {true, noproc};
@@ -2579,8 +2684,11 @@ partition(A, B, Opts) ->
     ok = cut(B, A),
     ok = link_event(A, B, Opts),
     case learns(Opts) of
-        both -> ok;
-        _ -> true = ets:insert(?CHAN, {{one_sided, A, B}, Opts}), ok
+        both ->
+            ok;
+        _ ->
+            true = ets:insert(?CHAN, {{one_sided, A, B}, Opts}),
+            ok
     end.
 
 -if(?DOCATTRS).

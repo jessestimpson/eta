@@ -807,8 +807,10 @@ rewrite({call, Anno, {atom, FAnno, Fun}, Args}, Locals) ->
             case maps:find(Key, ?AUTO_BIFS) of
                 {ok, {M, F}} ->
                     case sets:is_element(Key, Locals) of
-                        false -> {call, Anno, {remote, Anno, {atom, Anno, M}, {atom, FAnno, F}}, Args};
-                        true -> {call, Anno, {atom, FAnno, Fun}, Args}
+                        false ->
+                            {call, Anno, {remote, Anno, {atom, Anno, M}, {atom, FAnno, F}}, Args};
+                        true ->
+                            {call, Anno, {atom, FAnno, Fun}, Args}
                     end;
                 error ->
                     {call, Anno, {atom, FAnno, Fun}, Args}
@@ -946,29 +948,78 @@ rewrite(Node, _Locals) ->
 %% Wrapping rather than retargeting, because these are many functions with one
 %% thing in common: a name that means something different on each simulated node.
 -define(ETS_TABLE_FIRST, [
-    {delete, 1}, {delete, 2}, {delete_all_objects, 1}, {delete_object, 2},
-    {first, 1}, {first_lookup, 1}, {give_away, 3}, {info, 1}, {info, 2},
-    {insert, 2}, {insert_new, 2}, {last, 1}, {last_lookup, 1}, {lookup, 2},
-    {lookup_element, 3}, {lookup_element, 4}, {match, 2}, {match, 3},
-    {match_delete, 2}, {match_object, 2}, {match_object, 3}, {member, 2},
-    {next, 2}, {next_lookup, 2}, {prev, 2}, {prev_lookup, 2}, {rename, 2},
-    {safe_fixtable, 2}, {select, 2}, {select, 3}, {select_count, 2},
-    {select_delete, 2}, {select_replace, 2}, {select_reverse, 2},
-    {select_reverse, 3}, {setopts, 2}, {slot, 2}, {tab2file, 2}, {tab2file, 3},
-    {tab2list, 1}, {take, 2}, {update_counter, 3}, {update_counter, 4},
-    {update_element, 3}, {update_element, 4}, {whereis, 1}
+    {delete, 1},
+    {delete, 2},
+    {delete_all_objects, 1},
+    {delete_object, 2},
+    {first, 1},
+    {first_lookup, 1},
+    {give_away, 3},
+    {info, 1},
+    {info, 2},
+    {insert, 2},
+    {insert_new, 2},
+    {last, 1},
+    {last_lookup, 1},
+    {lookup, 2},
+    {lookup_element, 3},
+    {lookup_element, 4},
+    {match, 2},
+    {match, 3},
+    {match_delete, 2},
+    {match_object, 2},
+    {match_object, 3},
+    {member, 2},
+    {next, 2},
+    {next_lookup, 2},
+    {prev, 2},
+    {prev_lookup, 2},
+    {rename, 2},
+    {safe_fixtable, 2},
+    {select, 2},
+    {select, 3},
+    {select_count, 2},
+    {select_delete, 2},
+    {select_replace, 2},
+    {select_reverse, 2},
+    {select_reverse, 3},
+    {setopts, 2},
+    {slot, 2},
+    {tab2file, 2},
+    {tab2file, 3},
+    {tab2list, 1},
+    {take, 2},
+    {update_counter, 3},
+    {update_counter, 4},
+    {update_element, 3},
+    {update_element, 4},
+    {whereis, 1}
 ]).
 
 -define(SYS_FIRST, [
-    {get_state, 1}, {get_state, 2}, {get_status, 1}, {get_status, 2},
-    {replace_state, 2}, {replace_state, 3}, {suspend, 1}, {suspend, 2},
-    {resume, 1}, {resume, 2}, {terminate, 2}, {terminate, 3}, {trace, 2},
+    {get_state, 1},
+    {get_state, 2},
+    {get_status, 1},
+    {get_status, 2},
+    {replace_state, 2},
+    {replace_state, 3},
+    {suspend, 1},
+    {suspend, 2},
+    {resume, 1},
+    {resume, 2},
+    {terminate, 2},
+    {terminate, 3},
+    {trace, 2},
     {statistics, 2}
 ]).
 
 -define(SUP_FIRST, [
-    {start_child, 2}, {restart_child, 2}, {delete_child, 2},
-    {terminate_child, 2}, {which_children, 1}, {count_children, 1},
+    {start_child, 2},
+    {restart_child, 2},
+    {delete_child, 2},
+    {terminate_child, 2},
+    {which_children, 1},
+    {count_children, 1},
     {get_childspec, 2}
 ]).
 
@@ -1009,8 +1060,6 @@ net_wrap() ->
             [{{supervisor, F, A}, {1, dest}} || {F, A} <- ?SUP_FIRST] ++
             [{{'Elixir.Supervisor', F, A}, {1, dest}} || {F, A} <- ?SUP_FIRST]
     ).
-
-
 
 %% Client-side messaging `eta_net` does not implement yet.
 %%
@@ -1567,7 +1616,8 @@ ng_any({call, A, F, Args} = Call) ->
     end;
 ng_any(T) when is_tuple(T) -> ng_any(tuple_to_list(T));
 ng_any(L) when is_list(L) -> lists:any(fun ng_any/1, L);
-ng_any(_) -> false.
+ng_any(_) ->
+    false.
 
 node_bif({call, _, {remote, _, {atom, _, erlang}, {atom, _, node}}, Args}) when length(Args) =< 1 ->
     length(Args);
@@ -1600,7 +1650,8 @@ subst_node({call, A, _, []} = Call, V) ->
     end;
 subst_node(T, V) when is_tuple(T) -> list_to_tuple([subst_node(E, V) || E <- tuple_to_list(T)]);
 subst_node(L, V) when is_list(L) -> [subst_node(E, V) || E <- L];
-subst_node(X, _V) -> X.
+subst_node(X, _V) ->
+    X.
 
 node_call(A) ->
     {call, A, {remote, A, {atom, A, erlang}, {atom, A, node}}, []}.

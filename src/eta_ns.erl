@@ -126,8 +126,10 @@ dest(Name) when is_atom(Name) ->
     end;
 dest({Name, Node} = Dest) when is_atom(Name) ->
     case eta_net:local_node() of
-        undefined -> Dest;
-        Node -> resolved(Node, Name);
+        undefined ->
+            Dest;
+        Node ->
+            resolved(Node, Name);
         _ ->
             case eta_net:is_node(Node) of
                 true -> name(Node, Name);

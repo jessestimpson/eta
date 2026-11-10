@@ -585,7 +585,9 @@ defmodule EtaMembershipTest do
 
       try do
         Code.put_compiler_option(:debug_info, true)
-        {:ok, _, _} = Kernel.ParallelCompiler.compile_to_path([src], dir, return_diagnostics: true)
+
+        {:ok, _, _} =
+          Kernel.ParallelCompiler.compile_to_path([src], dir, return_diagnostics: true)
       after
         Code.put_compiler_option(:debug_info, orig)
       end
