@@ -143,6 +143,7 @@ simulation.
 | `application:start/1,2`, `ensure_all_started/1,2,3` | `eta_app:*` |
 | `file:read_file/1`, `write_file/2,3`, `make_dir/1`, `del_dir/1`, `delete/1`, `rename/2`, `list_dir/1`, `read_file_info/1,2`, `read_link_info/1,2`, `get_cwd/0` | `eta_file:*` |
 | `filelib:ensure_dir/1`, `is_file/1`, `is_dir/1`, `is_regular/1` | `eta_file:*` |
+| `file:open/2`, `write/2`, `pwrite/3`, `truncate/1`, `sync/1`, `datasync/1`, `close/1` | `eta_disk:*` |
 | `dets:open_file/2`, `close/1`, `sync/1`, `lookup/2`, `member/2`, `insert/2`, `delete/2`, `delete_all_objects/1`, `select/2`, `select_delete/2`, `foldl/3`, `to_ets/2`, `info/2` | `eta_dets:*` |
 
 Each of the last group is a call that waits on a process the scheduler doesn't
@@ -465,6 +466,16 @@ while a scheduler is active and calls the original otherwise.
     {filelib, is_file, 1} => eta_file,
     {filelib, is_dir, 1} => eta_file,
     {filelib, is_regular, 1} => eta_file,
+    %% A raw handle works in the calling process already. These go to the
+    %% simulated disk, which decides what a crash loses. With no disk
+    %% running, each one delegates to `file`. See `eta_disk`.
+    {file, open, 2} => eta_disk,
+    {file, write, 2} => eta_disk,
+    {file, pwrite, 3} => eta_disk,
+    {file, truncate, 1} => eta_disk,
+    {file, sync, 1} => eta_disk,
+    {file, datasync, 1} => eta_disk,
+    {file, close, 1} => eta_disk,
     %% Asking whether another process is alive waits for that process to run,
     %% and under a run it is suspended. See `eta_sched:is_alive/1`.
     {erlang, is_process_alive, 1} => {eta_sched, is_alive},

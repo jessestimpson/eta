@@ -123,6 +123,9 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
     %% What the simulated network did, or `#{}` when none was installed. See
     %% `eta_net:stats/0`; `dropped` is what a non-vacuity guard asserts on.
     net := #{atom() => non_neg_integer()},
+    %% What the simulated disk did, or `#{}` when none was installed. See
+    %% `eta_disk:stats/0`.
+    disk := #{atom() => non_neg_integer()},
     %% What the seeded `rand` streams did. `unmanaged` is a draw by a process
     %% the scheduler was not stepping. See `eta_rand:stats/0`.
     rand := #{atom() => non_neg_integer()},
@@ -217,6 +220,10 @@ Options, all with defaults:
   is a function of that seed and nothing else. A harness whose cluster must sync
   before it can survive faults leaves the policy perfect here and calls
   `eta_net:set_policy/1` at the end of `init/2`.
+- `disk` (`false`) — install a simulated disk for the run. `true` for the
+  default policy, or `#{policy => ...}`; see `eta_disk`. With a disk, a write to
+  a raw file handle is lost by `eta_net:kill_node/2` unless the system synced
+  it. The disk is started before `init/2` and seeded from the seed of the run.
 - `preload` (`[]`) — applications whose modules to load before the run starts.
   **Name your own application here.** `kernel`, `stdlib` and `eta` are always
   included; anything you add is loaded on top. `false` disables it entirely.
@@ -596,6 +603,9 @@ drive(Mod, Opts, Source) ->
     %% by default, so a harness that wants faults only after its cluster has
     %% synced calls `eta_net:set_policy/1` from `init/2` rather than reseeding.
     ok = start_net(maps:get(net, Opts, false), Seed),
+    %% And the simulated disk, under the same rule as the network: a run owns
+    %% its lifetime, including when it wants none. See `eta_disk`.
+    ok = start_disk(maps:get(disk, Opts, false), Seed),
     %% And the seeded `rand` streams, for the same reason again: a process that
     %% draws during `init/2` gets its stream from this run's seed rather than
     %% from OTP's entropy. See `eta_rand`.
@@ -649,6 +659,7 @@ drive(Mod, Opts, Source) ->
         %% down first and its non-vacuity guard reported zero drops on a run that
         %% had dropped plenty, a guard that failed closed only by accident.
         eta_net:stop(),
+        eta_disk:stop(),
         eta_rand:stop(),
         eta_time:stop()
     end.
@@ -670,6 +681,16 @@ start_net(true, Seed) ->
     start_net(#{}, Seed);
 start_net(Opts, Seed) when is_map(Opts) ->
     eta_net:start(#{seed => maps:get(seed, Opts, Seed), policy => maps:get(policy, Opts, #{})}).
+
+%% `disk => false` (the default) runs with no simulated disk: every `file` call
+%% the transform rewrote delegates to `file`. `true` starts one with the default
+%% policy, and a map may carry `seed` and `policy`. See `eta_disk:start/1`.
+start_disk(false, _Seed) ->
+    eta_disk:stop();
+start_disk(true, Seed) ->
+    start_disk(#{}, Seed);
+start_disk(Opts, Seed) when is_map(Opts) ->
+    eta_disk:start(#{seed => maps:get(seed, Opts, Seed), policy => maps:get(policy, Opts, #{})}).
 
 %% Load every module of the named applications, before there is a scheduler to
 %% be outside of.
@@ -1170,6 +1191,7 @@ finish(Outcome, R) ->
     %% While both the network and the clock are still up — `in_flight` is a
     %% question about the wheel, not just a counter.
     Net = net_stats(),
+    Disk = disk_stats(),
     Rand = eta_rand:stats(),
     %% Before `release/1` and `terminate/1`, so that teardown's own loading is
     %% not blamed on the run.
@@ -1199,6 +1221,7 @@ finish(Outcome, R) ->
         modules_loaded => Modules,
         stray_timers => Strays,
         net => Net,
+        disk => Disk,
         rand => Rand,
         sched => Stats
     }.
@@ -1209,6 +1232,13 @@ finish(Outcome, R) ->
 net_stats() ->
     case eta_net:running() of
         true -> eta_net:stats();
+        false -> #{}
+    end.
+
+%% `#{}` for a run with no simulated disk, as `net_stats/0` is for the network.
+disk_stats() ->
+    case eta_disk:running() of
+        true -> eta_disk:stats();
         false -> #{}
     end.
 
