@@ -2930,6 +2930,10 @@ kill_node(Node, Opts) ->
     ok = forget_monitors(Dying),
     ok = cancel_touching(Dying),
     ok = kill_all(Dying),
+    %% After the processes are gone, so that none of them writes again: the
+    %% simulated disk decides what the node's unsynced writes left behind. A
+    %% no-op with no disk running. See `eta_disk:crash/1`.
+    ok = eta_disk:node_killed(Node),
     ok = node_down(Node, Dying),
     case maps:find(signal, Opts) of
         error -> ok;

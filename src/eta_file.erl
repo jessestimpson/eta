@@ -18,6 +18,9 @@ either way.
 Inert in the sense that matters: with no run, the result is still what `file`
 would return.
 
+While a simulated disk is running, `write_file/2,3`, `delete/1` and `rename/2`
+go through `eta_disk`, so a crash can lose what they did.
+
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
@@ -52,7 +55,11 @@ read_file(Name) -> prim_file:read_file(Name).
 -if(?DOCATTRS).
 -doc "`file:write_file/2`, in the calling process.".
 -endif.
-write_file(Name, Bytes) -> prim_file:write_file(Name, Bytes).
+write_file(Name, Bytes) ->
+    case eta_disk:running() of
+        true -> eta_disk:write_file(Name, Bytes);
+        false -> prim_file:write_file(Name, Bytes)
+    end.
 
 -if(?DOCATTRS).
 -doc """
@@ -62,7 +69,7 @@ here; any mode other than `raw`, `binary` or `write` goes to `file`.
 -endif.
 write_file(Name, Bytes, Modes) ->
     case Modes -- [raw, binary, write] of
-        [] -> prim_file:write_file(Name, Bytes);
+        [] -> write_file(Name, Bytes);
         _ -> file:write_file(Name, Bytes, Modes)
     end.
 
@@ -79,12 +86,20 @@ del_dir(Name) -> prim_file:del_dir(Name).
 -if(?DOCATTRS).
 -doc "`file:delete/1`, in the calling process.".
 -endif.
-delete(Name) -> prim_file:delete(Name).
+delete(Name) ->
+    case eta_disk:running() of
+        true -> eta_disk:delete(Name);
+        false -> prim_file:delete(Name)
+    end.
 
 -if(?DOCATTRS).
 -doc "`file:rename/2`, in the calling process.".
 -endif.
-rename(From, To) -> prim_file:rename(From, To).
+rename(From, To) ->
+    case eta_disk:running() of
+        true -> eta_disk:rename(From, To);
+        false -> prim_file:rename(From, To)
+    end.
 
 -if(?DOCATTRS).
 -doc "`file:list_dir/1`, in the calling process.".

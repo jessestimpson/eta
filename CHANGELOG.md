@@ -40,6 +40,13 @@
 - `erlang:monitor_node/2,3` is simulated between simulated nodes.
 - The parse_transform gates `proc_lib:start*` and `gen:start/5,6`, so a behaviour
   built on `gen` (`gen_batch_server`, say) starts under the scheduler.
+- Added `eta_disk`, a simulated disk. The parse_transform points `file:open/2`,
+  `write/2`, `pwrite/3`, `truncate/1`, `sync/1`, `datasync/1` and `close/1` at
+  it, and `eta_file` calls it for `write_file/2,3`, `delete/1` and `rename/2`.
+  With the `disk` option of `eta_run:run/2`, `eta_net:kill_node/2` loses the
+  file contents and the directory operations that the node did not sync, as the
+  seed decides. A policy can make writes, syncs and renames fail. With no disk
+  running, every call delegates to `file`. A run reports `disk` statistics.
 - Added `eta_app`, `eta_file` and `eta_dets`, which the parse_transform points
   `application` starts, `file_server`'s `file` and `filelib` functions, and `dets`
   at, so none of them waits on a VM service outside the schedule. `eta_dets`
