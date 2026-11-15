@@ -136,7 +136,8 @@ simulation.
 | `os:timestamp/0` | `eta_time:timestamp/0` |
 | `timer:sleep/1` | `eta_time:sleep/1` |
 | `calendar:universal_time/0` | `eta_time:universal_time/0` |
-| `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`, `seed/1,2` | `eta_rand:*` |
+| `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`, `bytes/1`, `seed/1,2` | `eta_rand:*` |
+| `crypto:strong_rand_bytes/1` | `eta_rand:strong_rand_bytes/1` |
 | `erlang:is_process_alive/1` | `eta_sched:is_alive/1` |
 | `proc_lib:start/3,4,5`, `start_link/3,4,5`, `start_monitor/3,4,5` | `eta_sched:plib_start*` |
 | `gen:start/5,6` | `eta_sched:gen_start/5,6` |
@@ -369,6 +370,10 @@ while a scheduler is active and calls the original otherwise.
     {rand, uniform_real, 0} => eta_rand,
     {rand, normal, 0} => eta_rand,
     {rand, normal, 2} => eta_rand,
+    {rand, bytes, 1} => eta_rand,
+    %% Random bytes that name something are compared and sorted like any other
+    %% term, so they have to be a function of the seed too.
+    {crypto, strong_rand_bytes, 1} => eta_rand,
     {rand, seed, 1} => eta_rand,
     {rand, seed, 2} => eta_rand,
     %% A hash-based table iterates in an order that depends on the bits of its keys,

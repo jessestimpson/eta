@@ -16,7 +16,10 @@ accounting is clean, no module loaded late, and the same seed produces a
 different trace on every run.
 
 `eta_transform` points a module's `rand:uniform/0,1`, `uniform_real/0`,
-`normal/0,2` and `seed/1,2` here. Inert unless a run has started this module —
+`normal/0,2`, `bytes/1` and `seed/1,2` here, and `crypto:strong_rand_bytes/1`
+with them: a system that names a thing with random bytes, and then sorts or
+compares the names, has the same problem by another route. Under a run those
+bytes come from the process's stream and are not cryptographically strong. Inert unless a run has started this module —
 every function delegates to `rand` otherwise — so a transformed module behaves
 normally outside a simulation.
 
@@ -77,6 +80,8 @@ therefore not a function of the schedule. `eta_run:audit/1` checks it, next to
     uniform_real/0,
     normal/0,
     normal/2,
+    bytes/1,
+    strong_rand_bytes/1,
     seed/1,
     seed/2
 ]).
@@ -214,6 +219,24 @@ normal(Mean, Variance) ->
         fun(S) -> rand:normal_s(Mean, Variance, S) end,
         fun() -> rand:normal(Mean, Variance) end
     ).
+
+-if(?DOCATTRS).
+-doc "`rand:bytes/1`, from the process's seeded stream.".
+-endif.
+-spec bytes(non_neg_integer()) -> binary().
+bytes(N) ->
+    draw(fun(S) -> rand:bytes_s(N, S) end, fun() -> rand:bytes(N) end).
+
+-if(?DOCATTRS).
+-doc """
+`crypto:strong_rand_bytes/1`. Under a run the bytes come from the process's
+seeded stream, so they are a function of the seed and are not cryptographically
+strong. Outside a run this is `crypto:strong_rand_bytes/1`.
+""".
+-endif.
+-spec strong_rand_bytes(non_neg_integer()) -> binary().
+strong_rand_bytes(N) ->
+    draw(fun(S) -> rand:bytes_s(N, S) end, fun() -> crypto:strong_rand_bytes(N) end).
 
 -if(?DOCATTRS).
 -doc """

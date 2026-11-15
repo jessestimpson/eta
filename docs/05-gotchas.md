@@ -222,9 +222,12 @@ schedule that isn't a function of the seed, and nothing in the run result
 says so: `adopted_late` is 0, nothing loaded late, the scheduler's accounting
 is clean, and the same seed produces a different trace on every run.
 
-`eta_transform` rewrites `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`
-and `seed/1,2` to `eta_rand`, which gives each process a stream of its own
-derived from the run's seed. An explicit `rand:seed(Alg, Seed)` is honoured,
+`eta_transform` rewrites `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`,
+`bytes/1` and `seed/1,2` to `eta_rand`, which gives each process a stream of its
+own derived from the run's seed. `crypto:strong_rand_bytes/1` goes the same
+way: under a run its bytes come from that stream, so an identifier made of
+random bytes sorts the same way on every run of a seed. Those bytes are not
+cryptographically strong. An explicit `rand:seed(Alg, Seed)` is honoured,
 since that was deterministic already. Only the process-local API is covered:
 `rand:uniform_s/1,2` and the rest of the `_s` family take their state as an
 argument and were never the problem.

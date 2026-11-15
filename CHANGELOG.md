@@ -10,6 +10,8 @@
   memory, for dependencies and for the OTP and Elixir stdlib modules a system runs
   on. `Task` and `Agent` no longer raise once their modules have been instrumented.
   This feature is not supported for Erlang.
+- The parse_transform points `rand:bytes/1` and `crypto:strong_rand_bytes/1` at
+  `eta_rand`, so random bytes drawn under a run are a function of the seed.
 - Added `eta_ets`, which the parse_transform uses so that iterating a hash-based ETS
   table is stable under a run. Keys holding references or pids otherwise iterate in
   a different order in every VM, which `audit/1` cannot see.
