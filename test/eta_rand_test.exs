@@ -47,9 +47,30 @@ defmodule EtaRandTest do
       assert is_float(@rand.uniform())
       assert is_float(@rand.uniform_real())
       assert is_float(@rand.normal())
+      assert byte_size(@rand.bytes(16)) == 16
+      assert byte_size(@rand.strong_rand_bytes(16)) == 16
 
       # Nothing of this module's was left behind in the process.
       assert Process.get(:"$eta_rand") == nil
+    end
+  end
+
+  describe "random bytes" do
+    test "are a function of the seed while the module is running" do
+      draw = fn seed ->
+        :ok = @rand.start(%{seed: seed})
+        Process.delete(:"$eta_rand")
+        bytes = {@rand.strong_rand_bytes(16), @rand.bytes(16)}
+        @rand.stop()
+        bytes
+      end
+
+      {strong, plain} = draw.(7)
+      assert byte_size(strong) == 16
+      assert byte_size(plain) == 16
+      assert strong != plain
+      assert draw.(7) == {strong, plain}
+      assert draw.(8) != {strong, plain}
     end
   end
 

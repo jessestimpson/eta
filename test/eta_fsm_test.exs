@@ -117,9 +117,16 @@ defmodule EtaFsmTest do
       # Advance to the deadline first, so the message is already in the
       # mailbox when the cancelling message is processed. The flush in
       # `eta_time:disarm_self/2` is what keeps it from arriving as `timeout`.
+      #
+      # The machine is suspended while the clock advances. Without that, the
+      # machine can cancel the deadline at the moment `eta_time:advance/1`
+      # fires it, on another scheduler, and the message lands after the flush.
+      # Under `eta_sched` the receiver does not run while a timer fires.
       :ok = @sut.drive(pid, {:arm, 100})
+      :ok = :sys.suspend(pid)
       send(pid, {:"$gen_event", :noop})
       @time.advance(100)
+      :ok = :sys.resume(pid)
 
       :ok = @sut.drive(pid, :noop)
       refute_received {:fired, _}

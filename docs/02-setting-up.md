@@ -293,7 +293,8 @@ parse transform will only rewrite fully module-qualified calling conventions:
 | `os:system_time/0,1`, `os:timestamp/0` | `eta_time:*` |
 | `timer:sleep/1` | `eta_time:sleep/1` |
 | `calendar:universal_time/0` | `eta_time:universal_time/0` |
-| `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`, `seed/1,2` | `eta_rand:*` |
+| `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`, `bytes/1`, `seed/1,2` | `eta_rand:*` |
+| `crypto:strong_rand_bytes/1` | `eta_rand:strong_rand_bytes/1` |
 | `erlang:spawn/1,3`, `spawn_link`, `proc_lib` equivalents | `eta_sched:*` |
 | `gen_server:start/3,4`, `start_link/3,4`, `start_monitor/3,4` | `eta_sched:*` |
 | the same six on `gen_statem` | `eta_sched:statem_*` |
