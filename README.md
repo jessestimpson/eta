@@ -180,6 +180,11 @@ Early and under development.
 
 ### Known gaps, roughly by size
 
+- **Interleavings that depend on preemption or yielding.** eta cannot reproduce
+  interleavings that depend on reduction-based preemption and/or process
+  yielding, since a process yields only when it blocks in a receive or exits.
+  Another process cannot act between two sends, or between two ETS writes, in
+  one step.
 - **Elixir's `Task` and `Agent` are not simulated by default.** Both spawn and
   wait inside the Elixir standard library, where the scheduler cannot gate them,
   so under a run their entry points raise by name rather than quietly running
