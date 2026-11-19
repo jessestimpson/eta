@@ -73,6 +73,11 @@
 
 ### Bug fixes
 
+- The transform rewrites `Process.send_after/3,4` to `eta_time:send_after/3,4`,
+  with the arguments reordered. Up to Elixir 1.19 the Elixir compiler inlined the
+  call to `erlang:send_after/3,4`. From Elixir 1.20 it is a remote call into
+  `Process`, and before this fix its timer ran on the real clock.
+
 - `monitor(process, {Name, Node})` from a process on a simulated node, to a
   simulated node where nothing holds `Name`, delivers the DOWN distribution
   would: `noconnection` if the two nodes cannot connect, as for a node that was

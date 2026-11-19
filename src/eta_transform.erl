@@ -309,10 +309,11 @@ pass exists to virtualise. A sleep in an *untransformed* module still hangs.
 
 This transform runs unchanged on Elixir modules — `Eta.Beam` feeds it the
 abstract format the Elixir compiler produced — and most of the coverage comes
-free: Elixir inlines `send/2`, `spawn/1`, `Process.send_after/3` (arguments
-reordered), `Process.monitor/1` and friends down to the exact `erlang` calls the
-tables above match, and `receive do ... after` compiles to the form the `after`
-pass rewrites. The `'Elixir.*'` entries in the tables cover what does *not*
+free: Elixir inlines `send/2`, `spawn/1`, `Process.monitor/1` and friends down
+to the exact `erlang` calls the tables above match (`Process.send_after/3,4` up
+to Elixir 1.19 only; from 1.20 a table entry reorders its arguments onto
+`eta_time:send_after/3,4`), and `receive do ... after` compiles to the form the
+`after` pass rewrites. The `'Elixir.*'` entries in the tables cover what does *not*
 inline: `GenServer`'s clients share `eta_net`'s targets (same wire protocol),
 its starts go through `Eta.GenServer` (which reproduces the `name:` option
 translation `GenServer.do_start/4` performs out of reach), its broadcasts raise
@@ -563,8 +564,15 @@ while a scheduler is active and calls the original otherwise.
     {'Elixir.GenServer', start, 2} => {'Elixir.Eta.GenServer', start},
     {'Elixir.GenServer', start, 3} => {'Elixir.Eta.GenServer', start},
     %% Elixir's clock reads that do not inline. (`System.system_time/0`,
-    %% `System.os_time/0`, `Process.send_after/3,4` and friends need no entry:
-    %% the Elixir compiler lowers them to the `erlang`/`os` calls above.)
+    %% `System.os_time/0`, `Process.cancel_timer/1,2` and friends need no
+    %% entry: the Elixir compiler lowers them to the `erlang`/`os` calls above.)
+    %% `Process.send_after/3,4` was inlined the same way up to Elixir 1.19;
+    %% from 1.20 it is a remote call into `Process`. Its target takes the
+    %% arguments in `erlang:send_after/3,4` order, so the entry carries the
+    %% argument order as well: `Process.send_after(Dest, Msg, Time)` becomes
+    %% `eta_time:send_after(Time, Dest, Msg)`, the call the inlined form was.
+    {'Elixir.Process', send_after, 3} => {eta_time, send_after, [3, 1, 2]},
+    {'Elixir.Process', send_after, 4} => {eta_time, send_after, [3, 1, 2, 4]},
     %% `Process.sleep/1` is `eta_time:sleep/1`'s exact contract, `infinity`
     %% included. The unit-argument `System` forms go through `Eta.System`,
     %% which reproduces the legacy-plural unit normalisation `System` performs
@@ -795,7 +803,9 @@ rewrite(
     ]};
 %% A remote call whose target is in the rewrite table has its module replaced.
 %% Arity is taken from the argument list, so a rewrite only applies to the exact
-%% arities declared.
+%% arities declared. A `{Module, Function, Order}` target also reorders the
+%% arguments: argument `I` of the new call is argument `lists:nth(I, Order)` of
+%% the original.
 rewrite(
     {call, Anno, {remote, RAnno, {atom, MAnno, Mod}, {atom, FAnno, Fun}}, Args}, _Locals
 ) ->
@@ -805,6 +815,11 @@ rewrite(
             unsupported_call(Anno, eta_sched, MFA, Args);
         false ->
             case maps:find(MFA, ?REWRITES) of
+                {ok, {Target, TargetFun, Order}} ->
+                    {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, TargetFun}}, [
+                            lists:nth(I, Args)
+                         || I <- Order
+                        ]};
                 {ok, {Target, TargetFun}} ->
                     {call, Anno, {remote, RAnno, {atom, MAnno, Target}, {atom, FAnno, TargetFun}},
                         Args};

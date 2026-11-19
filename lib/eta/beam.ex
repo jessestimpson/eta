@@ -12,8 +12,10 @@ defmodule Eta.Beam do
      form `eta_transform:parse_transform/2` takes from `erlc`, so
   2. the transform runs on it **unchanged**. It lands better than it has any
      right to: the Elixir compiler's inliner already lowers `send/2`,
-     `spawn/1`, `Process.monitor/1` and even `Process.send_after/3` — with the
-     argument reorder — to the `:erlang` calls the rewrite tables match, and
+     `spawn/1`, `Process.monitor/1` and, up to Elixir 1.19,
+     `Process.send_after/3` — with the argument reorder — to the `:erlang`
+     calls the rewrite tables match (from Elixir 1.20 a table entry does the
+     reorder), and
      `receive do ... after` compiles to the same abstract form the `after`
      pass expands. Because abstract format is post-macro-expansion, code
      injected by `use GenServer` is covered too, which no source-level rewrite

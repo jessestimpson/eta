@@ -134,8 +134,9 @@ format back out of its beam (the same stable protocol Dialyzer uses), runs
 
 That line plus the `only: :dst` dependency is the whole configuration. The
 transformed code is the same code the Erlang tables produce — Elixir inlines
-`send/2`, `spawn/1`, `Process.send_after/3` and friends down to the very
-`:erlang` calls they match, `receive do ... after` is virtualised the same
+`send/2`, `spawn/1` and friends down to the very `:erlang` calls they match
+(`Process.send_after/3` too, up to Elixir 1.19; from 1.20 it has its own table
+entry), `receive do ... after` is virtualised the same
 way, and the `'Elixir.*'` entries cover what does not inline (`GenServer`,
 the clock reads, `DateTime.utc_now/0` and kin). `Task` and `Agent` raise by
 name under a run; see the Elixir section of `eta_transform`'s module docs
