@@ -284,6 +284,10 @@ releasing, not after.
 %% Bound on waiting for erlang:trace_delivered/1 to report the trace stream drained.
 -define(DELIVERED_TIMEOUT, 5000).
 
+%% Bound on re-reading a held process's queue while messages are still arriving
+%% after its block. See `queue_at_block/3`.
+-define(LATE_SETTLE_ROUNDS, 5).
+
 %% Presence of this table means a scheduler is running, so `spawn/1` and friends
 %% gate their children. Created by the scheduler process and destroyed with it, so
 %% the inertness is automatic — the same arrangement `eta_time` uses.
@@ -2120,19 +2124,88 @@ do_step(St0 = #st{procs = Procs}, Id) ->
     %% fixes.
     case hold(Pid) of
         false ->
-            {_SelfSends, StDead} = drain_trace(St2, Pid),
+            {_SelfSends, _Late, StDead} = drain_trace(St2, Pid),
             {exited, StDead#st{exited = (StDead#st.exited)#{Id => true}}};
         true ->
-            {SelfSends, St3} = drain_trace(St2, Pid),
-            QueueAfter = queue_len(Pid),
+            {SelfSends, Late, St3} = drain_trace(St2, Pid),
+            {QueueAfter, St3a} = queue_at_block(St3, Pid, Late),
             Consumed = QueueBefore + SelfSends - QueueAfter,
-            St4 = note_quiescence(St3, Id, Pid, Quiescence, QueueAfter),
+            St4 = note_quiescence(St3a, Id, Pid, Quiescence, QueueAfter),
             Outcome =
                 case Consumed > 0 of
                     true -> progress;
                     false -> no_progress
                 end,
             {Outcome, St4}
+    end.
+
+%% The length the process's queue had when the process blocked.
+%%
+%% `blocked_at` must be that length. A message that arrives later is one the
+%% receive has not seen, and it must make the process runnable. Reading the
+%% queue after the step does not give that length. Every other owned process is
+%% suspended during a step, but a suspended process still dies at once from an
+%% exit signal, and the `EXIT` and `DOWN` it then sends arrive in real time. So
+%% a process that kills another and waits for the `DOWN`, which is what
+%% `supervisor:shutdown/1` does to a child that does not trap exits, is often
+%% blocked before the `DOWN` arrives and suspended before the queue is read. The
+%% `DOWN` was then counted as a message the receive had rejected, the process
+%% was not runnable, and the run waited on the virtual clock for the receive's
+%% time-out: 30 seconds for each such child of a supervisor.
+%%
+%% The `'receive'` trace events say which messages arrived after the block. The
+%% blocking `out` event was the last event `await_quiescent/2` consumed, so
+%% every `'receive'` event for this process that the drains find came after it.
+%% A suspended process still produces these events, because it still takes
+%% signals into its queue.
+%%
+%% The common case has no late arrival: the queue is read, a second drain finds
+%% nothing new, and the length is exact. Otherwise the queue's contents are
+%% compared with the late messages. The late messages that are still at the end
+%% of the queue are subtracted. A late message that is not in the queue was
+%% consumed, because the process ran again between its block and the hold. The
+%% comparison is repeated while further messages arrive, a bounded number of
+%% times, and the old reading is the fallback.
+-spec queue_at_block(#st{}, pid(), [term()]) -> {non_neg_integer(), #st{}}.
+queue_at_block(St, Pid, Late0) ->
+    Queue = queue_len(Pid),
+    case drain_trace(St, Pid) of
+        {_, [], St1} when Late0 =:= [] ->
+            {Queue, St1};
+        {_, More, St1} ->
+            settle_late(St1, Pid, Late0 ++ More, ?LATE_SETTLE_ROUNDS)
+    end.
+
+-spec settle_late(#st{}, pid(), [term()], non_neg_integer()) -> {non_neg_integer(), #st{}}.
+settle_late(St, Pid, Late, Rounds) ->
+    Messages =
+        case erlang:process_info(Pid, messages) of
+            {messages, Ms} -> Ms;
+            undefined -> []
+        end,
+    case drain_trace(St, Pid) of
+        {_, [], St1} ->
+            {length(Messages) - late_in_queue(Late, Messages), St1};
+        {_, _More, St1} when Rounds =< 1 ->
+            {queue_len(Pid), St1};
+        {_, More, St1} ->
+            settle_late(St1, Pid, Late ++ More, Rounds - 1)
+    end.
+
+%% How many messages at the end of `Messages` are the last of `Late`, in order.
+-spec late_in_queue([term()], [term()]) -> non_neg_integer().
+late_in_queue(Late, Messages) ->
+    late_in_queue(Late, Messages, min(length(Late), length(Messages))).
+
+late_in_queue(_Late, _Messages, 0) ->
+    0;
+late_in_queue(Late, Messages, K) ->
+    case
+        lists:nthtail(length(Messages) - K, Messages) =:=
+            lists:nthtail(length(Late) - K, Late)
+    of
+        true -> K;
+        false -> late_in_queue(Late, Messages, K - 1)
     end.
 
 %% Suspend a process, answering whether there was one to suspend. `false` means it
@@ -2349,27 +2422,31 @@ await_event(St, _Pid, _Want, _Budget, _Patience) ->
 %% erlang:trace_delivered/1 so a step never races the trace stream.  Returns how
 %% many messages the process sent to *itself* during the step — the only way its
 %% mailbox can grow while it holds the CPU alone, and so the correction term the
-%% consumption count needs.
--spec drain_trace(#st{}, pid()) -> {non_neg_integer(), #st{}}.
+%% consumption count needs — and the messages delivered to it, oldest first.
+%% Called after the step's blocking `out` event, those are the messages that
+%% arrived after the process blocked. See `queue_at_block/3`.
+-spec drain_trace(#st{}, pid()) -> {non_neg_integer(), [term()], #st{}}.
 drain_trace(St, Pid) ->
     Ref = erlang:trace_delivered(Pid),
-    do_drain(St, Pid, Ref, 0).
+    do_drain(St, Pid, Ref, 0, []).
 
--spec do_drain(#st{}, pid(), reference(), non_neg_integer()) ->
-    {non_neg_integer(), #st{}}.
-do_drain(St, Pid, Ref, SelfSends) ->
+-spec do_drain(#st{}, pid(), reference(), non_neg_integer(), [term()]) ->
+    {non_neg_integer(), [term()], #st{}}.
+do_drain(St, Pid, Ref, SelfSends, Received) ->
     receive
         {trace_delivered, Pid, Ref} ->
-            {SelfSends, St};
+            {SelfSends, lists:reverse(Received), St};
         {trace, Pid, send, _Msg, Pid} ->
-            do_drain(St, Pid, Ref, SelfSends + 1);
+            do_drain(St, Pid, Ref, SelfSends + 1, Received);
+        {trace, Pid, 'receive', Msg} ->
+            do_drain(St, Pid, Ref, SelfSends, [Msg | Received]);
         {trace, _, _, _} = T ->
-            do_drain(handle_trace(St, T), Pid, Ref, SelfSends);
+            do_drain(handle_trace(St, T), Pid, Ref, SelfSends, Received);
         {trace, _, _, _, _} = T ->
-            do_drain(handle_trace(St, T), Pid, Ref, SelfSends)
+            do_drain(handle_trace(St, T), Pid, Ref, SelfSends, Received)
     after ?DELIVERED_TIMEOUT ->
         logger:warning("eta_sched: trace_delivered timed out for ~p", [Pid]),
-        {SelfSends, St}
+        {SelfSends, lists:reverse(Received), St}
     end.
 
 %% Trace events that are not about the step in progress: adopt spawned children,
