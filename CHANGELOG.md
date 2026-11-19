@@ -73,6 +73,16 @@
 
 ### Bug fixes
 
+- A process that kills a scheduled process and then waits for its `DOWN` or
+  `EXIT` is runnable as soon as that message arrives. Before this fix the
+  scheduler counted the message as one the receive had already rejected,
+  because the message arrived after the process blocked but before the
+  scheduler read the queue length. The process then waited on the virtual clock
+  for its receive time-out. `supervisor:shutdown/1` does this to every child
+  that does not trap exits, so each such child cost the full shutdown time-out,
+  30,000 ms for a Broadway stage. The scheduler now uses the `'receive'` trace
+  events to exclude messages that arrived after the block.
+
 - The transform rewrites `Process.send_after/3,4` to `eta_time:send_after/3,4`,
   with the arguments reordered. Up to Elixir 1.19 the Elixir compiler inlined the
   call to `erlang:send_after/3,4`. From Elixir 1.20 it is a remote call into
