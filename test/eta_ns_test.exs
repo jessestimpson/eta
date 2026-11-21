@@ -339,8 +339,8 @@ defmodule EtaNsTest do
     end
 
     test "times out, and the worker goes with it" do
-      assert on(:a, fn -> @f.rpc(:b, @f, :stall, []) end) == {:badrpc, :timeout}
-      assert on(:a, fn -> catch_error(@f.erpc(:b, @f, :stall, [])) end) == {:erpc, :timeout}
+      assert on(:a, fn -> @f.rpc(:b, @f, :stall, [], 100) end) == {:badrpc, :timeout}
+      assert on(:a, fn -> catch_error(@f.erpc(:b, @f, :stall, [], 100)) end) == {:erpc, :timeout}
     end
 
     test "a cast runs on the node and nothing waits" do

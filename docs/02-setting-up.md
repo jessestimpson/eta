@@ -367,6 +367,7 @@ The options you're likely to touch:
 | `op_p` | 0.3 | Chance of injecting rather than stepping, when both are possible |
 | `quiet_p` | 0.3 | Chance of letting time pass rather than injecting, when nothing is runnable |
 | `check_every` | 1 | Run the invariants every N actions |
+| `check_timeout` | 5000 | Milliseconds of real time an invariant may take before the run reports `check_blocked` |
 | `preload` | `[]` | Applications to load before the run starts. **Name yours.** |
 | `log` | `true` | Collect a `eta_log` record of the run |
 

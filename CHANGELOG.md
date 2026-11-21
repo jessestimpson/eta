@@ -71,6 +71,10 @@
   child that exits `noconnection`. From a process on no simulated node, or to a
   node the network doesn't know, they still raise while a run is active.
 
+- Added the `check_timeout` run option, in milliseconds, default 5000. It bounds
+  how long `check/1` or `check_final/2` may take before the run ends with
+  `{error, check_blocked}`. The bound was fixed at 5000 ms.
+
 - The scheduler is faster per step. Measured on eta's own test systems,
   against the scheduler that includes the late-arrival fix below:
 

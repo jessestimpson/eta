@@ -300,7 +300,12 @@ defmodule DstRunTest do
       # invariant naturally wants to do — ask a process how it is doing — which
       # cannot be served while that process is suspended.
       assert %{outcome: {:error, :check_blocked}} =
-               @run.run(:eta_blocking_check_sut, %{seed: 1, max_ops: 1, max_steps: 100})
+               @run.run(:eta_blocking_check_sut, %{
+                 seed: 1,
+                 max_ops: 1,
+                 max_steps: 100,
+                 check_timeout: 100
+               })
     end
   end
 

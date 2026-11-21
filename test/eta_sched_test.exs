@@ -82,6 +82,17 @@ defmodule DstSchedTest do
 
   # Build the ping-pong system, freeze it, run a seeded schedule, return the
   # trace. Everything the scheduler needs is created before anything can run.
+  defp await_waiting(pid) do
+    case Process.info(pid, [:status, :message_queue_len]) do
+      [status: :waiting, message_queue_len: 0] ->
+        :ok
+
+      _ ->
+        Process.sleep(1)
+        await_waiting(pid)
+    end
+  end
+
   defp ping_pong_run(seed, opts \\ []) do
     trace = Trace.new()
     names = [:a, :b, :c]
@@ -104,10 +115,17 @@ defmodule DstSchedTest do
     end
 
     # Let the peer casts land and every server block, so the frozen state is the
-    # same on every run.
-    Process.sleep(20)
-
+    # same on every run. A `:sys` call is served after the cast that precedes it,
+    # so its reply means the cast was handled. The status wait then covers the
+    # server's return to its receive. A fixed 20 ms sleep did the same job and
+    # cost 20 seconds across the 1000-run test below.
     all = Map.values(pids)
+
+    for pid <- all do
+      _ = :sys.get_state(pid)
+      await_waiting(pid)
+    end
+
     sched = @sched.new(%{seed: seed}) |> @sched.register(all)
 
     GenServer.cast(Map.fetch!(pids, :a), {:ping, Keyword.get(opts, :depth, 4)})
@@ -147,8 +165,7 @@ defmodule DstSchedTest do
 
     test "one seed produces an identical trace across many runs" do
       # The design doc's Phase 0 bar, at its stated number. Each run builds and tears
-      # down a real supervision tree; 1000 of them costs ~23s, which is worth
-      # paying for the one assertion the whole phase rests on. Exact equality, so
+      # down a real supervision tree; 1000 of them cost about 0.5 s. Exact equality, so
       # a single divergence anywhere fails it.
       runs = for _ <- 1..1000, do: ping_pong_run(42)
 

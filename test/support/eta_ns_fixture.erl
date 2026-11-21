@@ -21,8 +21,10 @@
     pt_get/1,
     whoami/0,
     rpc/4,
+    rpc/5,
     rpc_cast/4,
     erpc/4,
+    erpc/5,
     erpc_fun/2,
     raise/1,
     stall/0,
@@ -62,11 +64,17 @@ pt_get(Key) -> persistent_term:get(Key, undefined).
 
 whoami() -> node().
 
-rpc(Node, M, F, A) -> rpc:call(Node, M, F, A, 1000).
+rpc(Node, M, F, A) -> rpc(Node, M, F, A, 1000).
+
+%% With the time-out given, so a test that expects the time-out need not wait a
+%% whole second for it.
+rpc(Node, M, F, A, Timeout) -> rpc:call(Node, M, F, A, Timeout).
 
 rpc_cast(Node, M, F, A) -> rpc:cast(Node, M, F, A).
 
-erpc(Node, M, F, A) -> erpc:call(Node, M, F, A, 1000).
+erpc(Node, M, F, A) -> erpc(Node, M, F, A, 1000).
+
+erpc(Node, M, F, A, Timeout) -> erpc:call(Node, M, F, A, Timeout).
 
 erpc_fun(Node, Fun) -> erpc:call(Node, Fun).
 

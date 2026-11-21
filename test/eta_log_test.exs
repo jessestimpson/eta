@@ -212,7 +212,12 @@ defmodule DstLogTest do
       # fails in `check/1` before a single step runs, so this is the degenerate
       # case: a log with no steps in it at all must not break correlation.
       assert %{outcome: {:error, :check_blocked}} =
-               :eta_run.run(:eta_blocking_check_sut, %{seed: 1, max_ops: 1, max_steps: 200})
+               :eta_run.run(:eta_blocking_check_sut, %{
+                 seed: 1,
+                 max_ops: 1,
+                 max_steps: 200,
+                 check_timeout: 100
+               })
 
       assert step_names() == []
       assert is_list(:eta_log.profile())
