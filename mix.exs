@@ -77,10 +77,10 @@ defmodule Eta.MixProject do
         {"docs/02-setting-up.md", [title: "Setting up a project"]},
         {"docs/03-two-phase-commit.md", [title: "Example: two-phase commit"]},
         {"docs/04-writing-a-system-under-test.md", [title: "Writing a system under test"]},
-        {"docs/05-gotchas.md", [title: "Gotchas and footguns"]},
+        {"docs/05-gotchas.md", [title: "Hazards"]},
         {"docs/06-a-journey-through-dst.md", [title: "A Journey Through DST"]},
         {"docs/07-a-journey-through-dst-elixir.md", [title: "A Journey Through DST, in Elixir"]},
-        {"docs/design.md", [title: "Design history"]}
+        {"docs/design.md", [title: "Design"]}
       ],
       groups_for_extras: [
         Walkthrough: ~r{docs/0\d},

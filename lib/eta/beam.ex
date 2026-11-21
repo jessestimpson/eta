@@ -1,47 +1,63 @@
 defmodule Eta.Beam do
   @moduledoc """
-  Applies `eta_transform` to already-compiled Elixir modules, beam by beam.
+  Applies `eta_transform` to compiled Elixir modules, one beam file at a time.
 
-  Elixir has no `parse_transform` hook of its own, and the one it inherits
-  from the Erlang compiler is deprecated — "Elixir will no longer support
-  Erlang-based transforms in future versions" — so the transform runs *after*
-  compilation instead of during it. For each opted-in module:
+  Elixir has no `parse_transform` hook of its own. The hook that Elixir inherits
+  from the Erlang compiler is deprecated: "Elixir will no longer support
+  Erlang-based transforms in future versions". The transform therefore runs after
+  compilation, not during it.
 
-  1. The Erlang abstract format is read back out of the beam's `debug_info`
-     chunk, through the same stable protocol Dialyzer uses. This is the exact
-     form `eta_transform:parse_transform/2` takes from `erlc`, so
-  2. the transform runs on it **unchanged**. It lands better than it has any
-     right to: the Elixir compiler's inliner already lowers `send/2`,
-     `spawn/1`, `Process.monitor/1` and, up to Elixir 1.19,
-     `Process.send_after/3` — with the argument reorder — to the `:erlang`
-     calls the rewrite tables match (from Elixir 1.20 a table entry does the
-     reorder), and
-     `receive do ... after` compiles to the same abstract form the `after`
-     pass expands. Because abstract format is post-macro-expansion, code
-     injected by `use GenServer` is covered too, which no source-level rewrite
-     of the user's module could claim.
-  3. The rewritten forms are compiled and the beam is put back where it was.
+  ## Steps
 
-  A module opts in by carrying a persisted `@eta true` attribute, which is
-  what `use Eta` plants. The rewrite stamps its output with
-  `-eta_transformed(true)`, and a stamped beam is skipped on sight — the
-  callback-wrapping passes are not idempotent, so transforming twice must be
-  impossible rather than discouraged. Mix recompiling a module produces a
-  fresh unstamped beam, which is precisely the signal to transform it again.
+  For each module that opted in:
 
-  ## Prototype boundaries, deliberately
+  1. `Eta.Beam` reads the Erlang abstract format from the `debug_info` chunk of
+     the beam. It uses the stable protocol that Dialyzer uses. The result has the
+     same form as the input that `eta_transform:parse_transform/2` receives from
+     `erlc`.
+  2. `Eta.Beam` runs the transform on the abstract format without changes to the
+     transform.
+  3. `Eta.Beam` compiles the rewritten forms and writes the beam to its original
+     path.
 
-  - **The `'Elixir.*'` rewrite tables cover `GenServer` and the clock reads.
-    `Task` and `Agent` are the named gap**: their spawns and waits happen
-    inside Elixir's stdlib where nothing can gate them, so their entry points
-    raise while a scheduler is active (`eta_sched:unsupported/2`) rather than
-    quietly running outside the schedule, until `instrument/1` has rewritten
-    the module itself.
-  - The rewritten beam is compiled fresh from forms, so the Elixir-specific
-    chunks (`Docs`, `ExCk`) are dropped. Harmless in a `:dst` profile, whose
-    beams exist to be simulated, not documented.
-  - A beam compiled without `debug_info` cannot be transformed and says so,
-    rather than silently shipping real-clock code into a simulation.
+  The transform for Erlang applies to Elixir modules for these reasons:
+
+  - The inliner of the Elixir compiler lowers `send/2`, `spawn/1` and
+    `Process.monitor/1` to the `:erlang` calls that the rewrite tables match.
+  - Up to Elixir 1.19, the inliner also lowers `Process.send_after/3` to the
+    `:erlang` call, with the arguments reordered. From Elixir 1.20, an entry in the
+    rewrite tables reorders the arguments.
+  - `receive do ... after` compiles to the abstract form that the `after` pass
+    expands.
+  - The abstract format is produced after macro expansion. The transform therefore
+    covers the code that `use GenServer` injects. A rewrite of the source of the
+    module would not cover that code.
+
+  ## Opt-in and stamp
+
+  A module opts in with the persisted attribute `@eta true`, which `use Eta`
+  sets.
+
+  The rewrite stamps its output with `-eta_transformed(true)`. `Eta.Beam` skips a
+  stamped beam. The passes that wrap callbacks are not idempotent, so the stamp
+  makes a second transform of the same beam impossible. When Mix recompiles a
+  module, the new beam has no stamp, and `Eta.Beam` transforms it again.
+
+  ## Limitations
+
+  - The `'Elixir.*'` rewrite tables cover `GenServer` and the clock reads. They
+    do not cover `Task` and `Agent`. The spawns and waits of `Task` and `Agent`
+    are inside the Elixir standard library, where the transform cannot gate them.
+    The entry points of `Task` and `Agent` therefore raise while a scheduler is
+    active (`eta_sched:unsupported/2`), so that they do not run outside the
+    schedule. After `instrument/1` has rewritten the module itself, the entry
+    points no longer raise.
+  - The rewritten beam is compiled from forms, so the Elixir-specific chunks
+    (`Docs`, `ExCk`) are dropped. A `:dst` profile uses its beams for simulation
+    and not for documentation.
+  - A beam that was compiled without `debug_info` cannot be transformed.
+    `transform/1` returns an error for such a beam, so that code on the real clock
+    does not enter a simulation unreported.
 
   *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
   """
@@ -53,9 +69,10 @@ defmodule Eta.Beam do
   @type outcome :: :transformed | :not_opted_in | :already_transformed | {:error, term()}
 
   @doc """
-  Transforms every opted-in `.beam` under `dir`.
+  Transforms every `.beam` file under `dir` that opted in.
 
-  Returns `{path, outcome}` per beam, in no promised order.
+  Returns one `{path, outcome}` tuple per beam file. The order of the list is not
+  specified.
   """
   @spec transform_path(Path.t()) :: [{Path.t(), outcome()}]
   def transform_path(dir) do
@@ -66,7 +83,17 @@ defmodule Eta.Beam do
   end
 
   @doc """
-  Transforms one beam file in place, if it opted in and is not already stamped.
+  Transforms one beam file in place, if the module opted in and the beam is not
+  stamped.
+
+  Returns one of these outcomes:
+
+  | Outcome | Meaning |
+  |---|---|
+  | `:transformed` | The beam was rewritten on disk. If the module was loaded, the new code was loaded too. |
+  | `:not_opted_in` | The module has no `@eta true` attribute. |
+  | `:already_transformed` | The beam has the stamp. |
+  | `{:error, reason}` | The beam could not be read, has no debug information, or could not be transformed or compiled. |
   """
   @spec transform(Path.t()) :: outcome()
   def transform(path) when is_binary(path) do
@@ -84,20 +111,30 @@ defmodule Eta.Beam do
   end
 
   @doc """
-  Rewrites modules the project does not own, in memory, for this VM only.
+  Rewrites modules that the project does not own, in memory, for this VM only.
 
-  `use Eta` reaches only code you can edit. Everything else a system runs on —
-  a dependency's GenServers, `Registry`, `Task`, OTP's `:supervisor` and `:pg` —
-  spawns and waits where no transform of your code goes, and a process spawned
-  that way is adopted but never released: it has no mailbox traffic to make it
-  runnable. This puts those modules under the same rewrite, from the outside.
+  `use Eta` applies only to code that the project can edit. A system also runs on
+  other code: the GenServers of a dependency, `Registry`, `Task`, and
+  `:supervisor` and `:pg` from OTP. That code spawns and waits where the transform
+  of the modules of the project has no effect. The scheduler adopts a process that
+  is spawned there but never releases it, because the process has no message
+  traffic that makes it runnable. `instrument/1` applies the same rewrite to those
+  modules.
 
-  Each module's code is read from the code path, transformed and loaded with
-  `:code.load_binary/3`. Nothing on disk changes, so a dependency's source and
-  its compiled beams stay exactly as they were. The rewrites are inert outside
-  a run, so the rest of the VM, which shares these modules, is unaffected.
+  For each module, `instrument/1` does the following:
 
-  Call it once, before the first run. Returns `{module, outcome}` per module.
+  1. It reads the code of the module from the code path.
+  2. It transforms the code.
+  3. It loads the result with `:code.load_binary/3`.
+
+  No file on disk changes, so the source and the compiled beams of a dependency
+  stay as they were. The rewritten calls delegate to the original functions
+  outside a run, so the rest of the VM, which shares these modules, is not
+  affected.
+
+  Call `instrument/1` once, before the first run. It returns one
+  `{module, outcome}` tuple per module. The outcome is `:instrumented`,
+  `:already_transformed`, or an error term.
   """
   @spec instrument([module()]) :: [{module(), :instrumented | :already_transformed | term()}]
   def instrument(modules) when is_list(modules) do

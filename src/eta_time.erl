@@ -4,8 +4,7 @@
 
 -if(?DOCATTRS).
 -moduledoc """
-A virtual clock and timer wheel — Phase 1 of the DST framework
-(design: `docs/design.md`).
+A virtual clock and timer wheel (design: `docs/design.md`).
 
 Drop-in replacements for the `erlang` timer and clock BIFs, backed by a clock that
 only moves when the driver moves it. `eta_transform` rewrites a module's calls to

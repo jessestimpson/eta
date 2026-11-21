@@ -1,135 +1,144 @@
-# Gotchas and footguns
+# Hazards
 
-Grouped by where they bite. If you're here because a seed stopped
-reproducing, start with the method rather than the list.
+This page lists the hazards of running a system under `eta`. Each hazard
+states what happens, the cause, and what to do. The hazards are grouped by
+the part of a run that they affect.
+
+If a seed has stopped reproducing, read
+[Debugging a determinism failure](#debugging-a-determinism-failure) first.
 
 ## AI disclosure
 
 This document is pending a human rewrite. We still expect the content to be mostly
 correct.
 
-## How to debug a determinism failure
+## Debugging a determinism failure
 
-Reading the code and thinking hard doesn't have a good track record against
-"the same seed produced 2 different runs". These techniques work better.
+A determinism failure is a seed that produces 2 different runs. Reading the
+code is an unreliable way to find the cause. The following techniques produce
+evidence instead.
 
-**Look at which runs differ, not how many.** Run a seed 5 times and group the
-identical traces. A grouping of `[[1], [2,3,4,5]]` says run 1 is special,
-which points at warm-up or first-touch state. `[[1,3], [2], [4,5]]` says the
-divergence is a coin flip on every run. The 2 have completely different
-causes, and the distinction costs nothing to measure.
+- **Find which runs differ.** Run one seed 5 times and group the identical
+  traces. The grouping identifies the kind of cause:
 
-**Vary the position rather than the seed.** If seed 3 is the one that fails,
-run your seeds in reverse order. If the failure follows whichever seed is now
-first, the seed was never the variable and you're looking at the first-run
-problem below.
+  | Grouping of the 5 runs | Meaning | Likely cause |
+  |---|---|---|
+  | `[[1], [2,3,4,5]]` | Only run 1 differs | Warm-up or first-touch state |
+  | `[[1,3], [2], [4,5]]` | Every run can differ | A random choice on every run |
 
-**Snapshot everything at the point of divergence and diff it.** State,
-mailbox contents, process status, the timer wheel. Twice now the difference
-has been invisible in state and obvious in mailboxes. When even the mailboxes
-matched, what worked was logging scheduler events against step boundaries:
-which process was scheduled in and out, and what it was executing at the
-time.
+- **Vary the position of the seed.** If seed 3 fails, run the seeds in
+  reverse order. If the failure moves to the seed that now runs first, the
+  seed is not the variable. The cause is then the first-run problem described
+  in [Code loading hazards](#code-loading-hazards).
+- **Snapshot the system at the point of divergence and compare.** Capture the
+  state, the mailbox contents, the process status and the timer wheel of both
+  runs. The difference can be absent from the state and present in the
+  mailboxes. If the mailboxes also match, log the scheduler events against
+  the step boundaries: which process was scheduled in, which process was
+  scheduled out, and what each process was executing.
+- **Remove parts of the run.** Remove the client workload and check whether
+  the system is still nondeterministic. Either result narrows the search.
+- **Put the evidence in the failure message.** Add
+  `inspect(eta_run:summary(Result))` to the assertion message and run the
+  test in a loop until it fails. The failure then carries the summary of the
+  run. This costs 1 line. It removes the cycle of forming a theory, adding a
+  print statement and waiting for the next failure. The technique applies to
+  every test, not only to determinism failures.
 
-Bisecting what you compare helps too. Remove the client workload entirely and
-see whether the system is still nondeterministic. Either answer narrows the
-search for very little effort.
+## Code loading hazards
 
-**Put the evidence in the failure message rather than deriving it.** The most
-recent determinism bug found in this library survived 3 rounds of theorizing.
-What worked was adding `inspect(eta_run:summary(Result))` to the assertion
-message and looping until it failed. The answer arrived in one shot and was
-none of the 3 theories.
+### A module loaded during a run changes the schedule
 
-That advice isn't specific to determinism bugs. A test whose failure message
-carries the run's summary costs one line, and it saves the round trip where
-you guess, add a print, and try to make it fail again.
+**Symptom.** The first run in a fresh VM produces a different trace from
+every later run of the same seed. No process is adopted late, the scheduler
+does not time out, no warning is logged, and the accounting of the scheduler
+is correct.
 
-## The code server
+**Detection.** The `modules_loaded` field of a run result lists the modules
+that were loaded while the scheduler controlled the run. The list must be
+empty. `eta_run:audit/1` checks the field.
 
-**`modules_loaded` in a run result is what tells you.** It lists modules
-loaded while the scheduler was in charge, and it should be empty.
-`eta_run:audit/1` checks it for you.
+**Cause.** Loading a module on demand is a synchronous call to `code_server`.
+The scheduler does not own `code_server`.
 
-Before that field existed the symptom was all you had: the first run in a
-fresh VM produces a different trace from every subsequent run of the same
-seed, with nothing adopted late, no scheduler timeout, no warning logged, and
-the scheduler's accounting correct throughout.
+1. A scheduled process calls a module that is not yet loaded.
+2. The process blocks on `code_server`, which is outside the schedule.
+3. The scheduler treats the block as the end of the step.
+4. `code_server` runs on the real scheduler and makes the process runnable
+   again at a moment that the wall clock determines.
+5. Every choice of the scheduler after that moment shifts.
 
-Loading a module on demand is a synchronous call to `code_server`, which the
-scheduler doesn't own. A scheduled process that reaches a module it hasn't
-touched yet blocks on something outside the schedule. The scheduler reads
-that as the step ending, the code server runs freely and makes the process
-runnable again at a moment decided by wall clock, and every choice after that
-point shifts. On the second run everything is loaded and it never happens
-again.
+On the second run the module is loaded and the sequence does not occur.
 
-The fix is the `preload` option. Name your own application; `kernel`,
-`stdlib`, and `eta` are always included.
+**Remedy.** Use the `preload` option and name the application under test.
+`kernel`, `stdlib` and `eta` are always included.
 
 ```erlang
 eta_run:run(my_harness, #{seed => 1, preload => [my_app]}).
 ```
 
-If you drive `eta_sched` yourself instead of going through `eta_run`, nothing
-preloads for you and there's no `modules_loaded` afterwards to tell you it
-happened. Call it directly, once, before the first scheduler exists:
+Code that drives `eta_sched` directly, without `eta_run`, gets no preloading
+and no `modules_loaded` field. Call `eta_run:preload/1` once, before the
+first scheduler exists:
 
 ```erlang
 ok = eta_run:preload([my_app]).
 ```
 
-Running a seed twice is not a substitute, and it's worth being precise about
-why: **warming is per code path, not per VM.** A seed that first reaches a
-timeout handler runs a branch no earlier seed touched and loads code no
-earlier seed needed. Warming up fixes the seed you warmed and not the next
-one.
+Running a seed twice is not a substitute for `preload`. Warming applies to a
+code path, not to a VM. A seed that is the first to reach a time-out handler
+runs a branch that no earlier seed ran, and loads code that no earlier seed
+needed. A warm-up run fixes the seed that was warmed and does not fix the
+next seed.
 
-### The worse failure, and the field that catches it
+### Cold code can end a run early with outcome ok
 
-A process waiting on `code_server` is, to `eta_sched`, a process blocked in a
-receive. It isn't runnable. So if enough of the system reaches for cold code
-at once, nothing is runnable, no timer is pending, and **the run ends at what
-looks exactly like quiescence.**
-
-Measured on this project's own two-phase commit example, with preloading off
-and a cold module every client touches:
+**Symptom.** A run ends after very few steps and reports success. The
+following result was measured on the two-phase commit example of this
+project, with preloading off and a cold module that every client calls:
 
 ```
 ops: 5, steps: 5, exited: 0, processes: 9, outcome: ok
 ```
 
-5 steps for 5 operations, against a workload that normally takes about a
-hundred. Reported as success. `modules_loaded` doesn't catch this one,
-because the loads complete after the run has finished, and there's nothing
-left to report by the time anybody looks.
+The run took 5 steps for 5 operations. The same workload normally takes
+about 100 steps.
 
-`sched.cold_code` catches it from the other side. The scheduler looks once,
-at the moment a run finds nothing runnable and is about to return, for a
-process sitting in `code_server:call/1`. That function is a send followed by
-a one-clause receive, so a process waiting on the code server is always
-there. Each entry names the process and the frame that reached the cold
-module, and a warning is logged:
+**Cause.** To `eta_sched`, a process that waits on `code_server` is a process
+blocked in a receive. The process is not runnable. If enough processes call
+cold code at the same time, no process is runnable and no timer is pending.
+The run then ends in a state that is indistinguishable from quiescence.
+
+`modules_loaded` does not report this case. The loads complete after the run
+has finished, so the field is empty when it is read.
+
+**Detection.** The `sched.cold_code` field reports this case. When a run
+finds no runnable process and is about to return, the scheduler looks once
+for a process that is executing `code_server:call/1`. That function is a send
+followed by a one-clause receive, so a process that waits on the code server
+is always in that function. Each entry names the process and the stack frame
+that called the cold module. The scheduler also logs a warning.
 
 ```erlang
 #{sched := #{cold_code := [#{id := 3, pid := _, at := {my_client, commit, 2}}]}}
 ```
 
-`at` is `undefined` when there's no frame to name, which happens when the
-call into the cold module was a **tail call**: nothing of the caller is left
-on the stack. The pid is still the answer then.
+`at` is `undefined` when no frame can be named. This happens when the call
+into the cold module was a tail call, because no frame of the caller remains
+on the stack. The pid still identifies the process.
 
-`audit/1` checks the field, so you get this for free if you're already
-asserting on it.
+`audit/1` checks `cold_code`.
 
-None of that makes `preload` optional. Detection is after the fact: by the
-time `cold_code` has something in it the run is already spoiled, and all
-you've gained is knowing rather than guessing.
+**Remedy.** Use `preload`. `cold_code` detects the problem after the fact.
+When `cold_code` is not empty, the run is already invalid. The field only
+replaces a guess with a report.
 
-There's a second form that isn't a warm-up effect. `code:ensure_loaded/1`
-returns immediately for a module that's already loaded, but for a *missing*
-module it falls through to the code server every time. A common idiom for
-optional dependencies looks like this:
+### code:ensure_loaded/1 on a missing module calls the code server every time
+
+This hazard is not a warm-up effect. `code:ensure_loaded/1` returns
+immediately for a module that is already loaded. For a module that does not
+exist, `code:ensure_loaded/1` calls the code server on every call. A common
+idiom for optional dependencies has this form:
 
 ```erlang
 emit_telemetry(Event, Measurements, Metadata) ->
@@ -139,457 +148,548 @@ emit_telemetry(Event, Measurements, Metadata) ->
     end.
 ```
 
-For anyone without the optional dependency that's a synchronous code-server
-call on every event, forever. Cache the answer in `persistent_term`.
+When the optional dependency is absent, every event makes a synchronous call
+to the code server. Cache the result in `persistent_term`.
 
-Here's the general rule to carry to your own project. Under a user-level
-scheduler, **any synchronous call into an OTP service process is a real-time
-dependence**: `code_server`, `logger`'s handlers, `global`, `net_kernel`,
-`application_controller`. Grepping for `code:ensure_loaded`, `code:is_loaded`,
-and `global:` along the paths your system exercises is much cheaper than the
-instrumentation it takes to find these afterwards.
+### A synchronous call to an OTP service process depends on real time
 
-`logger` is the one of those the transform handles for you. See below.
+Under a user-level scheduler, any synchronous call into an OTP service
+process is a dependence on real time. The service processes include:
 
-### Logging is one of them, and it is handled
+- `code_server`
+- the handlers of `logger`
+- `global`
+- `net_kernel`
+- `application_controller`
 
-A `logger` call doesn't just format a string. It hands the event to a
-handler, and the default handler `logger_std_h` is a process the scheduler
-doesn't own. Under load it switches from asynchronous to synchronous, at
-which point a log call is a synchronous call into an OTP service process. The
-handler then runs on the real scheduler and makes your process runnable again
-at a moment nothing chose, so a chatty system can have its schedule decided
-by how busy its log handler happens to be. The symptom is a seed that
-*mostly* reproduces.
+Search for `code:ensure_loaded`, `code:is_loaded` and `global:` along the
+code paths that the system exercises. The search costs much less than the
+instrumentation that is needed to find these calls after a failure.
 
-Every `logger` level function and `logger:log/2,3,4` is rewritten to
-`eta_logger`, which records the event into `eta_log` while a run is
-collecting and delegates to `logger` when one isn't. So your system's own
-logging becomes part of the narrative `eta_log:analyze/0` prints, at a
-sequence number comparable with everything else, instead of scrolling past in
-a separate stream.
+The transform handles `logger`. See the next section.
 
-Nothing is filtered by level and no formatter runs. The run's log is a record
-of what happened, not an operator's console, and if you filter at record time
-you'll eventually lose the line you needed.
+### Logger calls are recorded by eta_logger
+
+A `logger` call passes the event to a handler. The default
+handler, `logger_std_h`, is a process that the scheduler does not own. Under
+load, `logger_std_h` switches from asynchronous to synchronous mode. A log
+call is then a synchronous call into an OTP service process. The handler runs
+on the real scheduler and makes the calling process runnable again at a
+moment that the seed does not determine. The load on the log handler then
+determines the schedule of a system that logs heavily. The symptom is a seed
+that reproduces in most runs and not in all runs.
+
+**What eta does.** The transform rewrites every `logger` level function and
+`logger:log/2,3,4` to `eta_logger`.
+
+- While a run is collecting, `eta_logger` records the event into `eta_log`.
+- When no run is collecting, `eta_logger` delegates to `logger`.
+
+The log events of the system therefore appear in the output of
+`eta_log:analyze/0`, with sequence numbers that are comparable with every
+other event of the run.
+
+`eta_logger` does not filter by level and does not run a formatter. The log
+of a run is a record of what happened, not an operator console. A filter
+applied at record time can discard the line that a later diagnosis needs.
 
 ## Scheduler hazards
 
-### A plain spawn is a determinism hole
+### A plain spawn runs outside the schedule
 
-A process created by a plain `spawn` isn't adopted until the scheduler
-notices it, and in that window it runs on the real scheduler. One racing
-process is usually harmless. 2, created by operations injected close
-together, race each other to deliver their first message.
+A process created by a plain `spawn` is not adopted until the
+scheduler detects the process. Until then the process runs on the real
+scheduler. One such process is usually harmless. 2 such processes, created by
+operations that are injected close together, race to deliver their first
+messages.
 
-A gated spawn closes the window: the child starts blocked on a token only the
-scheduler can send, so there is no interval in which it is alive and unowned.
+**Mechanism.** A gated spawn removes the interval. The child starts blocked
+on a token that only the scheduler can send. The child is therefore never
+alive and unowned.
 
-**Inside a transformed module you get this for free.** Every local spawn form
-is rewritten: `spawn`, `spawn_link`, `spawn_monitor`, and `spawn_opt`, on
-both `erlang` and `proc_lib`, qualified or bare. `start`, `start_link`, and
-`start_monitor` on `gen_server` and `gen_statem` are rewritten too, at both
-arities, because those spawn inside OTP where no transform of your code
-reaches.
+**Inside a transformed module.** The transform rewrites every local spawn
+form:
 
-**Inside `execute/2` you don't**, because your harness isn't transformed. Use
-`eta_run:spawn_op/1` there. It is the same mechanism under a different name:
+- `spawn`, `spawn_link`, `spawn_monitor` and `spawn_opt`, on both `erlang`
+  and `proc_lib`, qualified or bare.
+- `start`, `start_link` and `start_monitor` on `gen_server` and `gen_statem`,
+  at both arities. These functions spawn inside OTP, which the transform of a
+  module does not reach.
+
+**Inside `execute/2`.** The harness is not transformed. Use
+`eta_run:spawn_op/1`, which uses the same mechanism:
 
 ```erlang
 spawn_op(Fun) ->
     eta_sched:spawn(Fun).
 ```
 
-There used to be 2 gating protocols with 2 different tokens, and the harness
-had to know which one it was in. There is 1 now, and the thing that releases
-a gated child is `eta_sched:register/2`, which the driver already calls with
-whatever `processes/1` returns after every operation. So the order operations
-become runnable in is the order `processes/1` hands them over, and that is
-the only ordering rule. It used to be that plus an undocumented one hidden in
-a process-dictionary stack.
+**Ordering rule.** There is 1 gating protocol. `eta_sched:register/2`
+releases a gated child. The driver calls `eta_sched:register/2` after every
+operation with the list that `processes/1` returns. Operations therefore
+become runnable in the order in which `processes/1` returns their processes.
+No other ordering rule exists.
 
-Watch `sched.adopted_late` in the run result. It should be at or very near
-zero.
+**Detection.** Check `sched.adopted_late` in the run result. The value must
+be 0 or very close to 0.
 
-### An unseeded `rand` is a determinism hole, and it's handled
+### A process that does not seed rand gets a seed from the real clock
 
-`rand:uniform/1` draws from a state in the process dictionary, and a process
-that has never seeded it gets seeded by OTP on first use — from
-`erlang:system_time/0` and `erlang:unique_integer/1`, inside the `rand`
-module, where no transform of your code reaches. So a system that picks a
-gossip peer with `lists:nth(rand:uniform(length(Peers)), Peers)` has a
-schedule that isn't a function of the seed, and nothing in the run result
-says so: `adopted_late` is 0, nothing loaded late, the scheduler's accounting
-is clean, and the same seed produces a different trace on every run.
+`rand:uniform/1` draws from a state in the process dictionary.
+When a process has never seeded that state, OTP seeds it on first use from
+`erlang:system_time/0` and `erlang:unique_integer/1`. The seeding happens
+inside the `rand` module, which the transform of a module does not reach. For
+example, a system that selects a gossip peer with
+`lists:nth(rand:uniform(length(Peers)), Peers)` has a schedule that is not a
+function of the seed. The run result does not report the problem:
+`adopted_late` is 0, no module is loaded late, and the accounting of the
+scheduler is correct. The same seed produces a different trace on every run.
 
-`eta_transform` rewrites `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`,
-`bytes/1` and `seed/1,2` to `eta_rand`, which gives each process a stream of its
-own derived from the run's seed. `crypto:strong_rand_bytes/1` goes the same
-way: under a run its bytes come from that stream, so an identifier made of
-random bytes sorts the same way on every run of a seed. Those bytes are not
-cryptographically strong. An explicit `rand:seed(Alg, Seed)` is honoured,
-since that was deterministic already. Only the process-local API is covered:
-`rand:uniform_s/1,2` and the rest of the `_s` family take their state as an
-argument and were never the problem.
+**What eta does.** `eta_transform` rewrites the following calls to
+`eta_rand`. `eta_rand` gives each process its own stream, derived from the
+seed of the run.
 
-What it can't cover is a draw in an untransformed module, or one made by a
-process the scheduler isn't stepping. The second is counted as
-`rand.unmanaged` in the run result and `audit/1` reports it, the same way
-`net.unmanaged` reports a send from outside the schedule.
+| Call | Behaviour under a run |
+|---|---|
+| `rand:uniform/0,1`, `uniform_real/0`, `normal/0,2`, `bytes/1` | Draws from the stream of the process |
+| `rand:seed/1,2` | An explicit `rand:seed(Alg, Seed)` is honoured, because it was already deterministic |
+| `crypto:strong_rand_bytes/1` | The bytes come from the stream of the process. An identifier made of random bytes sorts the same way on every run of a seed. The bytes are not cryptographically strong. |
 
-### The distributed spawn forms work between simulated nodes only
+Only the process-local API is rewritten. `rand:uniform_s/1,2` and the other
+`_s` functions take the state as an argument and are already deterministic.
 
-`spawn(Node, Fun)` and its relatives ask for a process on another node. When
-the caller is on a simulated node and `Node` is one too, the spawn is simulated
-the way `eta_rpc` simulates an `rpc`: the child is a gated spawn placed on
-`Node`, so its `node()` and its registered names are `Node`'s, and the spawn
-connects the two nodes first. A spawn across a cut still returns a pid, and the
-child exits `noconnection` as soon as it runs, which is what a caller linked to
-or monitoring it would see in a real cluster.
+**Limitations.** `eta_rand` does not cover:
 
-Anywhere else there is no honest rewrite: running the child locally puts it on
-the wrong node, and letting it through puts it outside the schedule entirely.
-So a spawn from a process on no simulated node, or to a node the network has
-never heard of, raises while a run is active:
+- A draw in an untransformed module.
+- A draw by a process that the scheduler is not stepping. The run result
+  counts these draws as `rand.unmanaged`, and `audit/1` reports the count.
+  `net.unmanaged` reports a send from outside the schedule in the same way.
+
+### Distributed spawns work only between simulated nodes
+
+`spawn(Node, Fun)` and the related forms request a process on another node.
+
+**Caller and target both on simulated nodes.** The spawn is simulated in the
+way that `eta_rpc` simulates an `rpc`:
+
+- The child is a gated spawn placed on `Node`. `node()` in the child returns
+  `Node`, and the child uses the registered names of `Node`.
+- The spawn connects the 2 nodes first.
+- A spawn across a cut still returns a pid. The child exits with
+  `noconnection` as soon as it runs. A caller that links to or monitors the
+  child receives the same exit in a real cluster.
+
+**Any other case.** No correct rewrite exists. Running the child locally
+places it on the wrong node. Passing the spawn through places the child
+outside the schedule. A spawn from a process that is on no simulated node, or
+a spawn to a node that is not in the simulated network, therefore raises while a
+run is active:
 
 ```erlang
 {eta_sched, {no_distribution, {erlang, spawn, 2},
              <<"eta simulates distribution only between simulated nodes; place the caller and the target with eta_net">>}}
 ```
 
-With no run in progress those delegate, so a module built with the transform
-still works normally outside a simulation.
+When no run is in progress, these forms delegate to the original functions. A
+module built with the transform therefore works normally outside a
+simulation.
 
-The bare forms are rewritten as well as the qualified ones, since all of them
-are auto-imported: `spawn(Node, M, F, A)` written without `erlang:` used to run
-ungated, and showed up only as `adopted_late`.
+The transform rewrites the bare forms as well as the qualified forms, because
+all of them are auto-imported. Without the rewrite, a bare
+`spawn(Node, M, F, A)` would run ungated and would appear only in
+`adopted_late`.
 
-### suspend_process/1 is documented for debuggers
+### The scheduler is unverified above a few hundred processes
 
-That's what the scheduler is built on. It's clean at 3 processes and has been
-fine at a few hundred, but behaviour at 1000s, with supervisors and monitors
-in play, is unverified. Satisfy yourself about it before building on top for
-a very large system.
+The scheduler is built on `erlang:suspend_process/1`, which OTP documents as
+a function for debuggers.
 
-### One clock, one log and one scheduler per VM
+| Number of processes | Status |
+|---|---|
+| 3 | Works |
+| A few hundred | Works |
+| Thousands, with supervisors and monitors | Unverified |
 
-All 3 keep their state in named ETS tables, so exactly one of each exists per
-node and runs have to be serial. Keep the tests `async: false`.
+Verify the behaviour before building a simulation of a very large system.
 
-Getting it wrong is now loud rather than silent. Starting a second clock,
-log, or scheduler while a live process holds the first is refused, and the
-error names the owner:
+### A VM holds one clock, one log and one scheduler
+
+The clock, the log and the scheduler each keep their state in named ETS
+tables. Exactly one of each exists per VM, so runs must be serial. Keep the
+tests `async: false`.
+
+Starting a second clock, log or scheduler while a live process holds the
+first is refused. The error names the owner:
 
 ```erlang
 {eta_time, {clock_in_use, <0.312.0>,
             <<"one per VM; keep runs serial (`async: false`) ...">>}}
 ```
 
-It used to succeed. `eta_time:start/1` opened with an unconditional `stop()`,
-so a second run deleted the first's tables, and the first died on its next
-clock read with an ETS `badarg` in a stack that named nothing to do with the
-cause.
-
-If you want simulations to run in parallel, the unit of isolation is the
-**VM**, not the test process. Run seeds in separate OS processes; that
-isolates crashes and memory too. See [design.md](design.md) for why per-run
-state inside one VM is a bigger change than it looks.
+To run simulations in parallel, isolate each simulation in its own VM, not in
+its own test process. Run the seeds in separate OS processes. Separate OS
+processes also isolate crashes and memory. See
+[Per-run state](design.md#per-run-state-proposed-not-built) for the reasons
+that per-run state inside one VM is a large change.
 
 ## Time hazards
 
-### The wall clock is pinned to the seed, and that is load-bearing
+### The wall clock is derived from the seed
 
-`eta_time:system_time/1` and `os:timestamp/0` read as a plausible wall clock,
-and until 0.2 the anchor was the real time the clock started. That was a leak:
-a system that seeds `rand` from `os:timestamp/0` (riak_core's claimant does)
-carried the real start time into its schedule, so one seed reproduced when
-run twice in a row and a run and its replay diverged. `eta_run` now starts
-the clock with `system_ms` derived from the seed. If you drive `eta_time` by
-hand and something in your system does the same, pass `system_ms` yourself.
+`eta_time:system_time/1` and `os:timestamp/0` return a plausible wall-clock
+time. `eta_run` starts the clock with a `system_ms` value that is derived
+from the seed.
 
-### Start the clock before the system
+**Reason.** If the wall clock were anchored to the real start time, a system
+that seeds `rand` from `os:timestamp/0` would carry the real start time into
+its schedule. The claimant of `riak_core` seeds `rand` this way. A run and
+its replay would then diverge.
 
-`eta_run` does this for you, which is why `init/2` is called by the driver
-rather than by you beforehand. A timer armed while `eta_time` is inert goes
-onto the real clock and stays there until it fires and re-arms, so
-long-period timers, the interesting ones, would silently never become
-virtual.
+**What to do.** Code that drives `eta_time` directly must pass `system_ms`
+itself if the system reads the wall clock in this way.
 
-### receive ... after is handled
+### The clock must start before the system
 
-`eta_transform` rewrites calls, and `after` is a language construct rather
-than a call, so this looks as though it can't work. It can: `receive Cs after
-T -> B end` is an abstract form like any other, and the transform rewrites it
-into a receive whose timeout is an ordinary message clause on the virtual
-clock.
+A timer that is armed while `eta_time` is inert goes onto the real clock. The
+timer stays on the real clock until it fires and is armed again. A timer with
+a long period would therefore not become virtual during a run.
 
-**It's on by default.** `after` is the one real-time dependence a system can
-hold without naming a function. If it were behind an attribute, a module
-could quietly wake on the wall clock with nothing reporting it.
+`eta_run` starts the clock before the system. This is the reason that the
+driver calls `init/2`, and that the test does not call `init/2` beforehand.
 
-`-eta_after(false).` opts a module out, for a hot receive loop where the cost
-of arming and cancelling a timer per receive is measurable. `after 0` is
-never rewritten, since it's a mailbox poll rather than a wait.
+### receive ... after is rewritten by default
 
-### gen_statem's state_timeout is handled, and its other two aren't
+`eta_transform` rewrites calls, and `after` is a language construct, not a
+call. The rewrite is still possible, because `receive Cs after T -> B end` is
+an abstract form like any other form. The transform rewrites it into a
+receive whose time-out is an ordinary message clause on the virtual clock.
 
-A `state_timeout` is armed by `erlang:start_timer` *inside* `gen_statem`,
-where no transform of your code reaches. `eta` takes the action out of the
-callback's returned action list instead, before OTP ever sees it, and arms a
-virtual deadline in its place. Nothing to turn on, and nothing to write
-differently.
+| Case | Behaviour |
+|---|---|
+| Default | Every `receive ... after` in a transformed module is rewritten |
+| `-eta_after(false).` | The module is not rewritten. Use it for a hot receive loop in which the cost of arming and cancelling a timer per receive is measurable. |
+| `after 0` | Never rewritten, because it is a mailbox poll and not a wait |
 
-This one was worth chasing because of how it failed. The timer went into the
-VM's wheel rather than `eta_time`'s, so it wasn't a stray timer either.
-Nothing counted it and nothing warned. A machine waiting on a 30 second
-election period just sat there, and whatever happened next was ordered by the
-wall clock.
+The rewrite is on by default because `after` is the one dependence on real
+time that a system can hold without naming a function. If the rewrite
+required an attribute, a module without the attribute would wake on the wall
+clock and no field would report it.
 
-**Event time-outs and generic time-outs raise.** `{timeout, T, Msg}`, a bare
-integer action, and `{{timeout, Name}, T, Msg}` all error while a clock is
-running. They can't be left alone: every event a `gen_statem` processes
-cancels a running event time-out, and delivering a virtualized state time-out
-spends one, so a machine using both would find eta's own traffic cancelling
-its deadlines. Use `state_timeout`, which is the right tool for most of what
-people reach for an event time-out to do anyway.
+### gen_statem event time-outs raise
 
-### gen_fsm's time-outs are handled the same way
+| Time-out action | Behaviour while a clock is running |
+|---|---|
+| State time-out: `{state_timeout, T, Content}` | On the virtual clock |
+| Generic time-out: `{{timeout, Name}, T, Content}` | On the virtual clock |
+| Event time-out: `{timeout, T, Content}` or a bare integer action | Raises |
+| A time-out of 0 | Left to `gen_statem`. See [Cancellation rules of a state time-out](#cancellation-rules-of-a-state-time-out). |
 
-`gen_fsm` is deprecated and still everywhere in older code — `riak_core`'s
-metadata exchange is one. Its time-out is the `after` of the `receive` in
-`gen_fsm`'s own loop, which no transform of your module reaches, so it has
-the same hole `state_timeout` had and gets the same answer: the `Timeout` is
-taken off the callback's return before OTP sees it and a virtual deadline is
-armed instead. Delivery is free, because `gen_fsm` already dispatches a
-`{timeout, Ref, {'$gen_event', Event}}` message — the shape its own
-`send_event_after/2` produces — to the state function as `Event`.
+**State and generic time-outs.** `gen_statem` arms these time-outs with
+`erlang:start_timer` inside `gen_statem`, which the transform of a module
+does not reach. `eta` removes the action from the action list that the
+callback returns, before OTP receives the list, and arms a virtual deadline in
+its place. No option enables this, and the callback code does not change. A
+generic time-out is kept per name and is delivered as a `{timeout, Name}`
+event.
 
-Two of its rules are worth knowing, and `eta` keeps both:
+Without this handling, the timer would go into the timer wheel of the VM and
+not into the timer wheel of `eta_time`. The timer would not be counted as a
+stray timer and no warning would be logged. A machine that waits on a
+30-second election period would not proceed in virtual time, and the wall
+clock would order the events that follow.
 
-- **Any message cancels it.** Not a state change, any message. A machine
-  that means "do this unless something arrives first" has that; one that
-  means "do this in 5 seconds regardless" wants `send_event_after/2`.
-- **A state function that calls another one directly** — `prepare(Ev, S) ->
-  update(start, S)` — arms whatever the inner one returns. The wrapper around
-  the outer function sees a return with no time-out and leaves the inner
-  arm alone, because it was not the one pending when the outer call began.
+**Event time-outs.** An event time-out cannot be left on the real clock, and
+it cannot be virtualised. Every event that a `gen_statem` processes cancels a
+running event time-out. Delivering a virtual state time-out or generic
+time-out uses one event. In a machine that used both, the deliveries made by
+`eta` would cancel the event time-outs of the machine. Use `state_timeout` or
+a generic time-out. `state_timeout` fits most uses of an event time-out.
 
-`{ok, S, D, Timeout}` from `init/1`, `{reply, R, S, D, Timeout}` and
-`{next_state, S, D, Timeout}` are all read. `hibernate` raises. Synchronous
-events (`sync_send_event` and friends) raise while a network is running —
-their reply leg is not on the network yet — while `send_event/2` and
-`send_all_state_event/2` are routed like casts.
+### gen_fsm time-outs are on the virtual clock
 
-### A state_timeout's cancellation rules are subtler than they look
+`gen_fsm` is deprecated and is still common in older code. The metadata
+exchange of `riak_core` is one example.
 
-Worth knowing whether or not you use `eta`, and `eta` reproduces them
-exactly:
+The time-out of a `gen_fsm` is the `after` of the `receive` in the loop of
+`gen_fsm`, which the transform of a module does not reach. `eta` handles it
+in the same way as `state_timeout`: `eta` takes the `Timeout` off the return
+value of the callback before OTP receives it, and arms a virtual deadline
+instead. Delivery needs no extra mechanism. `gen_fsm` already dispatches a
+`{timeout, Ref, {'$gen_event', Event}}` message to the state function as
+`Event`. `send_event_after/2` of `gen_fsm` produces a message of the same
+shape.
 
-- A **state change** cancels it. `keep_state`, `keep_state_and_data`,
-  `repeat_state`, `repeat_state_and_data`, and `{next_state, SameState, _}`
-  do not; the comparison is `=:=` on the state term.
-- A follower that rearms its election deadline on every heartbeat depends on
-  both halves of that: the `keep_state` doesn't cancel, and the new action
-  replaces the deadline.
-- `{state_timeout, update, Content}` with **nothing running** isn't an error.
-  It fires the event immediately, which `gen_statem` documents as deliberate.
-- A time-out cancelled *after* its timer fired produces no event at all, not
-  even a discarded one.
-- `{state_timeout, 0, Msg}` is delivered when the event **queue** drains,
-  which is after any event inserted with `next_event` and after any postponed
-  event, and before the next message is taken from the mailbox. It's still
-  cancellable while it waits, so "do this next, unless one of those makes me
-  leave the state first" is a thing you can write and rely on.
+`eta` keeps 2 rules of `gen_fsm`:
 
-That last one is why `eta` leaves zero time-outs with `gen_statem` rather
-than virtualizing them. A zero consults no clock, so there's nothing in it to
-make virtual, and no substitution reproduces both its position and its
-cancellability.
+- **Any message cancels the time-out.** A state change is not required. A
+  machine that means "do this unless something arrives first" gets that
+  behaviour. A machine that means "do this in 5 seconds regardless" must use
+  `send_event_after/2`.
+- **A state function that calls another state function directly arms the
+  time-out that the inner function returns.** An example is
+  `prepare(Ev, S) -> update(start, S)`. The wrapper around the outer function
+  receives a return value with no time-out. The wrapper leaves the time-out of
+  the inner function armed, because that time-out was not pending when the
+  outer call began.
+
+| `gen_fsm` feature | Behaviour |
+|---|---|
+| `{ok, S, D, Timeout}` from `init/1` | The time-out is read |
+| `{reply, R, S, D, Timeout}` | The time-out is read |
+| `{next_state, S, D, Timeout}` | The time-out is read |
+| `hibernate` | Raises |
+| Synchronous events (`sync_send_event` and the related functions) | Raise while a network is running, because the reply is not yet routed through the network |
+| `send_event/2` and `send_all_state_event/2` | Routed like casts |
+
+### Cancellation rules of a state time-out
+
+These are the rules of `gen_statem`. They apply with or without `eta`, and
+`eta` reproduces them exactly.
+
+- **A state change cancels the time-out.** `keep_state`,
+  `keep_state_and_data`, `repeat_state`, `repeat_state_and_data` and
+  `{next_state, SameState, _}` do not cancel it. The comparison is `=:=` on
+  the state term.
+- **A new action replaces the deadline.** A follower that arms its election
+  deadline again on every heartbeat depends on both rules: `keep_state` does
+  not cancel, and the new action replaces the deadline.
+- **`{state_timeout, update, Content}` with no time-out running is not an
+  error.** It delivers the event immediately. `gen_statem` documents this as
+  deliberate.
+- **A time-out that is cancelled after its timer fired produces no event.**
+  It does not produce a discarded event either.
+- **`{state_timeout, 0, Msg}` is delivered when the event queue is empty.**
+  That moment is after any event inserted with `next_event`, after any
+  postponed event, and before the next message is taken from the mailbox. The
+  time-out can still be cancelled while it waits. A machine can therefore
+  express "do this next, unless one of those events changes the state first".
+
+Because of the last rule, `eta` leaves a time-out of 0 with `gen_statem` and
+does not virtualise it. A time-out of 0 reads no clock, so it has nothing to
+virtualise. No substitute reproduces both its position in the queue and its
+cancellation.
 
 `test/support/eta_elect.erl` is a leader election written against these
-rules, and `test/eta_state_timeout_test.exs` is each of them as a test.
+rules. `test/eta_state_timeout_test.exs` has one test for each rule.
 
-### timer:sleep/1 is rewritten; a sleep outside the boundary still hangs
+### timer:sleep/1 in an untransformed module hangs the process
 
-A sleep is `receive after T -> ok end` inside OTP's `timer` module, which no
-transform of your code reaches, so the call site is rewritten instead:
-`timer:sleep/1` in a transformed module becomes `eta_time:sleep/1`, a virtual
-deadline the driver advances to like any other. With no clock running it's a
-real sleep, like every other rewrite.
+**In a transformed module.** A sleep is `receive after T -> ok end` inside
+the `timer` module of OTP, which the transform of a module does not reach.
+The transform rewrites the call site instead. `timer:sleep/1` becomes
+`eta_time:sleep/1`, which arms a virtual deadline. The driver advances the
+clock to that deadline like any other deadline. When no clock is running,
+`eta_time:sleep/1` is a real sleep. Every other rewrite behaves the same way
+without a clock.
 
-In an untransformed module the sleep stays real, and the process hangs. It's
-blocked on a timeout rather than on a message, and `eta_sched` decides what's
-runnable by looking at mailboxes, so it sees a process with nothing waiting
-for it and never steps it. Only the real clock can end that wait, and the
-driver doesn't control the real clock.
+**In an untransformed module.** The sleep stays real and the process hangs.
+The process is blocked on a time-out, not on a message. `eta_sched` determines
+which process is runnable by inspecting mailboxes. The mailbox of the
+sleeping process is empty, so `eta_sched` never steps the process. Only the
+real clock can end the wait, and the driver does not control the real clock.
 
-Keep transformed sleeps out of the driver. The clock advances only to
-deadlines of processes the scheduler can step, so a sleep executed on the
-driver's own process arms a deadline nothing will ever reach. That's the same
-rule as "a call from the driver can't have a virtual timeout" above.
+**In the driver.** Do not execute a transformed sleep on the process of the
+driver. The clock advances only to the deadlines of processes that the
+scheduler can step. A sleep on the process of the driver arms a deadline that
+the clock never reaches. This is the rule of
+[A call from the driver keeps its real time-out](#a-call-from-the-driver-keeps-its-real-time-out).
 
-### A system with periodic timers never becomes quiet
+### A system with periodic timers never becomes quiescent
 
-Heartbeats mean "nothing runnable and nothing pending" is a state you never
-reach. Without a bounded settle phase the only way such a run can end is the
-step budget, which is reported as an error, so every run looks like a
-failure. That's what `settle_steps` is for. The settle phase is also useful
-in its own right: it's the only part of a run where the invariants are
-checked with no client traffic at all.
+A system with heartbeats never reaches the state "no process is runnable and
+no timer is pending". Without a bounded settle phase, such a run can end only
+at the step budget. The step budget is reported as an error, so every run
+would be reported as a failure.
 
-### A timer outlives the scheduler's ownership of its process
+The `settle_steps` option bounds the settle phase. The settle phase is also
+the only part of a run in which the invariants are checked with no client
+traffic.
 
-A timer belongs to a process, and the scheduler is not obliged to own that
-process. When it doesn't, the timer is still in the wheel, and a driver that
-advances to the earliest deadline moves the clock on behalf of something that
-can never take a step. 2 runs of one seed then differ by an inserted
-`{clock, Ms}` with no step behind it, hundreds of entries in.
+### A timer can belong to a process that the scheduler does not own
 
-There are 2 ordinary ways to get one. A process killed while blocked in a
-rewritten `receive ... after` never reaches the clause head that disarms it,
-so its deadline outlives it. And a process spawned before the scheduler
-existed, which means anything your system starts during `init/2`, is outside
-the schedule by construction.
+A timer belongs to a process, and the scheduler does not
+necessarily own that process. The timer is still in the timer wheel. A driver
+that advanced to the earliest deadline would move the clock for a process
+that can never take a step. 2 runs of one seed would then differ by an
+inserted `{clock, Ms}` entry with no step after it, several hundred entries
+into the trace.
 
-`eta` steps over such deadlines rather than advancing to them, so this no
-longer changes a schedule, and reports the count as `stray_timers` in the run
-result. `audit/1` checks it. A non-zero count still means something worth
-fixing: a process holding a timer that nothing will ever schedule. Either
-hand it to `processes/1` so it becomes part of the run, or don't start it in
-`init/2`.
+**Causes.** A stray timer has 2 ordinary causes:
 
-### Timeouts outside the transform boundary are on the real clock
+- A process is killed while it is blocked in a rewritten `receive ... after`.
+  The process never reaches the clause head that disarms the timer, so the
+  deadline remains after the process has exited.
+- A process is spawned before the scheduler exists. Every process that the
+  system starts during `init/2` is in this category and is outside the
+  schedule.
 
-If you deliberately leave a client-facing module untransformed, its
-`gen_server:call` timeouts are real. Under the scheduler a client is
-suspended between steps, so when its call times out is decided by wall clock.
-The usual workaround is to configure the timeout high enough that it can't
-fire during a run, which removes the behaviour it guards from the set of
-things you're testing.
+**What eta does.** `eta` steps over such a deadline and does not advance the
+clock to it. A stray timer therefore does not change the schedule. The run
+result reports the count as `stray_timers`, and `audit/1` checks it.
 
-A **transformed** module's calls are virtual whenever a clock is running,
-whether or not you asked for a network. That used to depend on the network,
-so the ordinary configuration (scheduler and clock up, `net => false`) waited
-out a real 5 second `after` inside OTP on every call. If you have a run from
-before that was mysteriously sensitive to machine load, this was why.
+**What to do.** A count above 0 means that a process holds a timer and that
+the scheduler will never schedule that process. Either return the process
+from `processes/1`, so that it becomes part of the run, or do not start the
+process in `init/2`.
 
-### A call from the driver still can't have a virtual timeout
+### Time-outs in an untransformed module are on the real clock
 
-The exception to the above, and it follows from how the clock moves.
-`eta_run` advances only to deadlines belonging to a process it can step, and
-steps over everything else as a stray. A virtual deadline armed by the driver
-is therefore one nothing ever reaches: the driver is blocked waiting for a
-timeout that only the driver can deliver.
+**Untransformed module.** If a client-facing module is deliberately left
+untransformed, its `gen_server:call` time-outs are real. Under the scheduler,
+a client is suspended between steps, so the wall clock determines when the call
+times out. The usual workaround is to configure a time-out that is too long
+to fire during a run. The workaround removes the behaviour that the time-out
+guards from the behaviour under test.
 
-So a call made from `execute/2` or `check/1` keeps its real timeout, which is
-the same rule as before by a different route: those callbacks must not call
-into a scheduled process, and `eta_harness` says why. What changed is only
-that getting it wrong still ends in a 5 second exit rather than in a run with
-no way to finish.
+**Transformed module.** The call time-outs of a transformed module are
+virtual whenever a clock is running. A network is not required. With a
+scheduler and a clock and with `net => false`, a call does not wait for the
+real 5-second `after` inside OTP.
 
-### A virtual call timeout doesn't mean what a real one means
+### A call from the driver keeps its real time-out
 
-Worth understanding before you read a counterexample. The clock only moves
-when nothing is runnable, so a virtual call timeout fires exactly when the
-system reached a state where nothing could make progress and this was the
-earliest deadline. That's a much stronger statement than production's, where
-a timeout mostly means somebody was slow, and it makes a good lost-message
-and deadlock detector.
+This is the exception to the previous section. `eta_run` advances the clock
+only to a deadline that belongs to a process it can step. `eta_run` steps
+over every other deadline as a stray timer. A virtual deadline armed by the
+driver would never be reached: the driver would be blocked on a time-out that
+only the driver can deliver.
 
-The flip side is that **"the callee was slow" doesn't exist under a virtual
-clock**, because computation costs no virtual time. The race where a caller
-gives up and the answer arrives just afterwards is reachable only through a
-timer or a network delay, never through the callee taking too long. If that
-race is what you're hunting, you need `skew_ms` or a lossy network policy. A
-timeout on its own won't find it.
+A call made from `execute/2` or `check/1` therefore keeps its real time-out.
+The underlying rule is that `execute/2` and `check/1` must not call into a
+scheduled process. `eta_harness` documents the reason. A harness that breaks
+the rule gets an exit after 5 seconds of real time, not a run that cannot
+finish.
 
-For the same reason, the *numbers* matter more than they do in production.
-Deadlines are what the clock jumps between, so a timeout value orders events
-against every heartbeat, lease, and retry in the system. Every default is
-5000, so they land on one deadline and fire in creation order, the same order
-every run. `skew_ms` is what breaks the tie, and it reaches receive and call
-deadlines as well as the timers your system sets itself.
+### A virtual call time-out means that nothing could make progress
 
-`drop_p` deliberately does *not* reach them. A timer your system sets to fire
-at another process can go missing with that process; a deadline a process
-arms for itself cannot, and dropping one produces a hang that looks like a
-finding but isn't.
+**Meaning.** The clock moves only when no process is runnable. A virtual call
+time-out therefore fires exactly when the system reached a state in which no
+process could make progress, and the time-out was the earliest deadline. In
+production, a time-out usually means that a process was slow. The virtual
+time-out is a stronger statement. It detects lost messages and deadlocks
+well.
+
+**A slow callee does not exist under a virtual clock.** Computation takes no
+virtual time. The race in which a caller gives up and the reply arrives
+immediately afterwards is reachable only through a timer or a network delay.
+It is not reachable through a slow callee. To find that race, use `skew_ms`
+or a lossy network policy. A time-out alone does not find it.
+
+**Time-out values order events.** The clock moves from deadline to deadline.
+A time-out value therefore orders the time-out against every heartbeat, lease
+and retry in the system. Every default call time-out is 5000 ms, so the
+defaults share one deadline and fire in creation order, which is the same on
+every run. `skew_ms` breaks the tie. `skew_ms` applies to receive deadlines
+and call deadlines as well as to the timers that the system sets.
+
+**`drop_p` does not apply to these deadlines.** This is deliberate. A timer
+that the system sets to fire at another process can be lost together with
+that process. A deadline that a process arms for itself cannot be lost.
+Dropping such a deadline would produce a hang that resembles a finding and is
+not one.
 
 ## Observability hazards
 
-### An invariant that asks is an invariant that checks nothing
+### Invariants must read state without calling a process
 
-Covered on the [previous page](04-writing-a-system-under-test.md), and
-repeated here because it's the failure that doesn't announce itself. A client
-API that catches its own call timeout returns a plausible answer for a
-suspended process, and the invariant computes over that answer and passes.
-`eta_run` bounds `check/1` and reports `check_blocked` when it hangs. It
-can't detect the case where the API answers.
+This hazard is described on the
+[previous page](04-writing-a-system-under-test.md). It is repeated here
+because the failure produces no error.
 
-### When something hangs, measure how long
+- **Symptom.** The invariant passes and has checked nothing.
+- **Cause.** A client API that catches its own call time-out returns a
+  plausible answer for a suspended process. The invariant computes over that
+  answer.
+- **Detection.** `eta_run` bounds `check/1` and `check_final/2` with the
+  `check_timeout` option, which defaults to 5000 ms of real time. When the
+  bound is exceeded, the run ends with `{error, check_blocked}`. `eta_run`
+  cannot detect the case in which the API returns an answer.
+- **Remedy.** Read the state without a call to a scheduled process.
 
-A stall costing *exactly* the timeout is a lost wakeup: a message that never
-arrived, a watch that never fired. A variable one is contention. Some call
-timeouts against the in-memory backend here were diagnosed as a retry
-livelock and were nothing of the sort. They were a watch anchored to the
-wrong version, which looks nothing like contention once somebody has looked
-at the distribution.
+### The duration of a stall identifies its cause
 
-### If you build a deterministic substitute, compare it differentially
+When a call hangs, measure the duration of each stall.
 
-An in-memory replacement for a database is a large piece of code that has to
-behave exactly like the thing it replaces, and a substitute that's subtly
-wrong is worse than none, because every finding it produces is suspect.
-Every bug we found in this project's in-memory backend came from running the
-same operations against both implementations and diffing the results, not
-from reading the code.
+| Duration of the stall | Cause |
+|---|---|
+| Exactly the time-out, every time | A lost wakeup: a message that never arrived or a watch that never fired |
+| Variable | Contention |
 
-Version equality is where those bugs cluster. "Did this key change after my
-read version?" and "should this watch fire?" are both questions about a
-boundary, and a commit landing exactly on the boundary is the case that gets
-written wrong: a conflict that isn't detected, a watch that never fires.
+Example: some call time-outs against the in-memory backend of this project
+were first diagnosed as a retry livelock. The distribution of the durations
+showed a different cause. A watch was anchored to the wrong version.
+
+### A deterministic substitute must be compared with the real implementation
+
+An in-memory replacement for a database is a large piece of code that must
+behave exactly like the database. If the substitute is wrong, every finding
+that it produces is in doubt. A wrong substitute is therefore worse than no
+substitute.
+
+Run the same operations against both implementations and compare the results.
+Every defect found in the in-memory backend of this project was found this
+way. No defect was found by reading the code.
+
+Most of those defects concerned version equality. "Did this key change after
+my read version?" and "should this watch fire?" are both questions about a
+boundary. A commit that lands exactly on the boundary is the case that is
+most often implemented wrongly. The results are a conflict that is not
+detected and a watch that never fires.
 
 ## Workload and trace hazards
 
 ### Operations must be stable across runs
 
-An operation carrying a generated name, a pid, or a ref makes the trace
-incomparable between runs and unreplayable against a fresh system. The
-symptom is a trace difference at a very early index, which reads exactly like
-a scheduling divergence.
+An operation that carries a generated name, a pid or a reference makes the
+trace incomparable between runs. The trace also cannot be replayed against a
+fresh system. The symptom is a trace difference at a very early index, which
+has the same appearance as a scheduling divergence. See also
+[Operations must not carry pids](#operations-must-not-carry-pids).
 
-### Every action the driver takes has to be in the trace
+### The trace must record every action of the driver
 
-`eta_run` records `{step, Id}` and `{op, Op}`. For a while it didn't record
-its third action, advancing the clock, on the reasoning that the clock is a
-function of the timers and the timers are a function of the schedule, so a
-replay would advance in the same places by itself.
+The driver takes 3 kinds of action, and the trace has an entry type for each:
 
-It doesn't, because `replay/3` walks only the entries it's given. A trace
-from a system with timers replayed against a clock that never moved. Nothing
-became runnable, every recorded step was refused, and a strict replay failed
-at entry 0. `eta_shrink` reported "nothing to shrink" for a failure that had
-just happened, because it replays the trace to classify it and got a clean
-run back.
+| Trace entry | Action of the driver |
+|---|---|
+| `{step, Id}` | Step a process |
+| `{op, Op}` | Inject an operation |
+| `{clock, Ms}` | Advance the clock |
 
-`{clock, Ms}` is an entry type now. The transferable lesson is why the bug
-survived so long. `replay/3` had only ever been exercised against a system
-with no timers, while the timer-driven system's "replay works" measurement
-re-ran the *seed*, which exercises `run/2`. 2 different claims that both
-sound like "replay works", and only one of them was tested.
+**Reason for `{clock, Ms}`.** The clock is a function of the timers, and the
+timers are a function of the schedule. This does not make the clock entry
+redundant, because `replay/3` walks only the entries that it is given.
+Without clock entries:
 
-### A seed-pinned regression test is coupled to your generator
+1. A trace from a system with timers is replayed against a clock that never
+   moves.
+2. No process becomes runnable, and every recorded step is refused.
+3. A strict replay fails at entry 0.
+4. `eta_shrink` reports "nothing to shrink" for a real failure, because
+   `eta_shrink` replays the trace to classify it and receives a clean run.
 
-A seed names a schedule **only in the context of a particular `generate/2`.**
-Change the operation mix and every seed you pinned quietly starts testing
-something else.
+**Rule for tests of replay.** Two different claims can both be described as
+"replay works":
 
-If the test asserts on a violation you find out, because it fails. If it
-asserts `ok` it goes vacuous without a word, which is the same silent failure
-as an invariant that never gets evaluated.
+- Running the same seed again reproduces the run. This exercises `run/2`.
+- Replaying a recorded trace reproduces the run. This exercises `replay/3`.
 
-Pin the trace instead. `replay/3` never calls `generate/2`. It walks the
-entries it's given, so a saved trace survives a rewritten workload entirely.
+Test both claims. Test `replay/3` against a system that has timers.
+
+### A regression test pinned to a seed depends on the generator
+
+A seed identifies a schedule only for one particular
+`generate/2`. After a change to the operation mix, every pinned seed tests a
+different schedule.
+
+| Assertion of the test | Result after `generate/2` changes |
+|---|---|
+| Asserts a violation | The test fails, so the change is visible |
+| Asserts `ok` | The test passes and no longer tests the original schedule. No error is reported. |
+
+**Remedy.** Pin the trace. `replay/3` never calls `generate/2`. It walks the
+entries that it is given, so a saved trace is unaffected by a rewritten
+workload.
 
 ```erlang
 %% once, from a shrink whose `verified` was true
@@ -601,126 +701,144 @@ entries it's given, so a saved trace survives a rewritten workload entirely.
     eta_run:replay_fixture("test/fixtures/atomicity.eta").
 ```
 
-`save_fixture/4` replays the trace strictly before writing anything and
-refuses on a divergence, so a fixture on disk is one that has been
-demonstrated to reproduce. It stores the harness and the options alongside
-the trace, which matters as much as the trace does: a reproduction that needs
-`config => #{mode => broken}` and gets replayed without it does not
-reproduce.
+`save_fixture/4` replays the trace strictly before it writes the file, and
+does not write the file on a divergence. A fixture on disk has therefore been
+shown to reproduce. `save_fixture/4` stores the harness and the options with the
+trace. The options are as necessary as the trace: a reproduction that needs
+`config => #{mode => broken}` does not reproduce when it is replayed without
+that option.
 
-In short: pin a seed when you're testing that seeds reproduce. Pin a trace
-when you're regressing a bug.
+**Rule.**
 
-You can't write the mirror test. Replaying a failing trace against a fixed
-implementation does not report `ok`, because the fix changes which messages
-exist, so recorded step ids stop being runnable and you get
-`{error, {diverged, _, _}}`. "The fix works" is a claim about the whole
-system, and a seed sweep is the right shape for it.
+- Pin a seed to test that seeds reproduce.
+- Pin a trace to test for the regression of a defect.
+
+**Limitation.** A failing trace cannot be replayed against a fixed
+implementation to show that the fix works. The replay does not report `ok`.
+The fix changes which messages exist, so the recorded step ids are no longer
+runnable, and the replay returns `{error, {diverged, _, _}}`. "The fix works"
+is a claim about the whole system. Use a seed sweep to test it.
 
 ## Fault injection hazards
 
-### A seeded fault schedule starts where its seed is applied
+### A seeded fault schedule starts where the seed is applied
 
-The symptom is specific enough to recognize. A seed reproduces exactly right
-up to the first injected fault, and never after.
+**Symptom.** A seed reproduces exactly up to the first injected fault and
+never after it.
 
-A simulated network draws from its seeded generator once per message the
-policy applies to. If the policy is installed after the cluster is up, which
-it usually has to be so that no member is partitioned away before it has ever
-synced, then the cluster's own startup traffic has already consumed draws.
-Startup runs on the real scheduler and varies in both order and message
-count, so the fault schedule begins at an offset that differs on every run.
+**Cause.** A simulated network draws from its seeded generator once for each
+message that the policy applies to. The policy is usually installed after the
+cluster is up, so that no member is partitioned before it has synchronised.
+The startup traffic of the cluster has then already consumed draws. Startup
+runs on the real scheduler, and both the order and the number of its messages
+vary. The fault schedule therefore begins at an offset that differs on every
+run.
 
-Anything that consumes the generator before the run begins silently offsets
-the schedule. Reseed when the run starts, and treat "the fault schedule is a
-function of the seed" as something to assert rather than assume.
+**Remedy.** Any draw from the generator before the run begins offsets the
+fault schedule, and no error is reported. Reseed when the run starts. Assert
+that the fault schedule is a function of the seed. Do not assume it.
 
-### Only inject faults the system can actually see
+### Inject only faults that a real system can observe
 
-Erlang guarantees that messages between an ordered pair of processes arrive
-in send order, and doesn't guarantee delivery at all. Dropping messages is
-therefore a faithful model of a failing link, and reordering them within a
-pair isn't. Inject reordering and every bug you find is a false positive.
+**Reordering within a pair of processes is not a valid fault.** Erlang
+guarantees that messages between an ordered pair of processes arrive in send
+order. Erlang does not guarantee delivery. Dropping messages is therefore a
+faithful model of a failing link. Reordering messages within a pair is not.
+Every defect found by injecting such reordering is a false positive.
 
-The subtler version is that dropping a message models a link failure, and a
-real link failure is never *just* lost messages. It comes with `nodedown` and
-`nodeup` on both sides, and systems hang their recovery off those signals.
-Drop messages without delivering the node event and you've injected something
-no real network produces: messages vanishing while both ends still believe
-the link is up. The unrecovered state you then report isn't a defect.
-`eta_net:partition/2` delivers that event to every process subscribed with
-`net_kernel:monitor_nodes/1`, so a system that watches nodes the usual way hears
-it without the harness doing anything.
+**A dropped message without a node event is not a valid fault.** Dropping a
+message models a link failure. A real link failure also delivers `nodedown`
+and `nodeup` to both sides, and systems attach their recovery to those
+signals. Dropping messages without delivering the node event injects a
+condition that no real network produces: messages are lost while both ends
+still consider the link up. An unrecovered state found this way is not a
+defect. `eta_net:partition/2` delivers the node event to every process that
+subscribed with `net_kernel:monitor_nodes/1`. A system that monitors nodes in
+the usual way therefore receives the event without any action by the harness.
 
-There's a trap on the other side of that. If you do deliver the node event,
-recovery may repair the very divergence you were trying to observe. In the
-process registry we tested, a rejoin makes the leader send that member a
-fresh snapshot. A run
-that asserts a property *during* a fault has to restrict the loss to a
-channel whose recovery is self-contained.
+**Recovery can repair the divergence under observation.** When the node event
+is delivered, recovery may repair the divergence that the run was meant to
+observe. In the process registry that was tested with `eta`, a rejoin makes
+the leader send a fresh snapshot to the member. A run that asserts a property
+during a fault must restrict the loss to a channel whose recovery is
+self-contained.
 
-### Too many faults crowd each other out
+### A second fault reduces the detection rate of the first
 
-Adding a second fault costs you search efficiency on the first. Measured on a
-quorum register: a workload that reproduced its write-back bug in **21 of 200
-seeds** dropped to **12 of 200** once a replica-pause fault was added, with
-the first failing seed moving from 6 to 53. Operations that time out never
-complete, and only completed operations can violate a safety property.
+Adding a second fault reduces the search efficiency for the first fault.
+Operations that time out never complete, and only a completed operation can
+violate a safety property.
 
-The sharper version of the same problem, seen before retuning that pause
-rate: the crashed-writer fault that made the bug reachable **disappeared from
-the event log entirely.** Not one completed. The new fault had crowded out
-the old one.
+Measured on a quorum register, with a workload that reproduces a write-back
+defect:
 
-The rule above is about injecting faults the system could never see. This is
-the opposite failure and it's just as quiet: inject too many and the suite
-stays green because nothing interesting ever completes.
+| Workload | Seeds that reproduced the defect | First failing seed |
+|---|---|---|
+| Without the replica-pause fault | 21 of 200 | 6 |
+| With the replica-pause fault | 12 of 200 | 53 |
 
-### A workload happens at virtual time zero
+Before the pause rate was retuned, the effect was total. The crashed-writer
+fault, which made the defect reachable, did not appear in the event log at
+all. Not one crashed-writer operation completed.
 
-Worth knowing before you inject anything with a *duration*, because the
-natural mental model is wrong.
+The previous section concerns faults that a real system could never observe.
+This section concerns the opposite failure, which also reports no error. With
+too many faults, the suite passes because no operation that could violate a
+property completes.
 
-The virtual clock only advances when nothing is runnable, and the driver is
-busy injecting and stepping throughout, so **an entire `max_ops` workload is
-typically injected while the clock still reads 0.** A fault lasting about as
-long as a run is therefore either active for all of it or none of it.
+### A workload is injected at virtual time zero
 
-The consequence is that such a fault tunes bimodally rather than smoothly. 10
-seeds of a 3-replica register with a 10-second pause gave give-up counts of
-`0, 0, 0, 0, 0, 0, 9, 9, 11, 12`. Lowering the rate makes jams rarer. It
-can't make them milder.
+Read this section before injecting a fault that has a duration.
+
+The virtual clock advances only when no process is runnable. The driver
+injects and steps throughout the workload. An entire `max_ops` workload is
+therefore typically injected while the clock still reads 0. A fault that
+lasts about as long as a run is active either for the whole run or for none
+of it.
+
+Such a fault therefore has a bimodal effect. 10 seeds of a 3-replica register
+with a 10-second pause gave give-up counts of
+`0, 0, 0, 0, 0, 0, 9, 9, 11, 12`. A lower fault rate makes the jammed runs
+less frequent. It does not make a jammed run less severe.
 
 ## Distribution hazards
 
-### Every simulated node is one VM, with a namespace each
+### All simulated nodes share one VM
 
-`node()`, `nodes()` and `net_kernel`'s events are answered by `eta_net`, and each
+`eta_net` provides the results of `node()` and `nodes()` and the events of
+`net_kernel`. Each
 simulated node has its own registered names, named ETS tables and
-`persistent_term` keys (see `eta_ns`). So a system runs under the same names on
-every node, as it would on a real cluster.
+`persistent_term` keys (see `eta_ns`). A system therefore runs under the same
+names on every node, as it does on a real cluster.
 
-Three things are still one per VM:
+Three things still exist once per VM:
 
-- **Applications.** `application_controller` is shared, so an application can't be
-  started once per node. Start its top supervisor on each node instead, and start
-  the application itself before the run only if the system insists on it being
-  running; `eta_app` answers that without a call.
-- **Anything the VM itself started.** A node that looks up a name it hasn't
-  registered finds the VM's process of that name, if there is one, and that
-  process runs outside the schedule. If the system's own applications are running
-  in the VM (`mix test` starts them), a node can reach them while its own copies
-  are still starting, and seeds stop reproducing. Run with `--no-start`.
-- **Code not rewritten.** A name passed to a module the transform never saw is
-  looked up in the VM's namespace. Instrument the dependencies too.
+- **Applications.** `application_controller` is shared, so an application
+  cannot be started once per node. Start the top supervisor of the
+  application on each node instead. Start the application itself before the
+  run only if the system requires it to be running. `eta_app` reports
+  whether an application is running, without a call.
+- **Processes that the VM started.** A node that looks up a name it has not
+  registered finds the process of that name in the VM, if one exists. That
+  process runs outside the schedule. If the applications of the system are
+  running in the VM, a node can reach them while its own copies are still
+  starting, and seeds stop reproducing. `mix test` starts the applications.
+  Run with `--no-start`.
+- **Code that is not rewritten.** A name passed to a module that the
+  transform has not processed is looked up in the namespace of the VM.
+  Instrument the dependencies too.
 
-### node(X) in a guard is refused
+### node(X) in a guard is refused at compile time
 
-`node()` in a guard is fine; the transform reads it just before the clauses are
-tried. `node(Pid)` in a guard isn't, because the pid is usually bound by the
-clause's own pattern and there's nowhere to read it first. The transform refuses
-the module with the line number rather than letting the guard ask the real node,
-which is the same for every simulated node. Move the test into the body:
+| Guard expression | Behaviour |
+|---|---|
+| `node()` | Accepted. The transform reads the node immediately before the clauses are tried. |
+| `node(Pid)` | Refused. The transform rejects the module and reports the line number. |
+
+The pattern of the clause usually binds the pid, so the transform has no
+earlier point at which to read the node of the pid. If the guard were left
+unchanged, it would read the real node, which is the same for every simulated
+node. Move the test into the body:
 
 ```elixir
 # Refused:
@@ -730,51 +848,73 @@ defp exit_local(pid) when node(pid) == node(), do: Process.exit(pid, :kill)
 defp exit_local(pid), do: if(node(pid) == node(), do: Process.exit(pid, :kill))
 ```
 
-### A heal doesn't reconnect
+### A healed partition does not reconnect nodes
 
-On a real cluster a healed network leaves nodes disconnected until something
-connects them, usually a reconnect loop or a library like libcluster. `eta_net`
-does the same: after `heal_partition/2`, a node is connected again only when one
-of its processes calls `connect_node/1` or sends without `noconnect`. A system that
-only ever sends with `noconnect` and has no reconnect loop of its own stays apart,
-and a run that ends that way reports divergence that is real for that system. If
-your production cluster has a reconnect loop the system doesn't, put one in the
-harness.
+On a real cluster, a healed network leaves the nodes disconnected until some
+code connects them. That code is usually a reconnect loop or a library such
+as libcluster. `eta_net` behaves the same way. After `heal_partition/2`, a
+node is connected again only when one of its processes calls `connect_node/1`
+or sends without `noconnect`.
 
-Nodes start disconnected for the same reason. Connect them once each node's
-system is up, as a cluster's discovery would, or peers will reach it before it is
-ready to hear them.
+A system that always sends with `noconnect` and has no reconnect loop stays
+disconnected. A run that ends in that state reports a divergence that is real
+for that system. If the production cluster has a reconnect loop that the
+system under test does not have, add one to the harness.
+
+Nodes also start disconnected, for the same reason. Connect the nodes after
+the system on each node is up, as the discovery mechanism of a cluster would.
+Otherwise peers reach a node before the node is ready to receive from them.
 
 ## Shrinking hazards
 
-### Give your violations a property key
+### Violations need a property key
 
-`eta_shrink`'s default test for "the same failure" is the violation's
-`property` key when there is one, and any violation at all when there isn't.
-With more than one invariant, the fallback will cheerfully shrink one bug
-into a different one, which is worse than no shrink because it looks like
-progress.
+By default, `eta_shrink` determines whether 2 failures are the same failure as
+follows:
+
+- If the violation has a `property` key, the failures are the same when the
+  keys are equal.
+- If the violation has no `property` key, any violation counts as the same
+  failure.
+
+With more than one invariant and no `property` key, `eta_shrink` can shrink
+one defect into a different defect. That result is worse than no shrink,
+because it appears to be a valid minimal trace. Give every violation a
+`property` key.
 
 ## Elixir hazards
 
-### Task and Agent raise, on purpose
+### Task and Agent raise while a scheduler is active
 
-Both spawn and wait *inside* the Elixir standard library, where the scheduler
-cannot gate them: a `Task.async/1` child would run outside the schedule, and
-a `Task.await/2` is a `receive ... after` in a module no transform touched,
-sitting on the real clock. Every entry point is rewritten to raise while a
-scheduler is active — `{eta_sched, {unsupported, {Task, :async, 1}, ...}}` —
-and to call the original otherwise, so ordinary builds and tests are
-unaffected. Under simulation, use a plain `spawn/1` (which is gated) or a
-`GenServer` for the same job, or instrument them; see the next section.
+`Task` and `Agent` spawn and wait inside the Elixir standard library, where
+the scheduler cannot gate them:
 
-### Instrument what you cannot opt in
+- A `Task.async/1` child would run outside the schedule.
+- A `Task.await/2` is a `receive ... after` in a module that no transform
+  processed, so it would wait on the real clock.
 
-`use Eta` reaches only code you can edit. A system also runs on dependencies,
-`Registry`, `Supervisor`, `Task`, `:pg` and OTP's `:supervisor`, and a process
-those spawn is adopted but never released: its mailbox is empty, so nothing ever
-makes it runnable, and the run ends looking quiet and clean. `Eta.Beam.instrument/1`
-rewrites them in memory, once per VM, before the first run:
+The transform rewrites every entry point. While a scheduler is active, the
+entry point raises `{eta_sched, {unsupported, {Task, :async, 1}, ...}}`.
+Otherwise the entry point calls the original function, so ordinary builds and
+tests are unaffected.
+
+Under simulation, use one of the following:
+
+- A plain `spawn/1`, which is gated.
+- A `GenServer`.
+- Instrumented `Task` and `Agent` modules. See the next section.
+
+### Dependencies must be instrumented
+
+`use Eta` applies only to code that the project can edit. A
+system also runs on dependencies: `Registry`, `Supervisor`, `Task`, `:pg` and
+`:supervisor` of OTP. A process that one of these modules spawns is adopted
+and never released. The mailbox of the process is empty, so the process never
+becomes runnable. The run ends with the appearance of a quiescent system and
+reports no error.
+
+**Remedy.** `Eta.Beam.instrument/1` rewrites the modules in memory, once per
+VM, before the first run:
 
 ```elixir
 Eta.Beam.instrument([:supervisor, Supervisor, Supervisor.Default, DynamicSupervisor,
@@ -782,112 +922,150 @@ Eta.Beam.instrument([:supervisor, Supervisor, Supervisor.Default, DynamicSupervi
                      Task, Task.Supervisor, Task.Supervised, Enum])
 ```
 
-Nothing on disk changes, and the rewrites are inert outside a run. `Enum` is on
-that list for `Enum.shuffle/1` and `Enum.random/1`, which draw from `:rand` inside
-the stdlib.
+No file on disk changes, and the rewrites are inert outside a run. `Enum` is
+in the list because `Enum.shuffle/1` and `Enum.random/1` draw from `:rand`
+inside the standard library.
 
-On OTP 28, instrument `:supervisor` even if every child starts without it. A
-supervisor that handles a call asks `gen_server` to hibernate it after an idle
-second, and `gen_server` arms a real timer for that. When the timer fires, the
-supervisor becomes runnable at whatever step the run has reached, so a run that
-started a child late doesn't replay. The instrumented `:supervisor` never asks
-to hibernate.
+**OTP 28.** Instrument `:supervisor` even if every child starts without it.
+The sequence without instrumentation is:
 
-### Operation bodies need the transform too
+1. A supervisor handles a call.
+2. The supervisor requests hibernation from `gen_server` after 1 idle second.
+3. `gen_server` arms a real timer for the hibernation.
+4. When the timer fires, the supervisor becomes runnable at whatever step the
+   run has reached.
+5. A run that started a child late does not replay.
 
-A harness is driver code and carries no `use Eta`, but a function passed to
-`eta_run:spawn_op/1` runs as part of the system. Written in the harness, its
-`Process.sleep/1` is on the real clock, so it does not wake during a virtual run,
-and its `GenServer.call/2` is not routed. Put operation bodies in a module that
-opts in.
+The instrumented `:supervisor` never requests hibernation.
 
-### Operations cannot carry pids
+### Operation bodies must be in a transformed module
 
-A trace records operations, and a replay executes them again. A pid in an operation
-is a pid from the original run, so the replay acts on a dead process and diverges,
-on every seed. Name things by an id the harness keeps, and resolve it in `execute/2`.
+A harness is driver code and has no `use Eta`. A function passed to
+`eta_run:spawn_op/1` runs as part of the system. If that function is written
+in the harness:
 
-The same goes for what a test compares after a replay. A value derived from
-`:erlang.unique_integer/0` differs between a run and its replay, so compare a
-violation's `property` rather than its whole detail.
+- Its `Process.sleep/1` is on the real clock, so the process does not wake
+  during a virtual run.
+- Its `GenServer.call/2` is not routed.
 
-### Spread the workload, and prove it
+Put operation bodies in a module that has `use Eta`.
 
-`eta_run` injects an operation whenever nothing is runnable, so at the default
-`quiet_p` a whole workload can land in the first virtual second. A partition then
-heals before anyone could notice, and the run passes. Raise `quiet_p` until time
-passes between operations, and count the events a scenario exists to cause. Assert
-that each happened: a failure detector that never fired is a scenario that tested
-nothing, and no invariant will tell you so.
+### Operations must not carry pids
 
-### Check a seed in a fresh VM
+A trace records operations, and a replay executes them again. A pid in an
+operation is a pid from the original run. The replay then acts on a dead
+process and diverges on every seed. Refer to a process by an id that the
+harness keeps, and resolve the id in `execute/2`.
 
-A strict replay in the same VM proves less than it looks like it does. Reference and
-pid values differ between VMs, and a run can depend on them without escaping the
-schedule, so `audit/1` passes and so does the replay. Run the seed twice, in 2 fresh
-VMs, and compare the traces. Run it alone, too: teardown happens in real time, so a
-run can also inherit the pid and reference values left behind by the run before it.
+The same rule applies to the values that a test compares after a replay. A
+value derived from `:erlang.unique_integer/0` differs between a run and its
+replay. Compare the `property` of a violation, not the whole detail of the
+violation.
 
-If a system compares references, or keeps them in keys it iterates, start the VM with
-one scheduler, `ELIXIR_ERL_OPTIONS="+S 1:1"`. Each scheduler thread makes references
-in its own sequence, so with several of them a seed can fork 2 ways at random. Setting
-`schedulers_online` from inside a running VM did not fix this when we tried it.
+### The workload must be spread over virtual time
 
-### Killing a tree is not one event
+`eta_run` injects an operation whenever no process is runnable. At the
+default `quiet_p`, a whole workload can be injected within the first virtual
+second. A partition then heals before any process could detect it, and the
+run passes.
 
-`Process.exit(supervisor, :kill)` spreads through links in real time, outside any
-step, so which processes are alive at the next decision depends on the wall clock.
-It reproduces for most seeds and diverges on a few. Kill the whole tree from
-`execute/2`, while everything is suspended, and wait for each `DOWN`. With a network,
-`eta_net:kill_node/2` does this; without one, walk the links and do the same, calling
-`eta_time:forget/1` on each pid.
+1. Raise `quiet_p` until time passes between operations.
+2. Count the events that the scenario exists to cause.
+3. Assert that each event happened.
 
-### The stdlib boundary is the transform boundary
+A scenario whose failure detector never fired has tested nothing, and no
+invariant reports that.
 
-The general rule behind the last gotcha: an Elixir standard library function
-that spawns, sleeps, or reads a clock *inside its own implementation* is
-outside the transform's reach unless the rewrite tables name it. `GenServer`,
-the `System` clock reads and the calendar constructors are named;
-`Process.send_after/3` and friends are inlined by the compiler into calls the
-Erlang tables already cover. When in doubt, read the compiled evidence — the
-beam's imports say exactly who a module calls:
+### A seed must be checked in a fresh VM
+
+A strict replay in the same VM is weaker evidence than it
+appears. Reference values and pid values differ between VMs. A run can depend
+on those values without leaving the schedule. In that case `audit/1` passes
+and the replay passes.
+
+**What to do.**
+
+- Run the seed twice, in 2 fresh VMs, and compare the traces.
+- Run the seed alone as well. Teardown happens in real time, so a run can
+  inherit the pid values and reference values that the previous run left.
+- If the system compares references, or keeps references in keys that it
+  iterates, start the VM with one scheduler:
+  `ELIXIR_ERL_OPTIONS="+S 1:1"`. Each scheduler thread makes references in
+  its own sequence. With several scheduler threads, a seed can take either of
+  2 paths at random. Setting `schedulers_online` from inside a running VM did
+  not fix this when it was tried.
+
+### Killing a supervision tree is not one event
+
+`Process.exit(supervisor, :kill)` propagates through links in
+real time, outside any step. The wall clock therefore determines which processes
+are alive at the next decision of the scheduler. The run reproduces for most
+seeds and diverges on a few.
+
+**Remedy.** Kill the whole tree from `execute/2`, while every process is
+suspended, and wait for each `DOWN`.
+
+| Configuration | Method |
+|---|---|
+| With a network | `eta_net:kill_node/2` |
+| Without a network | Walk the links, kill each process, wait for each `DOWN`, and call `eta_time:forget/1` on each pid |
+
+### Standard library functions outside the rewrite tables are outside the transform
+
+This is the general rule behind
+[Task and Agent raise while a scheduler is active](#task-and-agent-raise-while-a-scheduler-is-active).
+An Elixir standard library function that spawns, sleeps or reads a clock
+inside its own implementation is outside the transform, unless the rewrite
+tables name the function.
+
+| Function | Status |
+|---|---|
+| `GenServer`, the clock reads of `System`, the calendar constructors | Named in the rewrite tables |
+| `Process.send_after/3` and the related functions | The compiler inlines them into calls that the Erlang rewrite tables cover |
+
+When in doubt, inspect the compiled module. The imports of a beam file list
+every module that the module calls:
 
 ```elixir
 {:ok, {_, [imports: imports]}} = :beam_lib.chunks(~c"path/to.beam", [:imports])
 ```
 
-A transformed module whose imports still include `Elixir.Task` (or a library
-that wraps it) has a channel the schedule does not control.
+If the imports of a transformed module still include `Elixir.Task`, or a
+library that wraps `Task`, the module has a channel that the schedule does
+not control.
 
-### A stamped beam survives an eta upgrade
+### A stamped beam keeps the old transform after an eta upgrade
 
-`mix compile.eta` stamps every beam it rewrites and skips stamped beams on
-sight — that is what makes the pass safe to run repeatedly. The flip side:
-upgrading `eta` does not make Mix recompile *your* modules, and a stamped
-beam carries yesterday's transform until its source changes. After changing
-the `eta` dependency, run `mix compile --force` in the `:dst` env. (The same
-staleness gotcha as the Erlang one above, wearing Mix clothing.)
+`mix compile.eta` stamps every beam file that it rewrites, and skips a
+stamped beam file. The skip makes the pass safe to run repeatedly.
+
+An upgrade of `eta` does not make Mix recompile the modules of the project. A
+stamped beam file carries the transform of the previous `eta` version until
+its source changes. After a change to the `eta` dependency, run
+`mix compile --force` in the `:dst` environment.
 
 ## Teardown hazards
 
-ETS tables are owned by the process that created them, so an `on_exit`
-cleanup races the VM's own, and a cluster linked to the test process is
-already dead by the time it runs. Kill client processes before deleting
-tables they write to. By teardown the scheduler has been released, so
-anything still in flight is running again, and a client reaching its
-`ets:insert` after the table has gone crashes with a `badarg` that has
-nothing to do with the run.
+- **An `on_exit` cleanup races the cleanup of the VM.** An ETS table is owned
+  by the process that created it. A cluster that is linked to the test
+  process is already dead when `on_exit` runs.
+- **Kill client processes before deleting the tables that they write to.** By
+  teardown the scheduler has been released, so every process that was
+  suspended is running again. A client that reaches its `ets:insert` after
+  the table has been deleted crashes with a `badarg`. That crash is unrelated
+  to the run.
+- **Do not edit source files while background test runs are in progress.**
 
-And don't edit source while background test runs are in flight.
+## Verifying a fix
 
-## One closing rule
-
-2 clean runs isn't evidence for an intermittent fix. What is evidence is a
-test that fails deterministically before the fix and passes after it. If you
-can't produce one, the diagnosis isn't finished.
+2 clean runs are not evidence that an intermittent failure is fixed. The
+evidence is a test that fails deterministically before the fix and passes
+after the fix. If no such test can be produced, the diagnosis is not
+finished.
 
 ## Next
 
-[A Journey Through DST](06-a-journey-through-dst.md) is the whole thing end
-to end: an empty directory, a quorum register, a planted bug, and a minimized
-replayable failure that explains itself.
+[A Journey Through DST](06-a-journey-through-dst.md) is a complete
+walkthrough. It starts from an empty directory and builds a quorum register
+with a planted defect. It ends with a minimized, replayable failure and the
+log that explains the failure.

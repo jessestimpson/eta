@@ -1,33 +1,50 @@
 defmodule Eta do
   @moduledoc """
-  The Elixir face of `eta` — the same contract `include/eta.hrl` gives Erlang,
-  reached by `use` instead of by header.
+  Elixir support for `eta`. `use Eta` gives an Elixir module what
+  `include/eta.hrl` gives an Erlang module.
 
-  `use Eta` rewrites nothing by itself. It plants a persisted `@eta true`
-  attribute, which is how `mix compile.eta` (see `Mix.Tasks.Compile.Eta`)
-  recognises a module that wants the transform, and its options gate the
-  transform's optional passes:
+  `use Eta` does not rewrite the module. `use Eta` sets the persisted attribute
+  `@eta true`. `mix compile.eta` (see `Mix.Tasks.Compile.Eta`) transforms every
+  module that has this attribute.
+
+  ## Example
 
       use Eta                      # opt in, with every default pass
       use Eta, net: false          # take no part in the simulated network
       use Eta, after: false        # keep `receive ... after` on the real clock
       use Eta, observe: :all       # republish state on every callback return
 
-  Each option becomes a persisted module attribute (`@eta_net`, `@eta_after`,
-  `@eta_observe`), which reaches the compiled module's abstract format in
-  exactly the shape `eta_transform`'s Erlang gating passes already match — an
-  `observe: :all` here and an `-eta_observe(all).` there are the same
-  attribute by the time either is compiled. An unknown option, or a value the
-  pass cannot honour, raises `ArgumentError` where the `use` is written
-  rather than compiling into a module that silently is not simulated the way
-  it claims.
+  ## Options
 
-  ## Keeping eta out of every other build
+  The options control the optional passes of the transform.
 
-  `eta` is a test-only dependency, so `use Eta` written directly in a shipped
-  module is an undefined module the moment the `:dst` profile is off. The
-  answer is the wrapper trick `include/myapp_eta.hrl` plays for Erlang — one
-  module of your own:
+  | Option | Accepted values | Effect | Module attribute |
+  |---|---|---|---|
+  | `:net` | a boolean | `false` keeps the module out of the simulated network. | `@eta_net` |
+  | `:after` | a boolean | `false` keeps `receive ... after` on the real clock. | `@eta_after` |
+  | `:observe` | `:all` or `{record_name, [field]}` | Republishes the state on every callback return. | `@eta_observe` |
+
+  Each option becomes a persisted module attribute. The attribute reaches the
+  abstract format of the compiled module in the form that the gating passes of
+  `eta_transform` match for Erlang. `observe: :all` in Elixir and
+  `-eta_observe(all).` in Erlang compile to the same attribute.
+
+  `use Eta` raises `ArgumentError` at the `use` site, when the module compiles,
+  in these cases:
+
+  - the options are not a keyword list;
+  - an option is unknown;
+  - an option has a value that the pass does not accept.
+
+  A module with an invalid option therefore does not compile into a module that
+  is simulated differently from what the options state.
+
+  ## Builds without eta
+
+  `eta` is a test-only dependency. A shipped module that contains `use Eta`
+  refers to an undefined module in every build outside the `:dst` profile. Define
+  one wrapper module in the project. The wrapper does for Elixir what
+  `include/myapp_eta.hrl` does for Erlang:
 
       defmodule MyApp.Eta do
         @dst Mix.env() == :dst
@@ -49,13 +66,23 @@ defmodule Eta do
         end
       end
 
-  Your modules say `use MyApp.Eta, observe: :all` and call `MyApp.Eta.label/1`
-  and `MyApp.Eta.log/1`, and every build except `:dst` compiles them with no
-  relationship to this library at all — the options vanish along with the
-  `use` they were written on. The wrapper's no-op expansions mirror what
-  `include/eta.hrl` does without `DST`, stranded-variable gotcha included: a
-  variable used only inside a `log` becomes unused when the call compiles
-  away, so bind it to `_` if it exists for the log alone.
+  The modules of the project write `use MyApp.Eta, observe: :all` and call
+  `MyApp.Eta.label/1` and `MyApp.Eta.log/1`. In every build except `:dst`, the
+  wrapper expands as follows, and the compiled modules do not refer to `eta`:
+
+  | Call | Expansion outside `:dst` |
+  |---|---|
+  | `use MyApp.Eta, opts` | nothing; the options are discarded |
+  | `MyApp.Eta.label(value)` | `:ok` |
+  | `MyApp.Eta.log(event)` | `0` |
+
+  These expansions match the expansions of `include/eta.hrl` without `DST`.
+
+  ## Limitations
+
+  - Outside `:dst`, the argument of `log` is not compiled. A variable that is used
+    only inside a `log` call is then unused, and the compiler reports it. Bind such
+    a variable to `_`.
 
   *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
   """
@@ -131,12 +158,13 @@ defmodule Eta do
   end
 
   @doc """
-  Names the calling process on the simulation timeline. Call once, where the
-  process starts. The Elixir face of `?ETA_LABEL(Label)`; see `eta_log`.
+  Names the calling process on the simulation timeline. Call `label/1` once, where
+  the process starts. `label/1` is the Elixir equivalent of `?ETA_LABEL(Label)`.
+  See `eta_log`.
 
-  A macro rather than a function so the `MyApp.Eta` wrapper can compile it
-  away outside the `:dst` build — there is no call for the transform to
-  rewrite when the goal is to not exist at all.
+  `label/1` is a macro and not a function. The `MyApp.Eta` wrapper can therefore
+  expand it to `:ok` outside the `:dst` build, and the compiled module contains no
+  call to `eta`.
   """
   defmacro label(value) do
     quote do
@@ -145,8 +173,8 @@ defmodule Eta do
   end
 
   @doc """
-  Records an event on the simulation timeline, returning its sequence number.
-  The Elixir face of `?ETA_LOG(Event)`; see `eta_log`.
+  Records an event on the simulation timeline and returns the sequence number of
+  the event. `log/1` is the Elixir equivalent of `?ETA_LOG(Event)`. See `eta_log`.
   """
   defmacro log(event) do
     quote do

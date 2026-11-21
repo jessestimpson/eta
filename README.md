@@ -134,7 +134,7 @@ The seed produces the same trace each time, and the shrink reduces the size of t
    implementation, with an included bug for demonstration.
 4. [Writing a system under test](docs/04-writing-a-system-under-test.md). The
    behaviour callbacks and the practices around them.
-5. [Gotchas and footguns](docs/05-gotchas.md). Nondeterminism can leak in from
+5. [Hazards](docs/05-gotchas.md). Nondeterminism can leak in from
    many sources. This page details some common pain points.
 6. [A journey through DST](docs/06-a-journey-through-dst.md). The whole thing
    end to end: an empty directory becomes a quorum register with a
@@ -143,8 +143,9 @@ The seed produces the same trace each time, and the shrink reduces the size of t
 7. [A journey through DST, in Elixir](docs/07-a-journey-through-dst-elixir.md).
    The same walkthrough with the register built in Elixir.
 
-[docs/design.md](docs/design.md) is still a work in progress. Eventually, it will
-be the internal specification for the `eta` project itself.
+[docs/design.md](docs/design.md) describes the design of eta for people who
+change eta: the components, the reason for each significant decision, the
+limitations, the open problems and the planned work.
 
 ## Installation
 

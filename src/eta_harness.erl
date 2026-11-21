@@ -4,126 +4,219 @@
 
 -if(?DOCATTRS).
 -moduledoc """
-The contract between your system and `eta_run` — Phase 3 of the DST framework
-(design: `docs/design.md`).
+The behaviour that a system under test implements for `eta_run` (design:
+`docs/design.md`).
 
-A harness is not the system under test. Your `gen_server`s and your protocol
-code are that. A harness is the adapter that **starts** the system, **declares**
-which processes to schedule, **drives** it with a workload, and **judges** it
-against invariants. `eta_run` supplies the seed, owns the scheduler and the
-clock, decides when to inject work and when to let the system make progress, and
-records enough to replay the run exactly.
+A harness is a module that implements this behaviour. The harness is not the
+system under test. The system under test is the `gen_server` modules and the
+protocol code of the project. The harness does four things:
 
-Six callbacks are required and two are optional.
+1. It starts the system.
+2. It declares which processes `eta_run` schedules.
+3. It drives the system with a workload of operations.
+4. It checks the system against invariants.
 
-## Two rules that are not obvious, and both bite silently
+`eta_run` supplies the seed and owns the scheduler and the clock. `eta_run`
+decides when to inject an operation, when to step a process and when to advance
+the clock. `eta_run` records a trace that replays the run exactly.
 
-**`execute/2` must not block.** Every process the scheduler owns is *suspended*
-between steps, so a synchronous call into one from the driver cannot be served
-and will sit there until something times out. An operation is issued by spawning
-a process to perform it, and `eta_run` picks that process up through
-`processes/1` and schedules it like any other. This is not a limitation of the
-framework so much as what a driver is: the client is part of the system being
-interleaved.
+## Callbacks
 
-**`check/1` must not call into a scheduled process either — and getting this
-wrong does not fail loudly.** `eta_run` bounds the call and reports
-`check_blocked` if it hangs, but the more likely outcome is worse. A client API
-that catches its own timeout — a `status/1` that returns `undefined` on
-`exit:_` — turns a suspended member into a plausible-looking answer, and an
-invariant computed over "no members believe they lead" passes while checking
-nothing at all.
+Six callbacks are required and three are optional.
 
-Read state out of band: ETS, `persistent_term`, a table the system keeps anyway.
-Reading a registry's names table directly, the way its own lookups do, is the
-shape to copy; anything that sends a message and waits is not.
+| Callback | Required | Purpose |
+|---|---|---|
+| `init/2` | yes | Starts the system. |
+| `processes/1` | yes | Returns the pids to schedule. |
+| `generate/2` | yes | Returns the next operation. |
+| `execute/2` | yes | Issues an operation. |
+| `check/1` | yes | Checks the invariants after an action. |
+| `terminate/1` | yes | Stops the system. |
+| `check_final/2` | no | Checks the invariants that hold only at the end of a run. |
+| `settle_done/1` | no | Ends the settle phase before `settle_steps` is spent. |
+| `labels/1` | no | Names processes for `eta_log`. |
 
-## The callbacks
+## Requirements
 
-`init(Seed, Config)` — start the system and return with it **quiescent**.
-Anything still running when `eta_run` takes over ran on the real scheduler,
-outside the schedule, and that is exactly the nondeterminism the framework
-exists to remove.
+Every scheduled process is suspended between steps. Three requirements follow.
+A harness that breaks one of them can fail without reporting an error.
 
-`processes(State)` — every pid to schedule. Re-consulted after each operation,
-so processes an operation creates are picked up; already-known pids are ignored,
-so returning the full set every time is correct and expected. **The order is
-part of the contract**, because `eta_sched` assigns ids in registration order and
-the trace records ids.
+- `init/2` must return with the system quiescent.
+- `execute/2` must not block.
+- `check/1`, `check_final/2` and `settle_done/1` must not call a scheduled
+  process.
 
-`generate(State, Rand)` — the next operation, from the supplied `rand` state.
-Return the advanced state; drawing entropy from anywhere else breaks replay.
+The sections below give the reason for each requirement.
 
-`execute(Op, State)` — issue the operation. See the first rule above.
+## `init(Seed, Config)`
 
-`check(State)` — the invariants, run against a frozen system. See the second
-rule.
+`init/2` starts the system and returns `{ok, State}`. `Config` is the `config`
+option of `eta_run:run/2`.
 
-`check_final(Settled, State)` — **optional.** The invariants that are only true
-once the system has stopped being driven. Called once, after the last action of a
-run that ended normally, and not at all for a run that ended on a violation or a
-budget error.
+The system must be quiescent when `init/2` returns. A process that is still
+running when `eta_run` registers the processes runs on the real scheduler. The
+work of that process is not part of the schedule, so the seed does not reproduce
+it.
 
-Some properties are simply not instantaneous. "Exactly one leader per partition"
-is false for a moment after a partition heals and true again shortly after;
-"no lock is waited on forever" cannot be judged while requests are still being
-injected. Checking those after every action produces the choice between a check
-that flags correct code and one that is sound and blind, and neither is worth
-having — a threshold between the two is the trap, because the distributions
-overlap.
+## `processes(State)`
 
-`Settled` says how the run ended, and the two are not the same claim:
+`processes/1` returns every pid to schedule.
 
-- `quiescent` — nothing was runnable and no timer could make anything runnable.
-  The system is stopped, full stop.
-- `settle_budget` — `settle_steps` was spent with no operations left to inject.
-  The system was *left alone* for that long; it may still be ticking. A system
-  with a heartbeat never reaches `quiescent` and this is the strongest signal it
-  will ever give.
-- `settle_done` — `settle_done/1` said the harness has what it was waiting for,
-  before `settle_steps` ran out. The same claim as `settle_budget`, made sooner.
+- `eta_run` calls `processes/1` after `init/2` and after each operation. The
+  processes that an operation creates are therefore registered.
+- `eta_sched` ignores a pid that is already registered. The callback returns the
+  full set on every call.
+- The order of the list must be the same on every run. `eta_sched` assigns ids in
+  registration order, and the trace records ids.
 
-Take `quiescent` as proof and `settle_budget` as evidence, and be explicit about
-which one a given property needs. A harness that only trusts the first returns
-`ok` for the second.
+## `generate(State, Rand)`
 
-Its return is the same as `check/1`'s, and a violation ends the run as any other
-does — `outcome` carries it and `terminate/1` still runs.
+`generate/2` returns the next operation and the advanced `rand` state.
 
-`terminate(State)` — tear down. Called however the run ends, including on
-violation.
+The callback must draw every random value from the supplied `rand` state. A
+workload that draws from another source is not a function of the seed.
 
-`settle_done(State)` — **optional.** Asked after every step once the last
-operation is in. `true` ends the run there, as `settle_done`, rather than when
-`settle_steps` runs out. For a system that never goes quiet: its settle phase
-otherwise spends the whole budget on every run, so the budget has to be sized
-for the slowest recovery and every run pays for it. A harness whose final
-operation records that it has finished — a reader that waited for the cluster
-to catch up, say — answers from that record. Keep it to a read of the
-harness's own tables: it runs on the hot path, and it must not ask the system
-anything.
+## `execute(Op, State)`
 
-`labels(State)` — **optional, and the fallback rather than the main road.** A
-`#{pid() => Name}` map, used when `eta_log:analyze/0` renders a run. Without a
-name a step reads `p7`; with one, `participant-2`.
+`execute/2` issues the operation and returns the new state.
 
-Prefer `?ETA_LABEL(Name)` in the process itself. A process that labels itself is
-named in one place, so its step lines and its own events cannot disagree, and a
-self-reported name wins here. What this callback is for is the processes that
-*cannot* name themselves: something from a library you do not own, or a module
-you deliberately kept `eta.hrl` out of. `eta_2pc`'s clients are the example —
-they are anonymous funs handed to `eta_run:spawn_op/1`, so the harness is the
-only thing that knows what each one is.
+`execute/2` must not block. The driver calls `execute/2` while every scheduled
+process is suspended. A synchronous call from the driver to a scheduled process
+is not answered, and the call waits until a time-out.
 
-Called **once**, after the run, which is why it takes the whole state rather
-than one pid at a time: a harness already holds its processes in lists and maps,
-so building the mapping forwards is a comprehension, while answering "what is
-this pid called" one at a time means writing reverse lookups you otherwise would
-not need.
+An operation is issued by spawning a process that performs it. Spawn the process
+with `eta_run:spawn_op/1`. `eta_run` registers the process through `processes/1`
+and schedules it like every other process. The client of the system is part of
+the interleaving, so the client runs as a scheduled process.
 
-Name whatever you care about and leave the rest out; anything absent falls back
-to its position. Names are ordinary terms and `eta_log` renders them: an atom
-becomes itself, `{Kind, N}` becomes `kind-n`, anything else falls back to `~p`.
+## `check(State)`
+
+`check/1` checks the invariants and returns `ok` or `{violation, Violation}`.
+`eta_run` calls `check/1` every `check_every` actions (default 1), while every
+scheduled process is suspended.
+
+`check/1` must not call a scheduled process. Two failures are possible:
+
+- The call blocks. `eta_run` bounds `check/1` by the `check_timeout` option
+  (default 5000 ms) and ends the run with `{error, check_blocked}`.
+- The call returns a wrong value. A client function that catches its own
+  time-out does not reach the bound. For example, a `status/1` that returns
+  `undefined` on `exit:_` returns `undefined` for every suspended member. An
+  invariant "no member reports that it is the leader" then passes without
+  checking anything. No error is reported.
+
+`check/1` must read state out of band. The supported sources are an ETS table,
+`persistent_term`, `eta_observe`, or a table that the system keeps for its own
+use. For example, an invariant on a registry reads the names table of the
+registry directly, as the lookups of the registry do. A function that sends a
+message and waits for a reply is not a supported source.
+
+## `check_final(Settled, State)`
+
+`check_final/2` is optional. It checks the invariants that hold only after the
+system is no longer driven.
+
+- `eta_run` calls `check_final/2` once, after the last action of a run that ended
+  normally.
+- `eta_run` does not call `check_final/2` for a run that ended with a violation
+  or an error.
+- The return value has the same form as the return value of `check/1`. A
+  violation ends the run in the same way: `outcome` carries the violation, and
+  `terminate/1` still runs.
+- The `check_timeout` bound and the requirements of `check/1` apply.
+
+Some properties do not hold at every instant:
+
+- "Exactly one leader per partition" is false for a short time after a partition
+  heals.
+- "No lock is waited on forever" cannot be decided while requests are still
+  injected.
+
+A check of such a property after every action has two possible forms. One form
+reports a violation in correct code. The other form is too weak to find a defect.
+A threshold does not separate a transient state from a defect, because the two
+distributions overlap. `check_final/2` checks the property at the end of the run
+instead.
+
+`Settled` states how the run ended:
+
+| `Settled` | Meaning |
+|---|---|
+| `quiescent` | No process was runnable and no timer could make a process runnable. The system has stopped. |
+| `settle_budget` | `settle_steps` actions were spent after the last operation was injected. The system was not driven during those actions. The system can still be running. |
+| `settle_done` | `settle_done/1` returned `true` before `settle_steps` was spent. The guarantee is the same as for `settle_budget`, after fewer actions. |
+
+A system with a periodic timer, such as a heartbeat, never reaches `quiescent`.
+`settle_budget` is the strongest result that such a system gives.
+
+`quiescent` proves that the system has stopped. `settle_budget` and
+`settle_done` show only that the system ran without new operations. The harness
+must state which value each property requires. A check that requires
+`quiescent` returns `ok` for the other two values.
+
+## `terminate(State)`
+
+`terminate/1` stops the system. `eta_run` calls `terminate/1` at the end of every
+run, including a run that ended with a violation. `eta_run` resumes every
+scheduled process before the call, so `terminate/1` can call the system.
+
+## `settle_done(State)`
+
+`settle_done/1` is optional. After the last operation is injected, `eta_run`
+calls `settle_done/1` before every action. A return of `true` ends the run with
+`Settled` equal to `settle_done`. `eta_run` does not call `settle_done/1` during
+a replay.
+
+The callback is for a system that never becomes quiescent. Without the callback,
+the settle phase of such a system spends all of `settle_steps` on every run.
+`settle_steps` must then cover the slowest recovery, and every run pays that
+cost.
+
+A harness can answer from a record that the last operation writes when it
+finishes. An example is a reader that waits for the cluster to catch up and then
+records the result in a table of the harness.
+
+`settle_done/1` has two constraints:
+
+- It must read only the tables of the harness. It must not call the system.
+- It must be cheap, because `eta_run` calls it once per action.
+
+## `labels(State)`
+
+`labels/1` is optional. It returns a `#{pid() => Name}` map. `eta_log:analyze/0`
+uses the names when it renders a run. A step of an unnamed process reads `p7`. A
+step of a named process reads `participant-2`.
+
+`?ETA_LABEL(Name)` in the process itself is the preferred way to name a process.
+A process that labels itself is named in one place, so the step lines and the
+events of the process show the same name. A name that a process gave itself
+takes precedence over the name from `labels/1`.
+
+`labels/1` is for a process that cannot label itself:
+
+- a process from a library that the project does not own;
+- a process of a module that does not include `eta.hrl`.
+
+For example, the clients of the `eta_2pc` test harness are anonymous funs passed
+to `eta_run:spawn_op/1`. Only the harness knows what each client is.
+
+`eta_run` calls `labels/1` once, after the run, with the whole state. A harness
+already holds its processes in lists and maps, so one comprehension builds the
+map. A callback that took one pid at a time would require reverse lookups that
+the harness does not otherwise need.
+
+The map can name a subset of the processes. A process that is absent from the
+map is shown by its id. A crash in `labels/1`, or a return value that is not a
+map, gives no names.
+
+A name is any term. `eta_log` renders a name as follows:
+
+| Name | Rendered as |
+|---|---|
+| an atom | the text of the atom |
+| a binary or a printable string | the text |
+| `{Kind, N}` with an atom and an integer | `kind-n` |
+| any other term | the `~p` format of the term |
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.

@@ -4,8 +4,7 @@
 
 -if(?DOCATTRS).
 -moduledoc """
-Reading a process's state **without asking it** — the observability half of the DST
-framework (design: `docs/design.md`).
+Reading a process's state **without asking it** (design: `docs/design.md`).
 
 An invariant runs against a system the scheduler has frozen. Every process it owns
 is suspended, so anything that sends a message and waits cannot be served. That

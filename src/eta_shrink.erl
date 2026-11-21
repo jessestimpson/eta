@@ -4,8 +4,8 @@
 
 -if(?DOCATTRS).
 -moduledoc """
-Delta-debugging a failing trace down to one a human can read — Phase 4 of the DST
-framework (design: `docs/design.md`).
+Delta-debugging a failing trace down to one a human can read (design:
+`docs/design.md`).
 
 A run that finds a violation hands back the trace that produced it, and for a real
 system that is not a bug report: a three-member registry cluster produces around

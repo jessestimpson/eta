@@ -31,147 +31,241 @@
 A simulated network: seeded message loss, delay and partitions between processes
 in one VM.
 
-`eta_sched` decides *who runs* and `eta_time` decides *when*. Neither decides
-whether a message arrives, so a client that sends to three peers reaches all
-three inside one scheduler step. This module owns delivery, and can drop, delay
-or cut it.
+`eta_sched` decides which process runs. `eta_time` decides when a timer fires.
+Neither module decides whether a message arrives. This module delivers the
+messages that a system sends, and it can drop, delay or cut them.
 
-Inert unless a network is running: every function here delegates to its ordinary
-counterpart, so a module built with `eta_transform` behaves normally outside a
-simulation.
+With no network running, every function delegates to the function that it
+replaces. A module built with `eta_transform` therefore behaves normally outside
+a simulation. A network runs only when a harness starts one, with
+`eta_net:start/1` or the `net` option of `eta_run:run/2`.
 
-## Reaching it
+## Example
 
-`send/2` is an ordinary exported function, and there are three ways to call it:
+A send reaches `send/2` in one of three ways:
 
 ```erlang
-Peer ! {replicate, Batch}.                     %% eta_transform rewrites this
-eta_net:send(Peer, {replicate, Batch}).        %% or write it yourself
-myapp_link:send(Peer, {replicate, Batch}).     %% or from your own transport module
+Peer ! {replicate, Batch}.                     %% eta_transform rewrites this send
+eta_net:send(Peer, {replicate, Batch}).        %% a direct call
+myapp_link:send(Peer, {replicate, Batch}).     %% a call from a transport module
 ```
 
-Use the transform unless your system already has a transport module, in which
-case call this from it and skip the header.
+Use the transform, unless the system already has a transport module. In that
+case, call `send/2` from the transport module and do not include the
+`eta_transform` header.
 
-**Routing must be uniform per channel.** If some sends between two processes come
-through here and others go direct, a direct message can overtake a delayed one —
-reordering within an ordered pair, introduced by the harness and blamed on the
-system. The transform is module-granular so a peer-facing module is either in or
-out; a hand-written seam is call-site granular, and one `Pid ! ack` left unwrapped
-in an error branch is enough to break it.
+## Requirements
 
-## The fault model
+- Route every send between two processes in the same way. If some sends between
+  two processes go through this module and other sends go direct, a direct
+  message can overtake a delayed message. Real Erlang never reorders the
+  messages of one ordered pair of processes, so the result is a failure that the
+  system cannot produce. The transform rewrites a whole module, so either every
+  send of the module is routed or none is. A transport module is routed one call
+  site at a time, and one `Pid ! ack` that is not routed breaks the requirement.
+- Build the callee of `call/3` with `eta_transform`. See `call/3`.
+- Declare the topology before the system creates monitors. See `monitor/2`.
 
-Only faults real Erlang can produce. Distribution guarantees that messages between
-one ordered pair arrive in send order, and does not guarantee delivery at all. So
-per ordered pair this module may **deliver**, **drop**, **delay**, or **cut** the
-channel until healed. It never reorders within a pair; injecting that would
-manufacture counterexamples the real system cannot produce.
+## Model
 
-Between two simulated nodes the guarantee is wider, because distribution gives
-it: every message from node A to node B travels on one connection, in the order
-it was handed over, whoever sent it. So a message is never delivered ahead of one
-scheduled earlier on the same node-to-node link. A delay holds up what follows it
-on the link, as it would on TCP. Without that, a process that sends on another's
-behalf, as ra's leader does when its own send would block, could have its message
-overtaken by its principal's later ones.
+The network produces only the faults that real Erlang produces. Distribution
+guarantees that the messages between one ordered pair of processes arrive in
+send order. Distribution does not guarantee delivery. A channel is one ordered
+pair of processes. For each message on a channel, the network does one of the
+following:
 
-A perfect policy is exactly the behaviour of no network at all, which is what
-makes `drop_p => 0.0` usable as a control run.
+- It delivers the message.
+- It drops the message.
+- It delays the message.
+- It drops the message because the channel is cut. A cut lasts until it is
+  healed.
 
-**Loss comes with a signal.** A real link failure delivers `nodedown`/`nodeup` to
-both ends and systems hang recovery off those, so `partition/3` and
-`heal_partition/3` take one. Dropping messages without it injects something no
-network produces. See `partition/3`.
+The network never reorders the messages of one channel.
 
-## Where the network is: *located* and *faultable*
+Between two simulated nodes, the network also keeps the order of the link. Every
+message from node A to node B travels on one connection, in the order in which
+the senders handed the messages to the connection. A message is therefore never
+delivered before a message that was scheduled earlier on the same link. A
+delayed message delays the messages that follow it on the link, as on a TCP
+connection. This rule covers a process that sends on behalf of another process.
+The leader in ra does so when the send of the leader would block. Without the
+rule, a later message of the other process could overtake that message.
 
-Two different questions, and `place/2` used to answer both at once.
+A delay is virtual. A delayed message is a timer of `eta_time`, so the delay
+takes no real time.
 
-- **Located** — which simulated node a process is on. A located process receives
-  that node's link events (`partition/3`'s signal, a synthetic `noconnection`
-  `DOWN`, `kill_node/2`'s signal) and dies with the node.
-- **Faultable** — whether the network may drop or delay this process's messages.
+A perfect policy has `drop_p` and `delay_p` at 0.0. A network with a perfect
+policy and no cut behaves as no network does. A run with `drop_p => 0.0` can
+therefore serve as a control run.
 
-`place/2` makes a process both. `attach/2` makes it located only.
+The network decides the outcome of a send in this order:
 
-The distinction is not a nicety, and the case that forces it is the common one.
-Take a node that runs a member, an elector and a connector under one supervisor.
-Only member-to-member traffic crosses the wire: the elector coordinates with its
-peers through a durable store and the connector talks to nothing, so their
-"messages" are store operations wearing the costume of a send. Dropping one
-models a failure the store cannot produce — a database commits or errors, it does
-not silently evaporate — and the divergence that follows looks exactly like the
-replication defect a suite is hunting.
+1. A cut drops the message.
+2. A pending `drop_next/3` or `drop_matching/5` drops the message.
+3. The random policy drops, delays or delivers the message. See `set_policy/1`.
 
-But the connector is where node-level failure detection lives. It owns
-`nodedown`/`nodeup` and it must die when its node does. So it has to be *on* the
-node without being *on the wire*, which is `attach/2`.
+## Topology
 
-The alternative — place everything and narrow `scope` until the store traffic is
-excluded — states the same thing in a form that has to be kept correct by hand as
-the system grows a message. Topology is the durable statement; `scope` is what a
-particular run is entitled to break.
+A topology states which simulated node each process is on. A process has two
+properties:
 
-With no topology declared at all, every link is faultable, so `place/2` is opt-in.
+- **Located.** The process is on a simulated node. A located process receives
+  the link events of the node and dies when the node is killed.
+- **Faultable.** The network may drop or delay the messages of the process. A
+  send is faulted only when both ends are faultable and the ends are on
+  different simulated nodes.
 
-## Link events
+| Process | Located | Faultable |
+|---|---|---|
+| Placed with `place/2` | Yes | Yes |
+| Attached with `attach/2` | Yes | No |
+| Neither placed nor attached, with a topology declared | No | No |
+| Any process, with no topology declared | No | Yes |
 
-A link failure is not only lost messages. Real distribution delivers two things
-the schedule has to carry:
+A topology is declared by the first call to `place/2`, `attach/2` or
+`register_name/3`. With no topology declared, every send is faultable.
+
+A child process inherits the node and the faultable property of its parent. See
+`inherit/2`.
+
+`attach/2` exists for a process that must be on a node and must not have its
+messages faulted. An example is a node that runs a member, an elector and a
+connector under one supervisor:
+
+- Only the member sends messages to its peers over the network.
+- The elector coordinates with its peers through a durable store. A send of the
+  elector stands for a store operation. A database commits or returns an error.
+  A database does not lose a request. A dropped send of the elector is therefore
+  a failure that the store cannot produce, and the divergence that follows has
+  the same symptoms as a replication defect.
+- The connector receives `nodedown` and `nodeup` and must die with its node. The
+  connector must therefore be located.
+
+The alternative is to place every process and to narrow the `scope` of the
+policy until the store traffic is excluded. That alternative must be corrected
+by hand each time the system adds a message. The topology states where the
+network is for every run. The `scope` states which traffic one run may fault.
+
+## Faults
+
+| Function | Fault |
+|---|---|
+| `set_policy/1` | Random loss, delay and busy links, drawn from the seed. |
+| `cut/2`, `heal/2` | One direction of a channel or of a link drops every message. No link event is delivered. |
+| `partition/3`, `heal_partition/3` | Both directions are cut, and the link events are delivered. |
+| `kill_node/2` | Every located process of a simulated node dies, and the link events are delivered. |
+| `drop_next/3`, `drop_matching/5` | A fixed number of messages on one channel are dropped. |
+| `disconnect_node/1` | The connection between two simulated nodes is closed. |
+
+Prefer `partition/3` to `cut/2` for a link failure. A real link failure delivers
+`nodedown` to both ends, and systems start recovery from that event. A fault
+that only drops messages produces a state that no network produces. See
+`partition/3`.
+
+## Events
+
+A link failure delivers two kinds of link event in addition to the lost
+messages:
 
 - **Node signals.** `partition/3`, `heal_partition/3` and `kill_node/2` take a
-  `signal`, which reaches every *located* process on the affected side. See
-  `partition/3` for the derived and literal forms.
-- **Synthetic `noconnection` DOWNs.** Every monitor held across a failing link
-  fires `{'DOWN', Ref, process, Object, noconnection}`. Under `eta_net` the target
-  is still alive in the same VM, so the VM's own monitor never fires and nothing
-  substitutes for it — which leaves every system whose failure detection runs on
-  monitors untestable against a partition, even though the link fault itself
-  works. `monitor/2` fixes that. See `monitor/2` and `kill_node/2`.
+  `signal` option. The signal is sent to every located process on the affected
+  side. See `partition/3` for the forms of a signal.
+- **Synthetic `noconnection` DOWNs.** Every simulated monitor held across a
+  failing link fires `{'DOWN', Ref, process, Object, noconnection}`. The target
+  of such a monitor is still alive in the same VM, so a VM monitor does not
+  fire. See `monitor/2` and `kill_node/2`.
 
-Both are delivered **directly** rather than routed, because a cut channel must not
-be able to swallow the event that announces the cut, and both are enqueued
-synchronously by the calling driver in a deterministic order — so the schedule
-owns when they are *seen*, exactly as it does for any other message. Neither
-draws from the fault RNG: adding a signal must not shift the fault schedule for
-the traffic that can be faulted.
+A process subscribed with `monitor_nodes/1` also receives `{nodedown, Node}` and
+`{nodeup, Node}`. See "Node identity".
+
+Link events are delivered as follows:
+
+- A link event is sent directly and is not routed. A cut therefore cannot drop
+  the event that reports the cut.
+- The calling driver sends every link event before the call returns, in a
+  deterministic order. The schedule then decides when each process receives the
+  event, as for any other message.
+- A link event draws nothing from the fault generator. Adding a signal does not
+  change which messages are dropped.
+
+## Monitors
+
+`eta_transform` points `erlang:monitor/2,3` and `erlang:demonitor/1,2` at this
+module. A monitor between two processes on different simulated nodes is a
+simulated monitor. A simulated monitor fires `noconnection` when its link fails.
+Every other monitor is a VM monitor. See `monitor/2`.
 
 ## Node identity
 
-In one VM every process is on the same real node, so `node()`, `node(Pid)`,
-`nodes()` and `net_kernel`'s events give a whole simulated cluster one answer.
-`eta_transform` points those calls here instead, and this module answers them from
-its topology:
+In one VM every process is on the same real node. `node()`, `node(Pid)`,
+`nodes()` and the events of `net_kernel` would give one result for a whole
+simulated cluster. `eta_transform` points those calls at this module, and this
+module takes the results from the topology:
 
-- **`node/0`** is the simulated node the caller is placed or attached on.
-  `node/1` is the node a pid was placed on, kept after it dies.
-- **Connections are explicit**, as they are in distribution. A placed node starts
-  connected to nothing. `connect_node/1` connects it, and so does a plain send to
-  another node; a send with `noconnect` does not. `nodes/0` lists the nodes the
-  caller's node is connected to.
-- **Losing a connection is an event.** `partition/3`, `kill_node/2` and
-  `disconnect_node/1` disconnect, and every process subscribed with
-  `monitor_nodes/1` hears `{nodedown, Node}`. A heal does not reconnect; something
-  has to, as on a real cluster. `{nodeup, Node}` arrives when it does.
-- **Each side's view is its own.** `partition/3` with `learns` disconnects only
-  the side that noticed, and the other carries on believing it is connected.
-- **`send_nosuspend/2,3`** can find a link busy and return `false`, which is how
-  a real system loses a message on a live connection. See `send_nosuspend/3`.
+- `node/0` returns the simulated node of the caller. `node/1` returns the
+  simulated node on which a pid was placed or attached, also after the process
+  has died.
+- A connection is explicit, as in distribution. A new simulated node is
+  connected to no node. `connect_node/1` connects two nodes, and so does a send
+  to a process on another node. A send with the `noconnect` option does not
+  connect. `nodes/0` lists the nodes to which the node of the caller is
+  connected.
+- `partition/3`, `kill_node/2` and `disconnect_node/1` disconnect nodes. Every
+  process subscribed with `monitor_nodes/1` receives `{nodedown, Node}`. A heal
+  does not reconnect the nodes. The subscribers receive `{nodeup, Node}` when a
+  process connects the nodes again.
+- Each node has its own record of its connections. `partition/3` with the
+  `learns` option disconnects one side only. The other side remains connected in
+  its own record.
+- `send_nosuspend/2,3` can return `false` because the link is busy. A real
+  system loses a message on a live connection in this way. See
+  `send_nosuspend/3`.
 
-A process on no simulated node — a harness, an observer, anything a test spawns
-without placing — gets the real BIFs, so a network changes nothing for it.
-`with_node/2` lets such a process ask on a node's behalf.
+A process on no simulated node gets the real BIFs. Examples are a harness, an
+observer and a process that a test spawns and does not place. `with_node/2` lets
+such a process call the node identity functions for one simulated node.
 
-**Names are per node.** A process on a simulated node registers names, creates
-named ETS tables and writes `persistent_term` keys in that node's namespace, so a
-system can run under the same names on every node, and `{Name, Node}` finds the
-process holding `Name` on `Node`. See `eta_ns`. `rpc` and `erpc` to a simulated
-node run there; see `eta_rpc`. `node(X)` in a guard cannot be redirected here and
-is refused at compile time; see `eta_transform`.
+Names are separate for each simulated node. A process on a simulated node
+registers names, creates named ETS tables and writes `persistent_term` keys in
+the namespace of that node. A system can therefore use the same names on every
+node, and `{Name, Node}` resolves to the process that holds `Name` on `Node`.
+See `eta_ns`. A call to `rpc` or `erpc` for a simulated node runs on that node.
+See `eta_rpc`.
 
-Delay is virtual — a delayed message becomes a deadline in `eta_time`'s wheel — so
-waiting one out costs no real time.
+## Determinism
+
+- The fault generator is seeded by the `seed` option of `start/1`.
+- The fault generator advances only when a decision has more than one possible
+  outcome. These sends draw nothing: a send under a perfect policy, a send
+  outside the `scope`, and a send that does not cross a faultable link.
+- Link events draw nothing from the fault generator.
+- Every fan-out of link events is ordered by a sequence number. The number is
+  assigned when a process is first placed, when a monitor is created and when a
+  process first subscribes with `monitor_nodes/1`.
+- A send from a process that the scheduler is not stepping, to a process that
+  the scheduler owns, is delivered at once and draws nothing. `stats/0` counts
+  such a send as `unmanaged`.
+
+## Limitations
+
+- This module does not emulate distribution. A simulated node is a name in a
+  table in one VM. A destination that cannot be resolved to a local process,
+  such as `{global, _}`, `{via, _, _}` or a pid on a remote node, is passed to
+  the ordinary function.
+- One network runs per VM. Runs must be serial.
+- The functions listed in `?NET_UNSUPPORTED` in `eta_transform` raise while a
+  network is running. See `unsupported/2`.
+- `node(X)` in a guard cannot be redirected. `eta_transform` refuses it at
+  compile time.
+- A name is resolved when the message is sent. `erlang:send/2` resolves a name
+  when the message is delivered. The difference is observable only when a name
+  is registered again while a message to it is delayed.
+- A monitor created before its two ends are located is a VM monitor and never
+  fires `noconnection`.
+- A simulated monitor on a process that `eta_sched` does not own never fires for
+  the exit of that process.
+- A monitor created on the pid of a process that died in `kill_node/2` fires
+  `noproc`. Real distribution fires `noconnection` for a node that is gone.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -335,7 +429,7 @@ waiting one out costs no real time.
 %% ---------------------------------------------------------------------------
 
 -if(?DOCATTRS).
--doc "Starts a network with a perfect policy. See `start/1`.".
+-doc "Starts a network with the default options. See `start/1`.".
 -endif.
 -spec start() -> ok.
 start() ->
@@ -347,13 +441,18 @@ Starts the network.
 
 Options:
 
-- `seed` — seeds the fault schedule, so a run replays.
-- `policy` — see `set_policy/1`. Defaults to a perfect network, which is what a
-  cluster needs while it is still starting up.
+| Option | Default | Meaning |
+|---|---|---|
+| `seed` | `0` | The seed of the fault generator. The same seed gives the same fault decisions. |
+| `policy` | A perfect policy | The fault policy. See `set_policy/1`. |
 
-One network per VM, as with `eta_time` and `eta_log`, so runs must be serial.
-Starting over a running network resets it; starting over one another live process
-owns raises.
+The default policy is perfect because a cluster needs every message while it
+starts.
+
+One network runs per VM, as with `eta_time` and `eta_log`, so runs must be
+serial. If the calling process already owns a running network, `start/1` resets
+that network. If another live process owns the network, `start/1` raises
+`{eta_net, {network_in_use, Owner, Text}}`.
 """.
 -endif.
 -spec start(#{seed => integer(), policy => policy()}) -> ok.
@@ -400,10 +499,10 @@ claim() ->
 
 -if(?DOCATTRS).
 -doc """
-Stops the network. Safe to call when none is running.
+Stops the network. Returns `ok` also when no network is running.
 
-Messages already in flight are ordinary `eta_time` timers by then, and are still
-delivered by whatever advances the clock next.
+A delayed message is an `eta_time` timer. A message that is delayed when the
+network stops is still delivered when the clock reaches its deadline.
 """.
 -endif.
 -spec stop() -> ok.
@@ -421,7 +520,7 @@ stop() ->
     ok.
 
 -if(?DOCATTRS).
--doc "Whether a network is running. When false, every function here delegates.".
+-doc "Returns `true` when a network is running. When no network is running, every function of this module delegates.".
 -endif.
 -spec running() -> boolean().
 running() ->
@@ -433,13 +532,20 @@ running() ->
 
 -if(?DOCATTRS).
 -doc """
-Sends a message, subject to the network.
+Sends `Msg` to `Dest` through the network.
 
-Returns `Msg`, so it is a drop-in for both `Dest ! Msg` and `erlang:send/2`.
+Returns `Msg`, as `Dest ! Msg` and `erlang:send/2` do.
 
-A destination this module cannot identify as a local process — `{global, _}`,
-`{via, _, _}`, a remote node — is passed through untouched. `eta` does not
-simulate distribution.
+`Dest` is a pid, a registered name or `{Name, Node}`. The destination is handled
+as follows:
+
+- A destination that resolves to a local process is routed.
+- `{Name, Node}`, where `Node` is a simulated node and no process holds `Name`
+  there, receives nothing. The message is discarded and is not counted as
+  dropped.
+- Any other destination, such as `{global, _}`, `{via, _, _}` or a pid on a
+  remote node, is passed to `erlang:send/2`. This module does not simulate
+  distribution.
 """.
 -endif.
 -spec send(dest() | term(), term()) -> term().
@@ -458,11 +564,20 @@ send(Dest, Msg) ->
 -doc """
 `erlang:send/3`.
 
-Between two simulated nodes the options mean what they mean in distribution:
-`noconnect` returns `noconnect` and sends nothing when the sender's node is not
-connected to the destination's, and `nosuspend` returns `nosuspend` and sends
-nothing while the link is busy (see `send_nosuspend/3`). Anywhere else they have
-no meaning between two processes in one VM, and a routed send ignores them.
+Between two simulated nodes the options have the meaning that they have in
+distribution:
+
+- With `noconnect`, the function returns `noconnect` and sends nothing when the
+  node of the sender is not connected to the node of the destination.
+- With `nosuspend`, the function returns `nosuspend` and sends nothing while the
+  link is busy. See `send_nosuspend/3`.
+
+Without `noconnect`, the send first connects the two nodes. If the nodes cannot
+be connected, the function sends nothing and returns `ok`.
+
+A routed send between two local processes that are not on two different
+simulated nodes ignores the options and returns `ok`. Any other destination is
+passed to `erlang:send/3`.
 """.
 -endif.
 -spec send(dest() | term(), term(), list()) -> ok | nosuspend | noconnect.
@@ -482,7 +597,11 @@ send(Dest, Msg, Opts) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_server:cast/2`, routed. Never raises, including for an unregistered name.
+`gen_server:cast/2`, routed through the network.
+
+The message is tagged by the leading element of `Msg`, not by `'$gen_cast'`. See
+`set_policy/1`. The function returns `ok` and never raises, also for a name that
+is not registered.
 """.
 -endif.
 -spec cast(dest() | term(), term()) -> ok.
@@ -502,8 +621,10 @@ cast(Dest, Msg) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_fsm:send_event/2`, routed: a cast under `gen_fsm`'s `'$gen_event'`
-envelope, tagged by the event the same way.
+`gen_fsm:send_event/2`, routed through the network.
+
+The message is sent as `{'$gen_event', Event}` and is tagged by the leading
+element of `Event`, as in `cast/2`.
 """.
 -endif.
 -spec send_event(dest() | term(), term()) -> ok.
@@ -520,7 +641,7 @@ send_event(Dest, Event) ->
     end.
 
 -if(?DOCATTRS).
--doc "`gen_fsm:send_all_state_event/2`, routed. See `send_event/2`.".
+-doc "`gen_fsm:send_all_state_event/2`, routed through the network. See `send_event/2`.".
 -endif.
 -spec send_all_state_event(dest() | term(), term()) -> ok.
 send_all_state_event(Dest, Event) ->
@@ -537,78 +658,88 @@ send_all_state_event(Dest, Event) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_server:call/2,3` and `gen_statem:call/2,3`, with **both legs on the
-network**. One target for both, because the request is the same
-`{'$gen_call', From, Request}` either way.
+`gen_server:call/2,3` and `gen_statem:call/2,3`, with the request and the reply
+both routed through the network.
 
-The request is an ordinary send this module routes. The reply cannot be reached
-from here — `gen:reply` sends it from inside OTP — so `eta_transform` brings it
-on from the other end, rewriting the callee's returns: a `gen_server`'s
-`{reply, R, S}` becomes `eta_net:reply(From, R)` plus `{noreply, S}`, and a
-`gen_statem`'s `{reply, From, R}` action is taken out of the action list and sent
-through here instead. See `statem_return/1`.
+Both behaviours use this function, because both send the request as
+`{'$gen_call', From, Request}`.
 
-Both legs can therefore be dropped or delayed independently, which is what makes
-the asymmetric fault reachable: the work happened, the caller never learned it
-did.
+`call/2` uses a time-out of 5000 ms. `call/3` accepts a `timeout()`,
+`{clean_timeout, T}` or `{dirty_timeout, T}`. Both tuple forms are treated as
+`T`.
 
-Monitors the callee and takes a timeout, as `gen_server:call/3` does, with two
-differences:
+## Request and reply
 
-- **The timeout is virtual**, so waiting one out on a dropped request costs no
-  real time and fires where the schedule chose. See below for when.
-- **The monitor is `eta_net`'s own, real and simulated at once.** Real, rather
-  than going through `monitor/2`, because it exists to notice a callee that
-  died and has to work whatever the scheduler is or is not reporting — this is
-  the path that turns a dead callee into an exit instead of a hang. And entered
-  in the simulated-monitor table for the duration of the call, so that a
-  `partition/3` cutting the link fires it with `noconnection` the way it fires
-  every monitor the system holds across the cut. The caller sees
-  `{{nodedown, Node}, {eta_net, call, _}}`, which is what `gen:call` makes of
-  a `noconnection` DOWN. A call *into* an already-severed link fails the same
-  way at once, as distribution refuses a node it cannot connect to.
+- The request is a send that this module routes. The request is tagged by the
+  leading element of `Request`.
+- The reply is sent by the callee. `gen:reply` sends the reply from inside OTP,
+  so this module cannot route that send. `eta_transform` therefore rewrites the
+  returns of the callee. A `{reply, R, S}` return of a `gen_server` becomes
+  `eta_net:reply(From, R)` and `{noreply, S}`. A `{reply, From, R}` action of a
+  `gen_statem` is removed from the action list and sent with `reply/2`. See
+  `statem_return/1`.
 
-  That matters for a call with no timeout of its own. `riak_core`'s metadata
-  exchange is a chain of `infinity` calls holding a lock on both trees; under
-  the earlier simplification — a call outstanding across a partition ended in
-  its timeout — one partition left it holding both locks forever, and no
-  exchange between those nodes ever succeeded again.
+The network can drop or delay the request and the reply independently. A dropped
+reply produces the case in which the callee did the work and the caller did not
+receive the result.
 
-**Raises `unrouted_reply` if the callee was not built with the transform**, since
-its reply then comes around the network and one direction of the channel is
-silently unfaultable. Only on the routed path — with no network there is nothing
-to route and nothing to come around.
+## Paths
 
-## Three paths, and the timeout is virtual on two of them
+| Condition | Request | Time-out |
+|---|---|---|
+| A network is running. | Routed. | Virtual, under the rule below. |
+| No network is running and a virtual clock is running. | Sent with `erlang:send/2`, using the protocol and the alias of `gen:call`. | Virtual, under the rule below. |
+| No network and no virtual clock are running. | `gen_server:call/3`. | Real. |
 
-The network is not what decides whether the timeout is real. The **clock** is,
-which is a distinction that used to be got wrong here and is worth stating
-plainly, because the default run (`net => false`) took the wrong branch.
+The second path is the default configuration of `eta_run:run/2`, which has
+`net => false`. On that path the VM discards a reply that arrives after the
+time-out, as it does outside a simulation.
 
-- **Network running** — the request is routed, and the wait is on the virtual
-  clock.
-- **No network, but a virtual clock** — the request is an ordinary send and the
-  wait is still on the virtual clock. This is `gen:call`'s own protocol with
-  the deadline moved, alias and all, so a reply that loses the race to the
-  timeout is dropped by the VM exactly as it is outside a simulation.
-- **Neither** — a plain `gen_server:call/3`, real timeout, which is what the
-  module does about everything when it is inert.
+The time-out is virtual only when the virtual clock will reach the deadline:
 
-What made the old gating a bug rather than a gap: a transformed system with the
-scheduler and the clock up and no network is the ordinary configuration, and
-every `gen_server:call` in it was waiting out a real 5-second `after` inside OTP
-while the driver did other work. When it fired was decided by machine load, so a
-seed did not reproduce its own run, and nothing reported it.
+- With no scheduler active, every caller gets a virtual time-out.
+- With a scheduler active, only the process that `eta_sched` is stepping gets a
+  virtual time-out. `eta_run` advances the clock only to the deadlines of
+  processes that it owns. A virtual deadline of any other caller, such as the
+  driver or a harness `execute/2` that calls directly, would never be reached.
+  Such a caller gets a real time-out.
 
-**A virtual deadline is only armed for a process the scheduler is stepping.**
-`eta_run` advances the clock only to deadlines belonging to a process it owns and
-steps over every other one as a stray (`eta_time:advance_to_next/1`), so a
-virtual timeout armed by anything else — the driver, a harness `execute/2` that
-calls instead of spawning — is a deadline nothing will ever reach, and a hang
-with no timeout to end it. Those callers keep the real one. The check is a read
-of `eta_sched:stepping/0`, and it fails towards the real timeout: an owned caller
-this misses gets nondeterminism, which is bad, where an unowned caller it wrongly
-claimed would get a stalled run, which is worse.
+The check reads `eta_sched:stepping/0`. A real time-out for an owned caller
+makes the run nondeterministic. A virtual time-out for a caller that is not
+owned stops the run. The check therefore selects the real time-out when the
+caller is not the stepped process.
+
+## Monitor
+
+The call monitors the callee with a VM monitor, so that the exit of the callee
+ends the call. While a network is running, the same monitor is also recorded as
+a simulated monitor for the duration of the call. `partition/3`, `kill_node/2`
+and `disconnect_node/1` then fire it with `noconnection`. Without this, a call
+with an `infinity` time-out across a partition would never return.
+
+## Exits and errors
+
+The call exits with `{Reason, {eta_net, call, [Dest, Request, Timeout]}}`.
+`Reason` is one of:
+
+| Reason | Condition |
+|---|---|
+| `timeout` | The time-out passed with no reply. |
+| `{nodedown, Node}` | A network is running, and the link to the node of the callee was cut in both directions before the call or failed during the call. A call into a cut link sends nothing. |
+| `noproc` | A network is running, `Dest` is `{Name, Node}`, `Node` is a simulated node, and no process holds `Name` there. |
+| The exit reason of the callee | The callee exited during the call. |
+
+When a network is running, a reply that arrives after the time-out is dropped.
+See `reply/2`.
+
+When a network is running, the call raises
+`{eta_net, {unrouted_reply, Callee, Tag, Text}}` if the reply reached the caller
+without passing through `reply/2`. The reply could then not be faulted. The
+causes are:
+
+- The callee was not built with `eta_transform`.
+- The callee answers the call with a plain send to the caller, instead of
+  `gen_server:reply/2` or a `gen_statem` reply action.
 """.
 -endif.
 -spec call(dest() | term(), term()) -> term().
@@ -849,19 +980,19 @@ check_routed(Tag, To, Req) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_server:reply/2` and `gen_statem:reply/2`, routed — so a reply can be lost
-independently of the request that caused it.
+`gen_server:reply/2` and `gen_statem:reply/2`, routed through the network.
 
-Addressed to the caller's pid rather than to the alias in the tag. Both land in
-the same mailbox and the caller's selective receive matches on the tag either
-way.
+A reply can therefore be dropped or delayed independently of its request.
+`eta_transform` rewrites the `handle_call/3` returns of a `gen_server` and the
+reply actions of a `gen_statem` to call this function. See `call/3`.
 
-`eta_transform` also rewrites a `gen_server`'s `handle_call/3` returns and a
-`gen_statem`'s reply actions to reach this, which is how the reply leg of
-`call/3` gets onto the network.
-
-**A reply to a caller that already timed out is dropped**, which is what the
-alias `gen:call` waits on does outside a simulation. See `call/3`.
+- The reply is sent to the pid of the caller, not to the alias in the tag. The
+  selective receive of the caller matches on the tag in both cases.
+- Every reply is tagged `'$gen_reply'`. See `set_policy/1`.
+- A reply to a caller whose `call/3` has timed out is discarded. Outside a
+  simulation, the alias of `gen:call` discards such a reply.
+- With no network running, or when `From` is not `{Pid, Tag}`, the function
+  calls `gen_server:reply/2`.
 """.
 -endif.
 -spec reply(term(), term()) -> ok.
@@ -896,8 +1027,10 @@ reply(From, Reply) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_statem:reply/1`, routed. Takes one `{reply, From, Reply}` or a list of them,
-and puts each on the network through `reply/2`.
+`gen_statem:reply/1`, routed through the network.
+
+The argument is one `{reply, From, Reply}` tuple or a list of them. Each reply
+is sent with `reply/2`.
 """.
 -endif.
 -spec reply([{reply, term(), term()}] | {reply, term(), term()}) -> ok.
@@ -908,18 +1041,17 @@ reply(Replies) when is_list(Replies) ->
 
 -if(?DOCATTRS).
 -doc """
-Puts the **reply** leg of a `gen_statem:call` on the network, given a state
-callback's return value.
+Routes the replies in the return value of a `gen_statem` state callback through
+the network.
 
-The `gen_server` half of this job needs the `From` out of the callback's
-arguments, so `eta_transform` generates a per-module helper for it. A
-`gen_statem` names its caller inside the return instead — a `{reply, From, Msg}`
-action — so the whole job is a function of the return value alone and lives
-here.
+`eta_transform` wraps the returns of a state callback in this function. A
+`gen_statem` names the caller in the return value, in a `{reply, From, Msg}`
+action, so the function needs only the return value. For a `gen_server`, the
+transform generates a helper in each module, because `From` is an argument of
+`handle_call/3`.
 
-Every action-carrying return shape is recognised. Each `{reply, From, Msg}`
-action is sent through `reply/2` and removed from the list, so `gen_statem` does
-not also send it directly:
+The function sends each `{reply, From, Msg}` action with `reply/2` and removes
+it from the action list, so that `gen_statem` does not send it again:
 
 ```erlang
 {next_state, S, D, [{reply, From, R}, Other]}  %% -> eta_net:reply(From, R),
@@ -928,13 +1060,21 @@ not also send it directly:
                                                %%    {stop_and_reply, Reason, []}
 ```
 
-Anything else is returned untouched, including a return with no actions and a
-return shape this does not know. Idempotent, so a return that has already passed
-through — from a helper function the transform also wrapped — is unchanged the
-second time.
+The recognised return shapes are:
 
-Actions may be a single action rather than a list, which is why the bare
-`{reply, _, _}` clause exists.
+- `{next_state, State, Data, Actions}`
+- `{keep_state, Data, Actions}`
+- `{keep_state_and_data, Actions}`
+- `{repeat_state, Data, Actions}`
+- `{repeat_state_and_data, Actions}`
+- `{stop_and_reply, Reason, Replies}`
+- `{stop_and_reply, Reason, Replies, Data}`
+
+`Actions` is a list or one action. One `{reply, From, Msg}` action becomes `[]`.
+
+Any other value is returned unchanged. That includes a return with no actions
+and an unknown return shape. The function is idempotent: a return value that has
+passed through it once is unchanged by a second pass.
 """.
 -endif.
 -spec statem_return(term()) -> term().
@@ -962,17 +1102,20 @@ statem_actions(Other) ->
 
 -if(?DOCATTRS).
 -doc """
-What `eta_transform` points the messaging functions this module does not
-implement at: broadcasts and multi-node calls, the asynchronous
-request/response interface, and the `gen_event` client API. The list is
-`?NET_UNSUPPORTED` in `eta_transform`.
+The target of the messaging functions that this module does not implement.
 
-Raises while a network is running, and calls the original otherwise — so a module
-holding one on a path no simulation reaches still builds and behaves normally.
+`eta_transform` points these functions here: broadcasts, multi-node calls, the
+asynchronous request and response interface, and the `gen_event` client API. The
+list is `?NET_UNSUPPORTED` in `eta_transform`.
 
-Raising rather than passing through is deliberate: a run states a fault model,
-and a channel the model silently fails to cover makes the suite green for the
-wrong reason.
+- With no network running, the function calls the original function with `Args`.
+  A module that contains such a call therefore builds and behaves normally.
+- While a network is running, the function raises
+  `{eta_net, {unsupported, {M, F, A}, Text}}`.
+
+The function raises because a run states a fault model. If a channel were
+passed through without faults, the run would pass while it faulted less traffic
+than the fault model states.
 """.
 -endif.
 -spec unsupported({module(), atom(), arity()}, [term()]) -> term().
@@ -1057,32 +1200,50 @@ located_bare(Name, Node) ->
 
 -if(?DOCATTRS).
 -doc """
-Sets the random fault policy. Anything omitted keeps its current value.
+Sets the random fault policy. A key that is omitted keeps its current value. An
+unknown key is ignored.
 
-- `drop_p` — probability that an in-scope message is lost.
-- `delay_p` — probability that it is instead delivered late.
-- `max_delay` — upper bound, in **virtual** milliseconds, on a delay.
-- `scope` — which traffic the probabilities apply to:
-  - `all` (the default),
-  - `{tags, [Tag]}` — messages carrying one of these tags,
-  - `fun(From, Dest, Tag) -> boolean()`.
-- `busy_p` — probability that a `send_nosuspend` finds the link busy, starting a
-  busy spell. See `send_nosuspend/3`.
-- `busy_ms` — upper bound, in **virtual** milliseconds, on a busy spell.
+| Key | Default | Meaning |
+|---|---|---|
+| `drop_p` | `0.0` | The probability that a message in scope is dropped. |
+| `delay_p` | `0.0` | The probability that a message in scope is delayed. |
+| `max_delay` | `20` | The upper bound of a delay, in virtual milliseconds. A delay is at least 1 ms. |
+| `scope` | `all` | The messages to which `drop_p` and `delay_p` apply. |
+| `busy_p` | `0.0` | The probability that a `send_nosuspend` starts a busy period on its link. See `send_nosuspend/3`. |
+| `busy_ms` | `1000` | The upper bound of a busy period, in virtual milliseconds. |
 
-A message's **tag** is its leading element, except that `cast/2` and `reply/2`
-name the payload rather than OTP's envelope: a cast of `{prepare, TxId}` is
-tagged `prepare`, not `'$gen_cast'`, and every reply is tagged `'$gen_reply'`.
+The values of `scope` are:
 
-**Scope states which recovery paths a run is entitled to exercise**, rather than
-tuning how hard it tries. Loss on a channel whose recovery depends on a node
-event cannot be asserted against mid-run, because nothing delivers that event
-until the heal; a run that checks a property *during* a fault has to restrict
-loss to a channel that repairs itself, such as a replication stream a follower
-rejoins from a version discontinuity.
+- `all`: every message.
+- `{tags, [Tag]}`: the messages that have one of these tags.
+- `fun(From, Dest, Tag) -> boolean()`: the messages for which the function
+  returns `true`.
 
-An out-of-scope message draws nothing from the RNG, so narrowing the scope does
-not shift the fault schedule for the traffic still inside it.
+The tag of a message is:
+
+| Message | Tag |
+|---|---|
+| A tuple | The first element. |
+| An atom | The atom. |
+| Any other term | `unknown`. |
+| A `cast/2`, `send_event/2`, `send_all_state_event/2` or `call/3` request | The tag of the payload. A cast of `{prepare, TxId}` has the tag `prepare`, not `'$gen_cast'`. |
+| A reply | `'$gen_reply'`. |
+
+The policy applies to a message only when the message crosses a faultable link.
+See `place/2`.
+
+Use `scope` to state which recovery paths a run may exercise. Some channels
+recover from loss only after a node event, and no node event is delivered until
+the heal. A property that is checked during a fault does not hold for such a
+channel. A run that checks a property during a fault must restrict loss to a
+channel that repairs itself. An example is a replication stream in which a
+follower detects a version gap and joins again.
+
+A message outside the scope draws nothing from the fault generator. A narrower
+scope therefore does not change the fault decisions for the messages that remain
+in scope.
+
+Raises `{eta_net, {no_network, set_policy, Text}}` when no network is running.
 """.
 -endif.
 -spec set_policy(policy()) -> ok.
@@ -1093,7 +1254,7 @@ set_policy(Policy) ->
     ok.
 
 -if(?DOCATTRS).
--doc "The policy currently in force.".
+-doc "Returns the current policy.".
 -endif.
 -spec policy() -> policy().
 policy() ->
@@ -1101,38 +1262,49 @@ policy() ->
 
 -if(?DOCATTRS).
 -doc """
-Puts processes on a simulated node, **on the wire** — how a system says where its
-network is.
-
-Faults apply to a send only when both ends are placed and their nodes differ, so
-the fault model follows the topology rather than a predicate the harness has to
-keep correct.
+Places processes on a simulated node. A placed process is located and faultable.
 
 ```erlang
 eta_net:place(node_a, [MemberA]),
 eta_net:place(node_b, [MemberB]).
 ```
 
-A placed process is both *located* and *faultable*: it receives its node's link
-events and dies with it (`kill_node/2`), and its traffic can be dropped, delayed
-or cut. `attach/2` gives the first without the second; see the module doc on why
-those come apart.
+`Node` is any term. `Pids` is a list of pids and registered names. An entry that
+does not resolve to a process is ignored.
 
-**Unplaced means not on the network**: never faulted, in either direction, and it
-receives no link events. That is the safe default and also keeps a network inert
-for processes it does not know about, such as leftovers from an earlier test in
-the same VM. It is *not* the way to say "on this node but not on the wire" —
-`attach/2` is, because an unplaced process is not on any node at all and so
-learns nothing when one fails.
+A placed process has these properties:
 
-If nothing at all is placed, every link is faultable, so `place/2` is opt-in.
+- It receives the link events of its node.
+- It dies when its node is killed with `kill_node/2`.
+- Its messages can be dropped, delayed or cut. A send is faulted only when both
+  ends are placed and the ends are on different nodes.
 
-**Children inherit** their parent's node *and its faultability* as `eta_sched`
-adopts them, so a worker spawned mid-run does not send across a link the network
-was never told about — nor acquire one its parent was deliberately kept off.
+`attach/2` gives the first two properties without the third. See "Topology" in
+the module documentation.
 
-Placing a process that is already placed moves it and keeps its position in the
-link-event fan-out; see `partition/3`.
+A process that is neither placed nor attached is on no node:
+
+- Its messages are never faulted, in either direction.
+- It receives no link events.
+
+A network therefore does not affect a process that it has no record of, such as
+a process left by an earlier test in the same VM. Do not leave a process
+unplaced to keep its messages from being faulted when the process belongs to a
+node. Use `attach/2`, so that the process receives the link events of the node.
+
+With no topology declared, every send is faultable.
+
+A child process inherits the node and the faultable property of its parent when
+`eta_sched` adopts the child. A worker that is spawned during a run is therefore
+on the node of its parent, and a child of an attached process is not faultable.
+
+Placing a process that is already placed moves the process. The process keeps
+its position in the order of link events. See `partition/3`.
+
+Placing a process on a killed node marks the node as up again. See
+`kill_node/2`.
+
+Raises `{eta_net, {no_network, place, Text}}` when no network is running.
 """.
 -endif.
 -spec place(term(), [dest()]) -> ok.
@@ -1141,27 +1313,34 @@ place(Node, Pids) ->
 
 -if(?DOCATTRS).
 -doc """
-Puts processes on a simulated node **without putting them on the wire**: they
-receive the node's link events and die with it, and their traffic is never
-faulted.
+Attaches processes to a simulated node. An attached process is located and not
+faultable.
 
 ```erlang
-eta_net:place(node_a, [MemberA]),          %% talks to peers over the network
-eta_net:attach(node_a, [ElectorA, ConnA]). %% on the node, off the wire
+eta_net:place(node_a, [MemberA]),          %% sends to peers over the network
+eta_net:attach(node_a, [ElectorA, ConnA]). %% located, not faultable
 ```
 
-This is the honest way to model a process whose "messages" are not messages. An
-elector that coordinates through a durable store, a connector that only watches
-node liveness — dropping their sends injects a failure the real system cannot
-have, and the divergence that follows is an artefact that reads exactly like a
-replication defect. But both must still learn when their node's peers go away,
-and both must die when the node does, so leaving them unplaced is wrong too.
+An attached process receives the link events of its node and dies when the node
+is killed. Its messages are never faulted.
 
-Faultability is per process, not per channel: a send is faulted only when **both**
-ends are faultable, so an attached process is safe in either direction.
+Use `attach/2` for a process whose sends do not stand for network messages.
+Examples are an elector that coordinates through a durable store, and a
+connector that only watches whether nodes are alive. A dropped send of such a
+process is a failure that the real system cannot produce, and the divergence
+that follows has the same symptoms as a replication defect. Both processes must
+still receive the link events of their node and must die with the node, so they
+cannot be left unplaced.
 
-Otherwise identical to `place/2` — same node names, same inheritance, same
-participation in `partition/3` and `kill_node/2`.
+The faultable property belongs to a process, not to a channel. A send is faulted
+only when both ends are faultable. The messages of an attached process are
+therefore not faulted in either direction.
+
+In every other respect `attach/2` behaves as `place/2` does: the node names, the
+inheritance by child processes, and the treatment by `partition/3` and
+`kill_node/2` are the same.
+
+Raises `{eta_net, {no_network, attach, Text}}` when no network is running.
 """.
 -endif.
 -spec attach(term(), [dest()]) -> ok.
@@ -1188,8 +1367,8 @@ do_place(What, Node, Pids, Faultable) ->
 
 -if(?DOCATTRS).
 -doc """
-Registers `Name` on simulated node `Node`, so `{Name, Node}` resolves the way
-`{Name, node()}` does in a real cluster.
+Registers `Name` on the simulated node `Node`, so that `{Name, Node}` resolves
+as `{Name, node()}` does in a real cluster.
 
 ```erlang
 eta_net:place(node_a, [ServerA]),
@@ -1197,47 +1376,50 @@ eta_net:register_name(node_a, my_server, ServerA),
 eta_net:cast({my_server, node_a}, hello).   %% reaches ServerA
 ```
 
-**This is what lets a system keep its own addressing.** A distributed Erlang
-program says `{RegisteredName, Node}` and lets the VM find the process; there is
-no way to write that against simulated nodes, because one VM holds one registry
-and a second `gen_server:start_link({local, Name}, ...)` fails with
-`already_started`. Without this, `{Name, SomeSimulatedNode}` normalizes to
-`undefined` and the send falls through to `erlang:send/2`, which on a
-non-distributed VM **drops it silently** — a whole cluster's traffic vanishing
-with nothing raised and nothing counted.
+A distributed Erlang program addresses a process as `{RegisteredName, Node}`.
+One VM has one registry, and a second
+`gen_server:start_link({local, Name}, ...)` fails with `already_started`. With
+no registration, `{Name, Node}` for a simulated node resolves to no process and
+the message is discarded. Nothing is raised and nothing is counted.
 
-The name is scoped to the node, so the same name on two nodes is two processes,
-which is the point: a per-node singleton is exactly the shape that cannot be
-expressed otherwise.
+Rules:
 
-Registration is independent of placement — this only answers "who is `Name` on
-`Node`" — but registering without placing is almost always a mistake, since an
-unplaced process is on no node and is never faulted. Register the pid you
-placed.
+- The name belongs to the node. The same name on two nodes refers to two
+  processes.
+- Registration does not place the process. A process that is registered and not
+  placed is on no node and is never faulted. Register the pid that was placed.
+- A pid can hold several names.
+- Registering a name again moves the name.
+- A name is not removed when its process dies. The name then resolves to a dead
+  pid, as `{Name, Node}` does for a real node that has restarted. Use
+  `unregister_name/2` to model deregistration.
 
-A pid may hold several names, and re-registering a name moves it. Nothing is
-removed when a process dies: a name whose process is gone resolves to a dead pid,
-which routes and fails exactly as a stale `{Name, Node}` does against a real node
-that has restarted. Use `unregister_name/2` to model deregistration.
+`Dest` is a pid or a registered name. Raises
+`{eta_net, {register_name, Node, Name, no_such_process}}` when `Dest` resolves
+to no process. Raises `{eta_net, {no_network, register_name, Text}}` when no
+network is running.
 
-## An alias for a local name
+## Alias for a local name
 
-`Dest` may instead be `{local, LocalName}`: on `Node`, `Name` means whichever
-process holds the real local name `LocalName`, **looked up at each send**, and
-only while that process is located on `Node`.
+`Dest` can also be `{local, LocalName}`. `Name` on `Node` then resolves, at each
+send, to one of these processes:
+
+- the process that holds `LocalName` in the namespace of `Node`;
+- otherwise the process that holds the real local name `LocalName`, if that
+  process is located on `Node`.
 
 ```erlang
-%% Each node runs its own instance under its own local name, and peers address
-%% each other by their *own* instance's name, as they would in a real cluster.
+%% Each node runs one instance under a distinct local name. A peer addresses
+%% the instance by the name that the peer uses for its own instance.
 eta_net:register_name(node_b, myapp_a_server, {local, myapp_b_server}).
 ```
 
-That is the shape a system takes when it runs one instance per simulated node in
-one VM: the instances need distinct local names, but the system addresses a peer
-by the name *it* would have on the peer. Because the lookup happens at send time,
-the alias follows the process across restarts — a supervisor bringing the server
-back under the same local name needs no new registration — and resolves to
-nothing while the node is down.
+Use an alias when a system runs one instance for each simulated node in one VM.
+The instances need distinct local names, and each instance addresses a peer by
+the name of its own instance. The alias is resolved at each send, so it resolves
+to the new process after a supervisor restarts the server under the same local
+name. No new registration is needed. The alias resolves to no process while the
+node is down.
 """.
 -endif.
 -spec register_name(term(), atom(), dest() | {local, atom()}) -> ok.
@@ -1256,7 +1438,7 @@ register_name(Node, Name, Dest) when is_atom(Name) ->
     end.
 
 -if(?DOCATTRS).
--doc "Removes a simulated registration. See `register_name/3`.".
+-doc "Removes the registration of `Name` on the simulated node `Node`. See `register_name/3`.".
 -endif.
 -spec unregister_name(term(), atom()) -> ok.
 unregister_name(Node, Name) when is_atom(Name) ->
@@ -1265,9 +1447,12 @@ unregister_name(Node, Name) when is_atom(Name) ->
 
 -if(?DOCATTRS).
 -doc """
-The pid registered as `Name` on simulated node `Node`, or `undefined`.
+Returns the pid registered as `Name` on the simulated node `Node`, or
+`undefined`.
 
-`erlang:whereis/1` for the simulated registry. See `register_name/3`.
+This function is `erlang:whereis/1` for the names of `register_name/3`. An alias
+is resolved at the time of the call. The function returns `undefined` when no
+network is running.
 """.
 -endif.
 -spec whereis_name(term(), atom()) -> pid() | undefined.
@@ -1292,21 +1477,28 @@ next_seq() ->
 
 -if(?DOCATTRS).
 -doc """
-The simulated node a process is on, or `undefined`. See `place/2`.
+Returns the simulated node of a process, or `undefined`. See `place/2`.
 
-A process that is not placed itself answers with its **spawner's** node, if
-the spawner has one. Children a scheduled parent creates are placed by
-`inherit/2` as `eta_sched` adopts them, so this fallback is for the child that
-exists before there is a scheduler to adopt it — a worker a server spawns from
-its `init/1` during the harness's `init/2` — which is on its parent's node in
-every sense but the table's. It is *not* placed by being asked about: it stays
-off the wire and outside `kill_node/2`'s reach, which is why the harness should
-still return from `init/2` with such children finished.
+For a process that is neither placed nor attached, the function returns the node
+of the process that spawned it, if that process has a node. The function follows
+the chain of spawners up to the first located process.
 
-Who spawned a process is learned once and remembered; where the spawner is, is
-read each time, so the answer follows a spawner that is placed or moved later.
-The learning is done ahead of time for every process `eta_sched` owns, so that
-this function asks a suspended process nothing. See `introduce/1`.
+`eta_sched` places a child of a scheduled process with `inherit/2` when it
+adopts the child. The fallback covers a child that exists before a scheduler can
+adopt it. An example is a worker that a server spawns from `init/1` during the
+`init/2` of the harness. The function does not place such a child:
+
+- The child remains not faultable.
+- `kill_node/2` does not kill the child.
+
+A harness should therefore return from `init/2` only after such children have
+finished.
+
+The spawner of a process is recorded once. The node of the spawner is read at
+each call, so the result follows a spawner that is placed or moved later.
+`eta_sched` records the spawner of every process that it owns before the run
+needs it, so that this function does not call `erlang:process_info/2` on a
+suspended process. See `introduce/1`.
 """.
 -endif.
 -spec node_of(dest()) -> term() | undefined.
@@ -1366,13 +1558,19 @@ spawner(Pid) ->
 
 -if(?DOCATTRS).
 -doc """
-Learns who spawned `Pid`, and who spawned that, up to the first ancestor that
-is placed. Called by `eta_sched` for every process it is handed; a harness does
-not call this.
+Records the spawner of `Pid` and of each ancestor of `Pid`, up to the first
+located ancestor.
 
-It is the asking half of `node_of/1`, done here so that it is never done by a
-process the scheduler is stepping. See `spawner/1` for what goes wrong
-otherwise. Inert with no network running.
+`eta_sched` calls this function for every process that it is given. A harness
+does not call it.
+
+`node_of/1` needs the spawner of a process. Reading the spawner calls
+`erlang:process_info/2`, which waits for the target process when the target has
+signals pending. The process that the scheduler is stepping must not wait for a
+suspended process. This function therefore reads the spawner from the scheduler
+process, between steps.
+
+The function does nothing when no network is running.
 """.
 -endif.
 -spec introduce(pid()) -> ok.
@@ -1384,11 +1582,17 @@ introduce(Pid) when is_pid(Pid) ->
 
 -if(?DOCATTRS).
 -doc """
-Whether the network may fault this process's traffic.
+Returns `true` when the network may fault the messages of this process.
 
-`false` for an unplaced process and for one added with `attach/2`; `true` for a
-placed one, and for everything when no topology has been declared at all. See
-`place/2`.
+| Process | Result |
+|---|---|
+| Placed with `place/2`, or the child of a placed process | `true` |
+| Attached with `attach/2`, or the child of an attached process | `false` |
+| Neither placed nor attached | `false` |
+| Any process, with no topology declared | `true` |
+
+A topology is declared by the first call to `place/2`, `attach/2` or
+`register_name/3`.
 """.
 -endif.
 -spec faultable(dest()) -> boolean().
@@ -1413,8 +1617,15 @@ placement(Pid) ->
 
 -if(?DOCATTRS).
 -doc """
-Places `Child` where `Parent` is, with the same faultability. Called by
-`eta_sched` as it adopts a process; a harness does not call this. See `place/2`.
+Places `Child` on the node of `Parent`, with the faultable property of `Parent`.
+
+`eta_sched` calls this function when it adopts a process. A harness does not
+call it. See `place/2`.
+
+- The function records `Parent` as the spawner of `Child`, also when `Parent`
+  has no node.
+- A child that is already placed or attached keeps its placement.
+- The function does nothing when no network is running.
 """.
 -endif.
 -spec inherit(pid(), pid()) -> ok.
@@ -1507,12 +1718,12 @@ require_running(What) ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:node/0` for a process on a simulated node: the node it is placed or
-attached on.
+`erlang:node/0` for a process on a simulated node. Returns the node on which the
+caller is placed or attached.
 
-Anything else gets the real node, so a process the network does not know about
-sees exactly what it would without one. `with_node/2` answers this for a process
-that is on no node, such as a harness reading one node's state.
+For any other process the function returns the real node. A process that the
+network has no record of therefore gets the same result as with no network.
+Inside `with_node/2`, the function returns the node that `with_node/2` names.
 """.
 -endif.
 -spec node() -> term().
@@ -1524,11 +1735,13 @@ node() ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:node/1`: the simulated node a pid was placed on, or the real one.
+`erlang:node/1`. Returns the simulated node on which a pid was placed or
+attached, or the real node.
 
-A pid keeps its node after it dies, as a real pid does — it is written into the
-pid itself. Systems that learn about a peer's processes compare `node(Pid)` with
-the peer long after the process is gone.
+The result remains the same after the process dies, as for a real pid. Systems
+compare `node(Pid)` with the name of a peer after the process has died.
+
+For a port or a reference, the function calls `erlang:node/1`.
 """.
 -endif.
 -spec node(pid() | port() | reference()) -> term().
@@ -1542,9 +1755,11 @@ node(Other) ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:nodes/0`: the nodes the calling process's node is connected to, sorted.
+`erlang:nodes/0`. Returns the sorted list of nodes to which the node of the
+caller is connected.
 
-What "connected" means is in "Node identity" in the module doc.
+See "Node identity" in the module documentation for the rules of connection. For
+a caller on no simulated node, the function calls `erlang:nodes/0`.
 """.
 -endif.
 -spec nodes() -> [term()].
@@ -1556,9 +1771,19 @@ nodes() ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:nodes/1`. `visible` and `connected` are `nodes/0`, `this` is the
-caller's node, `known` is every simulated node there has been, and `hidden` is
-empty: a simulated node is always visible. A list combines them in order.
+`erlang:nodes/1` for a process on a simulated node.
+
+| Argument | Result |
+|---|---|
+| `visible` | The result of `nodes/0`. |
+| `connected` | The result of `nodes/0`. |
+| `this` | The node of the caller. |
+| `known` | Every simulated node that has been named in `place/2` or `attach/2`, sorted. |
+| `hidden` | `[]`. A simulated node is always visible. |
+
+A list of arguments returns the results in the order of the list, without
+duplicates. Any other argument raises `badarg`. For a caller on no simulated
+node, the function calls `erlang:nodes/1`.
 """.
 -endif.
 -spec nodes(atom() | [atom()]) -> [term()].
@@ -1587,7 +1812,7 @@ dedupe([H | T], Seen) when is_map_key(H, Seen) -> dedupe(T, Seen);
 dedupe([H | T], Seen) -> [H | dedupe(T, Seen#{H => true})].
 
 -if(?DOCATTRS).
--doc "`erlang:is_alive/0`: always `true` on a simulated node.".
+-doc "`erlang:is_alive/0`. Returns `true` for a process on a simulated node.".
 -endif.
 -spec is_alive() -> boolean().
 is_alive() ->
@@ -1604,22 +1829,41 @@ monitor_nodes(Flag) ->
 -doc """
 `net_kernel:monitor_nodes/2` for a process on a simulated node.
 
-`true` starts a subscription and `false` ends one, and like `net_kernel` each
-subscription delivers its own copy of every event. The caller's node receives
-`{nodeup, Node}` and `{nodedown, Node}` as its connections come and go: `nodeup`
-when `connect_node/1` or a plain send connects two nodes, and `nodedown` on
-`partition/3`, `kill_node/2` and `disconnect_node/1`. A heal does not reconnect,
-as it does not in distribution; something has to connect again.
+`true` adds a subscription and `false` removes one subscription with the same
+options. As with `net_kernel`, each subscription delivers its own copy of every
+event.
 
-With options the message is `{nodeup | nodedown, Node, Info}`.
-`{node_type, visible | all}` adds `{node_type, visible}` to `Info`,
-`{node_type, hidden}` selects nothing (a simulated node is never hidden), and
-`nodedown_reason` adds `{nodedown_reason, Reason}` to a `nodedown`. The reasons
-are `net_tick_timeout` for a partition, `connection_closed` for a killed node and
-`disconnect` for `disconnect_node/1`.
+The subscriber receives these messages for the node of the caller:
 
-Events are delivered directly rather than routed, in subscription order, like
-`partition/3`'s signal — a cut channel cannot swallow the news of the cut.
+| Message | Cause |
+|---|---|
+| `{nodeup, Node}` | `connect_node/1` or a send without `noconnect` connected the two nodes. |
+| `{nodedown, Node}` | `partition/3`, `kill_node/2` or `disconnect_node/1` disconnected the two nodes. |
+
+A heal does not reconnect the nodes, as in distribution. A process must connect
+them again.
+
+With a non-empty option list, the message is
+`{nodeup, Node, Info}` or `{nodedown, Node, Info}`. The options are:
+
+- `{node_type, visible}` or `{node_type, all}` adds `{node_type, visible}` to
+  `Info`.
+- `{node_type, hidden}` selects no events. A simulated node is never hidden.
+- `nodedown_reason` adds `{nodedown_reason, Reason}` to the `Info` of a
+  `nodedown` message.
+
+| `Reason` | Cause |
+|---|---|
+| `net_tick_timeout` | `partition/3` |
+| `connection_closed` | `kill_node/2` |
+| `disconnect` | `disconnect_node/1` |
+
+The messages are sent directly and are not routed, as the signal of
+`partition/3` is. A cut therefore cannot drop them. The subscribers of a node
+receive each event in the order in which they first subscribed.
+
+For a caller on no simulated node, the function calls
+`net_kernel:monitor_nodes/2`.
 """.
 -endif.
 -spec monitor_nodes(boolean(), list()) -> ok | error.
@@ -1660,11 +1904,19 @@ monitor_node(Node, Flag) ->
 -doc """
 `erlang:monitor_node/3` for a process on a simulated node.
 
-`true` watches `Node` from the caller's node: when that connection is lost the
-caller receives `{nodedown, Node}`, once, and the watch is gone. As in
-distribution it tries to connect first, and a node it can't reach is reported
-down at once. Each call is a watch of its own, and `false` removes one. A node
-watching itself is never told anything.
+With `true`, the caller watches the connection from its node to `Node`:
+
+- The function first connects the two nodes, as distribution does.
+- If the nodes cannot be connected, the caller receives `{nodedown, Node}` at
+  once.
+- When the connection is lost, the caller receives `{nodedown, Node}` once, and
+  the watch is removed.
+
+Each call with `true` adds one watch. A call with `false` removes one watch. A
+call that names the node of the caller adds no watch and sends no message. The
+function returns `true`. The options are ignored for a simulated node.
+
+For a caller on no simulated node, the function calls `erlang:monitor_node/3`.
 """.
 -endif.
 -spec monitor_node(term(), boolean(), list()) -> true.
@@ -1703,12 +1955,21 @@ monitor_node(Node, Flag, Opts) ->
 
 -if(?DOCATTRS).
 -doc """
-`net_kernel:connect_node/1` and Elixir's `Node.connect/1`.
+`net_kernel:connect_node/1` and `Node.connect/1` in Elixir.
 
-`true` when the caller's node is now connected to `Node`: it already was, or
-`Node` is up and not partitioned from it, in which case both sides' subscribers
-get `nodeup`. `false` otherwise — a node that has never been placed, one that was
-killed, or one on the far side of a cut.
+Returns `true` when the node of the caller is connected to `Node` after the
+call:
+
+- The nodes were already connected, or `Node` is the node of the caller.
+- `Node` is up and no cut exists between the two nodes. The function connects
+  the nodes, and the `monitor_nodes/1` subscribers of both nodes receive
+  `nodeup`.
+
+Returns `false` in every other case: `Node` has never been named in `place/2` or
+`attach/2`, `Node` was killed, or a cut exists between the two nodes.
+
+For a caller on no simulated node, the function calls
+`net_kernel:connect_node/1`.
 """.
 -endif.
 -spec connect_node(term()) -> boolean() | ignored.
@@ -1721,13 +1982,23 @@ connect_node(Node) ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:disconnect_node/1` and Elixir's `Node.disconnect/1`.
+`erlang:disconnect_node/1` and `Node.disconnect/1` in Elixir.
 
-Tears down the connection as distribution does: messages in flight between the
-two nodes are lost, monitors across it fire `noconnection`, and both sides'
-subscribers get `nodedown` with reason `disconnect`. `false` if they were not
-connected. Nothing reconnects them until a process calls `connect_node/1` or
-sends to the other node without `noconnect`.
+The function closes the connection between the node of the caller and `Node`, as
+distribution does:
+
+1. It cancels the delayed messages between the two nodes, in both directions.
+2. It fires the simulated monitors across the connection with `noconnection`.
+3. It sends `nodedown`, with the reason `disconnect`, to the `monitor_nodes/1`
+   subscribers of both nodes.
+
+Returns `true`, or `false` when the nodes were not connected or `Node` is the
+node of the caller. The function records no cut. The nodes are connected again
+when a process calls `connect_node/1` or sends to the other node without
+`noconnect`.
+
+For a caller on no simulated node, the function calls
+`erlang:disconnect_node/1`.
 """.
 -endif.
 -spec disconnect_node(term()) -> boolean() | ignored.
@@ -1739,7 +2010,7 @@ disconnect_node(Node) ->
     end.
 
 -if(?DOCATTRS).
--doc "`net_adm:ping/1` and Elixir's `Node.ping/1`: `connect_node/1` as `pong` or `pang`.".
+-doc "`net_adm:ping/1` and `Node.ping/1` in Elixir. Returns `pong` when `connect_node/1` returns `true`, and `pang` otherwise.".
 -endif.
 -spec ping(term()) -> pong | pang.
 ping(Node) ->
@@ -1762,30 +2033,43 @@ send_nosuspend(Dest, Msg) ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:send_nosuspend/3`, with a link that can be busy.
+`erlang:send_nosuspend/3`, on a link that can be busy.
 
-Between two simulated nodes it returns `false` and sends nothing when:
+Between two simulated nodes, the function returns `false` and sends nothing in
+these cases:
 
-- the link is **busy**. Each call that crosses a link starts a busy spell on it
-  with probability `busy_p`, lasting up to `busy_ms` virtual milliseconds, and
-  every `send_nosuspend` on that link in that direction is refused until it
-  ends. This is the fault a real system meets when a dist port's buffer is full:
-  the connection stays up, nothing says `nodedown`, and the message is gone
-  unless the sender acts on `false`. Plain sends are not refused, because a real
-  one would suspend the sender instead.
-- `noconnect` is given and the nodes are not connected, or they are not
-  connected and cannot be (a cut, or a node that is down).
+- The link is busy.
+- The option `noconnect` is given and the nodes are not connected.
+- The nodes are not connected and cannot be connected, because of a cut or
+  because the destination node is down.
 
-Otherwise the message is routed like any other send, so the random policy and
-any cut still apply, and the result is `true` — including for a name nobody holds
-on the other node, which distribution loses without saying so.
+In every other case the message is routed as any send is, so the random policy
+and any cut still apply, and the function returns `true`. The function also
+returns `true` for a name that no process holds on the other node. Distribution
+loses such a message without an error.
 
-Busy spells are drawn from the fault schedule only for traffic that crosses a
-link, and only while `busy_p` is above zero. `scope` does not apply: it selects
-messages, and a busy port refuses everything.
+## Busy links
 
-Anywhere else this is `erlang:send_nosuspend/3`, or `true` after a routed send
-between local processes.
+A busy link models a distribution port whose buffer is full. The connection
+stays up, no `nodedown` is delivered, and the message is lost unless the sender
+handles `false`.
+
+- A call that crosses a faultable link starts a busy period on that link with
+  probability `busy_p`. The busy period lasts between 1 and `busy_ms` virtual
+  milliseconds.
+- During a busy period, every `send_nosuspend` on that link in the same
+  direction returns `false`. A `send/3` with the `nosuspend` option returns
+  `nosuspend`.
+- A send without `nosuspend` is not refused, because a real send would suspend
+  the sender.
+- A busy period draws from the fault generator only while `busy_p` is above 0.
+- The `scope` of the policy does not apply. The `scope` selects messages, and a
+  busy port refuses every message.
+- `stats/0` counts a refused send as `busy`, not as `dropped`.
+
+Between two local processes that are not on two different simulated nodes, the
+function routes the message and returns `true`. Any other destination is passed
+to `erlang:send_nosuspend/3`.
 """.
 -endif.
 -spec send_nosuspend(dest() | term(), term(), list()) -> boolean().
@@ -1805,12 +2089,16 @@ send_nosuspend(Dest, Msg, Opts) ->
 
 -if(?DOCATTRS).
 -doc """
-Runs `Fun` as though the calling process were on `Node`, for the membership
-functions only: `node/0`, `nodes/0,1`, `connect_node/1` and the rest answer for
-`Node`. Placement and routing are unchanged.
+Runs `Fun` with the calling process treated as a process on `Node`, and returns
+the result of `Fun`.
 
-For a harness that reads one node's state through the system's public API, which
-asks `node()` to decide what is local.
+The setting affects only the node identity functions: `node/0`, `nodes/0,1`,
+`is_alive/0`, `connect_node/1`, `disconnect_node/1`, `monitor_nodes/1,2`,
+`monitor_node/2,3`, `ping/1` and `local_node/0`. Placement and routing are
+unchanged.
+
+Use this function in a harness that reads the state of one node through the
+public API of the system, when that API calls `node()` to decide what is local.
 """.
 -endif.
 -spec with_node(term(), fun(() -> T)) -> T.
@@ -1827,9 +2115,12 @@ with_node(Node, Fun) when is_function(Fun, 0) ->
 
 -if(?DOCATTRS).
 -doc """
-The caller's simulated node, or `undefined` when it is on none: the node it is
-placed or attached on, or the one `with_node/2` names. `node/0` with the real node
-as the fallback.
+Returns the simulated node of the caller, or `undefined`.
+
+The simulated node of the caller is the node that `with_node/2` names, or
+otherwise the node on which the caller is placed or attached. The function
+returns `undefined` when the caller is on no simulated node or no network is
+running. `node/0` returns the real node in that case.
 """.
 -endif.
 -spec local_node() -> term() | undefined.
@@ -1850,7 +2141,7 @@ local_node() ->
     end.
 
 -if(?DOCATTRS).
--doc "Whether `Node` is a simulated node: one something has been placed or attached on.".
+-doc "Returns `true` when `Node` is a simulated node: a node that has been named in `place/2` or `attach/2`.".
 -endif.
 -spec is_node(term()) -> boolean().
 is_node(Node) ->
@@ -2112,83 +2403,99 @@ node_message(Kind, Other, Reason, Opts) ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:monitor/2`, aware of the simulated network.
+`erlang:monitor/2,3`, with monitors that can fire `noconnection` on a simulated
+link failure.
 
-Most systems detect a failed peer with a monitor rather than with a timeout, so
-without this a partition is invisible to exactly the code it should be exercising:
-the target is alive in the same VM, the VM's monitor stays armed, and the link
-fault drops messages into a system that never learns why.
+Most systems detect a failed peer with a monitor. Under a partition in one VM,
+the target is still alive and a VM monitor does not fire. `eta_transform` points
+`erlang:monitor/2,3` and `erlang:demonitor/1,2` of a module at this module, so
+the code of the system needs no change.
 
-`eta_transform` points a module's `erlang:monitor/2,3` and `demonitor/1,2` here,
-so ordinary code needs no change.
+## Simulated monitors and VM monitors
 
-## What is simulated, and what is left to the VM
+A simulated monitor is a record in this module. No VM monitor exists for it. A
+monitor is simulated when a network is running, the type is `process`, the
+options contain no `alias`, and one of these conditions holds when the monitor
+is created:
 
-A monitor is **simulated** when, at the moment it is created, watcher and target
-are located on *different* simulated nodes. Everything else — same node, either
-end unplaced, no topology at all, a monitor on a port or a `time_offset`, or one
-asking for an `alias` — is a plain `erlang:monitor` and behaves exactly as it
-always did.
+- The watcher and the target are located on different simulated nodes.
+- The item is `{Name, Node}`, `Node` is not the real node, and this module
+  resolves the item to a process. The VM cannot resolve such an item.
 
-That line is deliberately narrow, and the reason is which way each choice fails.
-A simulated monitor is the only kind that can be made to fire `noconnection`,
-because the VM will not let one process cancel another's monitor and will not let
-anyone rewrite a `DOWN` already on its way — so a monitor that stayed real would
-report `killed` to a remote watcher, or report twice. But a simulated monitor
-depends on this module being *told* the target died (see `notify_exit/2`), and if
-that ever fails to arrive the watcher waits forever. Simulating only the monitors
-that need it keeps that exposure to the pairs a partition can actually sever, and
-leaves everything else on machinery that cannot go wrong.
+Every other monitor is a VM monitor, created with `erlang:monitor/2,3`.
+Examples:
 
-The consequence worth stating: a monitor created **before** its ends are placed is
-a real one and will not fire `noconnection`. Place the topology before the system
-starts monitoring — `init/2`, alongside registration — which is where it belongs
-anyway.
+- a monitor between two processes on one simulated node;
+- a monitor with an end that is not located;
+- a monitor with no topology declared;
+- a monitor on a port or on `time_offset`;
+- a monitor with an `alias`.
 
-## When a simulated monitor fires
+The rule is narrow for two reasons:
 
-Exactly once, then it is gone, as a real one is:
+- Only a simulated monitor can fire `noconnection`. The VM does not let one
+  process cancel the monitor of another process, and a `DOWN` message that is
+  already sent cannot be changed. A VM monitor on a process of a killed node
+  would report `killed` to a watcher on another node.
+- A simulated monitor fires for an exit only when this module is notified of the
+  exit. See `notify_exit/2`. If the notification is missing, the watcher waits
+  with no end. The rule limits that risk to the monitors that a link failure can
+  sever.
 
-- `{'DOWN', Ref, process, Object, noconnection}` when `partition/3` or
-  `kill_node/2` severs the link between watcher and target.
-- `{'DOWN', Ref, process, Object, Reason}` when the target exits, with the real
-  reason, reported by `eta_sched`. See `notify_exit/2`.
-- `{'DOWN', Ref, process, Object, noproc}` immediately, if the target is already
-  dead when the monitor is created.
-- `{'DOWN', Ref, process, Object, noconnection}` immediately, if the link between
-  watcher and target is already down when the monitor is created.
+A monitor created before its two ends are located is a VM monitor and never
+fires `noconnection`. Declare the topology before the system creates monitors,
+in `init/2` of the harness.
 
-`Object` follows `erlang:monitor/2`: the pid for a pid, `{Name, node()}` for a
-registered name. `{tag, Tag}` in the options replaces `'DOWN'`, as it does for the
-BIF.
+## Messages
 
-The last two are one rule: **a monitor that cannot be established says so at
-once**, rather than never. The BIF answers both that way, and code that waits for
-a DOWN it will not otherwise get depends on it — an agent that monitors a peer to
-find out it is unreachable waits forever otherwise, and the run looks healthy
-while it does.
+A simulated monitor fires once and is then removed, as a VM monitor is.
 
-**A `noconnection` DOWN is terminal.** Real Erlang does not re-arm a monitor
-after one, and neither does this: `heal_partition/3` resurrects nothing, and a
-system that wants to keep watching must monitor again. The immediate
-`noconnection` above is not an exception to that, because it is not the old
-failure being replayed. Nothing here is retroactive. It reports the topology
-*now*, which is the same thing the BIF reports when it is asked to monitor across
-a connection it cannot make.
+| Message | Condition |
+|---|---|
+| `{'DOWN', Ref, process, Object, noconnection}` | `partition/3`, `kill_node/2` or `disconnect_node/1` severs the link between the watcher and the target. |
+| `{'DOWN', Ref, process, Object, Reason}` | The target exits. `Reason` is the real exit reason, reported by `eta_sched`. See `notify_exit/2`. |
+| `{'DOWN', Ref, process, Object, noconnection}`, at once | The link between the watcher and the target is already down when the monitor is created. |
+| `{'DOWN', Ref, process, Object, noproc}`, at once | The target is already dead when the monitor is created, and the link is not down. |
 
-**"Already down" means both directions cut at the node level** — the state
-`partition/3` leaves behind, and the only one that models a lost connection: real
-distribution has no one-way link failure, since either end's tick timing out
-tears the whole connection down. A one-way `cut/2`, and a `cut/2` between two
-*processes*, leave the link up by definition; a monitor created across one is
-established and fires nothing, which is the whole point of that fault. See
-`cut/2`.
+`Object` is the value that `erlang:monitor/2` uses: the pid for a pid, and
+`{Name, node()}` for a registered name. A `{tag, Tag}` option replaces `'DOWN'`
+with `Tag`, as for the BIF.
 
-One approximation, and it is visible only through `learns`: this reads the
-topology, not who has noticed it. `partition/3` with `learns => a` leaves side B
-believing its peer is reachable, and a monitor B creates afterwards still gets
-the immediate `noconnection` — the cut is in the table, and B's ignorance of it
-is not.
+A monitor that cannot be established fires at once, as the BIF does. A process
+that monitors a peer in order to detect that the peer is unreachable depends on
+this message.
+
+A special case is an item `{Name, Node}` for which no process holds `Name` on
+the simulated node `Node`. When the caller is on a simulated node, the function
+creates no monitor and sends one `DOWN` at once:
+
+- `noproc` when `Node` is the node of the caller.
+- `noproc` when `Node` is another node and `connect_node/1` succeeds.
+- `noconnection` when `connect_node/1` fails.
+
+## Rules for `noconnection`
+
+- A `noconnection` DOWN is final. Real Erlang does not arm a monitor again after
+  the message, and this module does not either. `heal_partition/3` restores no
+  monitor. A system that needs the monitor must create it again.
+- The `noconnection` at creation reports the state of the link at that time. It
+  does not repeat an earlier failure.
+- A link is down when both directions are cut at the node level. `partition/3`
+  between two nodes produces this state. Real distribution has no failure of one
+  direction only: when the tick of either end times out, the whole connection
+  closes.
+- A `cut/2` of one direction, and a `cut/2` between two processes, leave the
+  link up. A monitor created across such a cut is established and does not fire.
+  See `cut/2`.
+
+## Limitations
+
+- The check at creation reads the recorded cut. It does not read which side has
+  received the link events. After `partition/3` with `learns => a`, side B has
+  received no link event, and a monitor that side B creates still fires
+  `noconnection` at once.
+- A monitor created on the pid of a process that died in `kill_node/2` fires
+  `noproc`, not `noconnection`.
 """.
 -endif.
 -spec monitor(process | port | time_offset, term()) -> reference().
@@ -2410,10 +2717,14 @@ demonitor(Ref) ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:demonitor/2`, including `flush` and `info`. See `monitor/2`.
+`erlang:demonitor/2`, with the options `flush` and `info`. See `monitor/2`.
 
-A simulated monitor that has already fired behaves as a real fired one does:
-`true`, or `false` under `info`, and never a raise.
+For a simulated monitor that has not fired, the function removes the monitor and
+returns `true`.
+
+For a simulated monitor that has already fired, the function behaves as the BIF
+does for a VM monitor that has fired. It returns `true`, or `false` with the
+`info` option, and it does not raise.
 """.
 -endif.
 -spec demonitor(reference(), list()) -> boolean().
@@ -2455,37 +2766,45 @@ flush_down(true, Tag, Ref) ->
 
 -if(?DOCATTRS).
 -doc """
-Tells the network a process has exited, so simulated monitors on it can fire.
+Records that a process has exited, and fires the simulated monitors on it with
+the exit reason.
 
-Called by `eta_sched` from the exit trace event, not by a harness. Inert when no
-network is running.
+`eta_sched` calls this function from the exit trace event. A harness does not
+call it. The function does nothing when no network is running.
 
-## Why the scheduler is the source
+The function does the following:
 
-A simulated monitor has no VM monitor behind it, so something has to notice the
-target died. Every candidate but this one is worse:
+1. It records the process as dead. A simulated monitor that is created on the
+   process later fires `noproc` at once, without a call to the VM.
+2. It removes the `monitor_nodes/1` subscriptions and the `monitor_node/2`
+   watches of the process.
+3. It fires every simulated monitor on the process, in the order in which the
+   monitors were created.
+4. It removes every simulated monitor that the process held.
 
-- A **broker process** holding real monitors would learn at the right moment and
-  forward at the wrong one — it is not a process the scheduler owns, so its
-  forwarded DOWN lands whenever the BEAM happens to run it. That is a message
-  ordered by wall clock, which is the thing this framework exists to remove.
-- A **real monitor in the watcher**, under a private tag, would land at exactly
-  the right moment in exactly the wrong shape, and no one can rewrite another
-  process's mailbox.
-- **Polling** would fire on whichever driver call happened next.
+## Source of the notification
 
-`eta_sched` is already the tracer for every process in a run and already calls
-`inherit/2` from the same handler, so it learns of an exit synchronously with the
-step that caused it, in a process whose mailbox is read at points the schedule
-fixes. Delivery from there is exact: only one process runs during a step, so a
-DOWN raised at the end of it sits behind every message the dying process sent
-during it, which is the order the VM would have produced.
+A simulated monitor has no VM monitor, so another component must report the
+exit of the target. The alternatives to `eta_sched` were rejected:
 
-**The boundary this leaves**: a target the scheduler does not own reports nothing,
-so a simulated monitor on one never fires. Every process a run schedules is owned
-by construction — that is `processes/1`'s contract — so this is a statement about
-processes outside the run, and it is another reason simulation is confined to
-monitors that cross a declared link.
+| Alternative | Defect |
+|---|---|
+| A broker process with VM monitors | The scheduler does not own the broker, so the broker forwards the `DOWN` at a time that the VM decides. The message is then ordered by real time. |
+| A VM monitor in the watcher, with a private tag | The message arrives at the correct time with the wrong content. No process can change a message in the mailbox of another process. |
+| Polling | The monitor fires at the next driver call, not at the exit. |
+
+`eta_sched` is the tracer of every process in a run, and it calls `inherit/2`
+from the same handler. It receives the exit in the step that caused the exit.
+Only one process runs during a step. A `DOWN` that is sent at the end of the
+step therefore follows every message that the dying process sent during the
+step. The VM produces the same order.
+
+## Limitations
+
+- A target that the scheduler does not own reports no exit, so a simulated
+  monitor on such a target never fires for an exit. Every process that a run
+  schedules is owned, so the limitation applies only to processes outside the
+  run.
 """.
 -endif.
 -spec notify_exit(pid(), term()) -> ok.
@@ -2535,18 +2854,32 @@ fire({Ref, Watcher, _Target, Object, Tag, _Seq}, Reason) ->
 
 -if(?DOCATTRS).
 -doc """
-Drops everything sent from `From` to `To` until `heal/2`. One direction.
+Drops every message sent from `From` to `To` until `heal/2`. The cut applies to
+one direction.
 
-Messages already in flight on that channel are cancelled, as a failing link loses
-what was on it, and counted as both `dropped` and `cancelled`.
+`From` and `To` are both simulated nodes or both processes:
 
-**No link events.** This is a message fault, not a node failure: nothing is
-signalled and no monitor fires. A one-way loss of messages is not something a
-lost connection produces — real distribution tears the whole connection down
-when either end's tick times out, and both ends then find out. `partition/3` is
-that event; `cut/2` is the narrower fault of a channel that swallows traffic
-while both ends still believe the link is up. Use it when that is what you mean,
-and `partition/3` when a node has gone.
+- A cut between two nodes applies to every process on the nodes. It also applies
+  to a process that is placed on one of the nodes later, such as a restarted
+  process.
+- A cut between two processes applies to those two pids.
+- An atom that names both a simulated node and a registered process is treated
+  as a node. Pass a pid to cut the process.
+
+Delayed messages on the channel are cancelled, because a failing link loses the
+messages that are in transit. Each cancelled message is counted as `dropped` and
+as `cancelled`.
+
+A cut delivers no link event: no signal is sent and no monitor fires. Both ends
+continue to treat the link as up. A lost connection does not produce this state.
+Real distribution closes the whole connection when the tick of either end times
+out, and both ends then receive the event. Use `partition/3` for a lost
+connection or a lost node. Use `cut/2` for a channel that drops messages while
+the connection stays up.
+
+Raises `{eta_net, {mixed_cut, Resolved, Text}}` when one argument is a node and
+the other is a process. Raises `{eta_net, {no_network, cut, Text}}` when no
+network is running.
 """.
 -endif.
 -spec cut(dest(), dest()) -> ok.
@@ -2573,7 +2906,7 @@ cut(From0, To0) ->
     end.
 
 -if(?DOCATTRS).
--doc "Restores a channel previously `cut/2`.".
+-doc "Removes a cut made with `cut/2`, in one direction. Raises `{eta_net, {mixed_cut, Resolved}}` when one argument is a node and the other is a process.".
 -endif.
 -spec heal(dest(), dest()) -> ok.
 heal(From0, To0) ->
@@ -2586,7 +2919,7 @@ heal(From0, To0) ->
     ok.
 
 -if(?DOCATTRS).
--doc "Cuts both directions — which is what a lost link actually is. See `partition/3`.".
+-doc "Cuts both directions between `A` and `B` and delivers the link events, with no signal. See `partition/3`.".
 -endif.
 -spec partition(dest(), dest()) -> ok.
 partition(A, B) ->
@@ -2594,88 +2927,109 @@ partition(A, B) ->
 
 -if(?DOCATTRS).
 -doc """
-Cuts both directions, delivers the `noconnection` DOWNs the failure produces, and
-optionally a link-down signal.
+Cuts both directions between `A` and `B` and delivers the link events of the
+failure.
 
 ```erlang
 eta_net:partition(na, nb, #{signal => nodedown}).
 ```
 
-## The signal
+`A` and `B` are both simulated nodes or both processes, as for `cut/2`.
 
-**Prefer the signalling form.** A real link failure is never only lost messages:
-it delivers `nodedown`/`nodeup` to both ends and systems hang recovery off those.
-Dropping without signalling injects something no network produces — messages
-vanishing while both ends still believe the link is up — and the unrecovered state
-that follows is an artefact rather than a defect.
-
-The opposite trap is real too: recovery driven by the signal may repair the very
-divergence under test, so a run asserting a property *during* a fault restricts
-loss by `scope` instead. Neither is right in every situation, which is why there
-is no default.
-
-Three forms, and the first is the one to reach for:
-
-| `signal` | side A receives | side B receives |
+| Option | Default | Meaning |
 |---|---|---|
-| `nodedown` (any atom) | `{nodedown, B}` | `{nodedown, A}` |
+| `signal` | No signal | A message sent to every located process on each side. |
+| `learns` | `both` | The side that receives the link events: `both`, `a` or `b`. |
+
+The function does the following, in this order:
+
+1. It cuts both directions and cancels the delayed messages, as `cut/2` does.
+2. It fires every simulated monitor held across the partition with
+   `noconnection`.
+3. When `A` and `B` are nodes, it disconnects them and sends `nodedown` to the
+   `monitor_node/2` watchers and the `monitor_nodes/1` subscribers.
+4. It sends the signal, if the `signal` option is given.
+
+Raises `{eta_net, {bad_learns, Value, Text}}` for any other value of `learns`.
+Raises `{eta_net, {mixed_cut, Resolved, Text}}` when one argument is a node and
+the other is a process.
+
+## Signal
+
+A real link failure delivers `nodedown` to both ends, and systems start recovery
+from that event. A partition that delivers no event leaves both ends treating
+the link as up while messages are lost. No network produces that state, and the
+state that the system then fails to recover from is not a defect of the system.
+
+Recovery that starts from the event can also repair the divergence that a run is
+testing. A run that checks a property during a fault should restrict loss with
+the `scope` of the policy instead. Neither choice fits every run, so the
+`signal` option has no default.
+
+| `signal` | Message to side A | Message to side B |
+|---|---|---|
+| An atom, such as `nodedown` | `{nodedown, B}` | `{nodedown, A}` |
 | `{literal, Term}` | `Term` | `Term` |
-| any other term | itself | itself |
+| Any other term | The term | The term |
 
-An atom names a *kind* and is derived per side, because that is what a partition
-actually says: processes on A learn that B is gone, and processes on B learn that
-A is gone. One undifferentiated term tells both sides the same thing, which is
-never what happened. `A` and `B` here are the arguments as resolved — a node name
-if the argument named a node, the pid otherwise.
+An atom is the kind of the event. Each side receives the kind with the name of
+the other side: the processes on A receive that B is gone, and the processes on
+B receive that A is gone. The name of a side is the node name when the argument
+named a node, and the pid otherwise.
 
-The literal forms are what a term that is already complete uses, and
-`#{signal => {nodedown, node()}}` keeps meaning exactly what it always did.
-`{literal, _}` exists for the one case the bare form cannot express: a signal
-that is a single atom.
+The other two forms send one complete term to both sides. For example,
+`#{signal => {nodedown, node()}}` sends `{nodedown, node()}` to both sides. Use
+`{literal, Atom}` to send a signal that is a single atom.
 
-## Which side learns
+## The `learns` option
 
-`learns` says which side of the partition *observes* the failure: `both` (the
-default), `a`, or `b`. It governs the signal and the DOWNs together, since they
-are the same event seen twice.
+`learns` selects the side that receives the link events. It applies to the
+DOWNs, the `nodedown` messages and the signal together.
 
 ```erlang
 eta_net:partition(na, nb, #{signal => nodedown, learns => a}).
 ```
 
-is "A finds out that B is gone, and B does not notice" — an asymmetry real
-distribution produces constantly, since the two ends time out independently, and
-one that had to be hand-rolled from two `cut/2` calls and a fan-out before. The
-cut itself stays symmetric: a lost link loses both directions whether or not
-anyone has realised.
+In this example, side A receives the events for the loss of B, and side B
+receives nothing. Real distribution produces this asymmetry, because the two
+ends time out independently. The cut is symmetric in every case: a lost link
+loses both directions.
 
-B finds out at the latest when the partition heals. `heal_partition/2,3` delivers
-B's side of the failure first, its DOWNs, `nodedown` and signal, then heals: A
-closed its end of the connection, so the first thing B hears once packets flow
-again is that the connection is gone. Without that, a call B made into the cut
-would wait out its whole time-out after the heal, which real distribution never
-does.
+Side B receives its events when the partition heals, at the latest.
+`heal_partition/2,3` first delivers the events of side B: the DOWNs, the
+`nodedown` messages and the signal of the partition. It then heals the cut. This
+order models the real case: side A closed its end of the connection, so side B
+receives the loss of the connection as soon as packets arrive again. Without
+this step, a call that side B made into the cut would wait for its whole
+time-out after the heal.
 
 ## Connections
 
-When `A` and `B` are nodes, the partition disconnects them, and the
-`monitor_nodes/1` subscribers on each side that learns of it receive
-`{nodedown, Other}` after the DOWNs and before the signal. That is the event a
-system watching `net_kernel` acts on, so it is usually all a run needs: `signal`
-is for a system that learns some other way. See "Node identity" in the module doc.
+When `A` and `B` are nodes, the partition disconnects them. On each side that
+receives the link events, the `monitor_nodes/1` subscribers receive
+`{nodedown, Other}`, with the reason `net_tick_timeout`. A system that watches
+`net_kernel` acts on this message, so most runs need no `signal`. Use `signal`
+for a system that detects a failure in another way. See "Node identity" in the
+module documentation.
 
 ## Monitors
 
-Every simulated monitor held across the partition fires exactly one
-`{'DOWN', Ref, process, Object, noconnection}` and is retired. See `monitor/2`
-for which monitors those are and why the DOWN is terminal.
+Every simulated monitor held across the partition fires
+`{'DOWN', Ref, process, Object, noconnection}` once and is removed. With
+`learns`, only the monitors whose watcher is on the selected side fire. See
+`monitor/2`.
 
-## Delivery
+## Delivery order
 
-DOWNs first, then signals; side A's fan-out before side B's; each in placement
-order. Everything is delivered directly rather than routed, so a cut channel
-cannot swallow it, and everything is enqueued before this call returns — no
-process the scheduler owns runs in between, so no one can observe half of it.
+1. The DOWNs, in the order in which the monitors were created.
+2. For side A and then for side B: `{nodedown, Other}` to the `monitor_node/2`
+   watchers, then to the `monitor_nodes/1` subscribers in subscription order.
+3. The signal to the processes of side A, in placement order.
+4. The signal to the processes of side B, in placement order.
+
+Every message is sent directly and is not routed, so the cut cannot drop it.
+Every message is sent before the call returns. No process that the scheduler
+owns runs during the call, so no process observes a part of the events.
 """.
 -endif.
 -spec partition(dest(), dest(), event_opts()) -> ok.
@@ -2692,7 +3046,7 @@ partition(A, B, Opts) ->
     end.
 
 -if(?DOCATTRS).
--doc "Heals both directions. See `heal_partition/3`.".
+-doc "Heals both directions between `A` and `B`, with no signal. See `heal_partition/3`.".
 -endif.
 -spec heal_partition(dest(), dest()) -> ok.
 heal_partition(A, B) ->
@@ -2700,15 +3054,25 @@ heal_partition(A, B) ->
 
 -if(?DOCATTRS).
 -doc """
-Heals both directions, optionally delivering a link-up signal — `#{signal =>
-nodeup}`, or any of the forms `partition/3` takes. See `partition/3` for why that
-matters, and `learns` for delivering it to one side only.
+Heals both directions between `A` and `B`, and optionally sends a signal.
 
-**Resurrects nothing.** A monitor that fired `noconnection` is gone, exactly as
-it would be in real Erlang, and a system that wants to keep watching its peer has
-to monitor it again. The nodes stay disconnected until something connects them —
-`connect_node/1`, or a plain send. Healing a link is not undoing the failure; it
-is a second event.
+The options are those of `partition/3`. `#{signal => nodeup}` sends
+`{nodeup, B}` to side A and `{nodeup, A}` to side B. `learns` restricts the
+signal to one side.
+
+The function does the following, in this order:
+
+1. If the partition was made with `learns => a` or `learns => b`, it delivers
+   the link events of the partition to the other side. See `partition/3`.
+2. It removes the cut in both directions.
+3. It sends the signal, if the `signal` option is given.
+
+A heal is a second event. It does not undo the failure:
+
+- A monitor that fired `noconnection` is not restored, as in real Erlang. A
+  system that needs the monitor must create it again.
+- The nodes remain disconnected until a process connects them, with
+  `connect_node/1` or with a send without `noconnect`.
 """.
 -endif.
 -spec heal_partition(dest(), dest(), event_opts()) -> ok.
@@ -2838,7 +3202,7 @@ endpoints(Ref) ->
     end.
 
 -if(?DOCATTRS).
--doc "Kills a simulated node with no signal. See `kill_node/2`.".
+-doc "Kills the simulated node `Node` with no signal. See `kill_node/2`.".
 -endif.
 -spec kill_node(term()) -> ok.
 kill_node(Node) ->
@@ -2846,59 +3210,75 @@ kill_node(Node) ->
 
 -if(?DOCATTRS).
 -doc """
-"Node N is gone": every process located on it dies, and every survivor gets the
-events that death produces.
+Kills a simulated node: every located process on the node dies, and the
+surviving processes receive the link events of the loss.
 
 ```erlang
 eta_net:kill_node(nb, #{signal => nodedown}).
 ```
 
-Six things happen, in this order, and the order is the point — a harness that
-hand-rolls this from `place/2`, `exit/2` and `partition/3` gets it subtly wrong,
-usually by killing first:
+The only option is `signal`. See `partition/3` for its forms. An atom `Signal`
+is sent as `{Signal, Node}`.
 
-1. Every simulated monitor held **from another node** on a process that is about
-   to die fires `{'DOWN', Ref, process, Object, noconnection}`.
-2. Every monitor with either end on the node is retired.
-3. Messages in flight to or from the node are cancelled, as a failing node loses
-   what was on the wire.
-4. Every located process on the node — placed *and* attached — is killed.
-5. Every node connected to it is disconnected, and its `monitor_nodes/1`
-   subscribers receive `{nodedown, Node}`.
-6. Surviving located processes receive `{Signal, Node}`.
+The function does the following, in this order:
 
-## The asymmetry in step 1
+1. It fires `{'DOWN', Ref, process, Object, noconnection}` for every simulated
+   monitor that a process on another node holds on a process of the node.
+2. It removes every simulated monitor that has either end on the node.
+3. It cancels the delayed messages to and from the processes of the node.
+4. It kills every located process on the node, placed and attached, and waits
+   until each process has exited. It also cancels the timers of these processes.
+5. It applies a disk crash to the files of the node, when a disk is running. See
+   `eta_disk:crash/1`.
+6. It marks the node as down and disconnects every node that is connected to it.
+   The `monitor_nodes/1` subscribers of those nodes receive `{nodedown, Node}`,
+   with the reason `connection_closed`.
+7. It sends the signal to every surviving located process, in placement order.
 
-Real distribution reports a lost node as `noconnection` to a remote monitor while
-a monitor on the same machine sees the true exit reason. One VM cannot do that on
-its own: a killed process yields `killed` to every monitor it has. So the remote
-monitors are retired *before* the process dies, and the DOWN they receive is the
-one distribution would have sent. Monitors held by anything not located — a
-client, a harness, an observer — are untouched real monitors and see `killed`,
-which is the same asymmetry seen from the other side.
+A harness that builds this sequence from `place/2`, `exit/2` and `partition/3`
+must keep the same order.
 
-Step 1 must precede step 4 for a second reason: once the exit signal is out, the
-scheduler may report it at any moment, and a monitor still on the books then
-would fire with the real reason.
+## Errors
+
+| Error | Condition |
+|---|---|
+| `{eta_net, {no_such_node, Node, Text}}` | No process has been placed or attached on `Node`. |
+| `{eta_net, {learns_on_kill, Node, Text}}` | The options contain `learns`. Only the surviving side receives events, so `learns` has no meaning here. |
+| `{eta_net, {kill_timeout, Pid, Text}}` | A process of the node did not exit within 5 s of real time. |
+| `{eta_net, {no_network, kill_node, Text}}` | No network is running. |
+
+## Order of step 1 and step 4
+
+Real distribution reports a lost node as `noconnection` to a monitor on another
+node. A monitor on the same machine receives the real exit reason. One VM cannot
+produce both results with VM monitors, because a killed process reports `killed`
+to every monitor on it. The function therefore fires and removes the monitors
+from other nodes before it kills the processes.
+
+Step 1 must also come before step 4 because the exit signal is asynchronous.
+After the kill, the scheduler can report the exit at any time. A simulated
+monitor that still exists at that time would fire with the real exit reason.
+
+A monitor held by a process that is not located is a VM monitor and receives
+`killed`. Examples are a client, a harness and an observer.
 
 ## Atomicity
 
-The whole sequence runs in the driver, between steps, while every process the
-scheduler owns is suspended. No survivor can observe a half-dead node, because no
-survivor runs until it is a fully dead one.
+The whole sequence runs in the driver, between steps, while every process that
+the scheduler owns is suspended. No surviving process runs until the sequence is
+complete, so no surviving process observes a node that is partly dead.
 
-## Restarting
+## Restart
 
-A killed node's *name* survives; its processes do not. `place/2` or `attach/2` on
-the same name afterwards is how a restart is expressed, and the new processes are
-ordinary members of that node — they get a fresh position in the link-event
-fan-out, since the ones they replace are gone.
+The name of a killed node remains. The processes of the node do not. To restart
+the node, call `place/2` or `attach/2` with the same name. The new processes get
+new positions in the order of link events.
 
-Two things deliberately do not reset. Any cut involving the node is still in
-force, so a node that was partitioned and then died comes back partitioned until
-it is healed; and nothing re-monitors on a survivor's behalf. Both follow from
-the same rule as everywhere else here: an event says what just happened, it does
-not undo what happened before.
+A restart does not reset the following:
+
+- A cut that involves the node remains. A node that was partitioned and then
+  killed is still partitioned after the restart, until the cut is healed.
+- No monitor is created again for a surviving process.
 """.
 -endif.
 -spec kill_node(term(), event_opts()) -> ok.
@@ -3023,8 +3403,14 @@ cancel_touching(Dying) ->
 
 -if(?DOCATTRS).
 -doc """
-Drops exactly the next `K` messages from `From` to `To`, then resumes. Asks what a
-probability cannot: "lose the reply to this one operation".
+Drops the next `K` messages from `From` to `To`. Later messages are not
+affected.
+
+Use this function for a fault that a probability cannot select, such as the loss
+of the reply to one operation. `From` and `To` are pids or registered names. A
+new call for the same channel replaces the earlier count.
+
+Raises `{eta_net, {no_network, drop_next, Text}}` when no network is running.
 """.
 -endif.
 -spec drop_next(dest(), dest(), non_neg_integer()) -> ok.
@@ -3035,16 +3421,19 @@ drop_next(From0, To0, K) ->
 
 -if(?DOCATTRS).
 -doc """
-On the `From -> To` channel, lets the next `Skip` messages tagged `Tag` through,
-then drops the following `K` of them. Other traffic is untouched.
+Drops selected messages with the tag `Tag` on the channel from `From` to `To`.
 
-Counts *within one kind of message*, which a raw message count cannot: a batch
-interleaves on the wire with acks and replies, so "drop messages 2..4 of this
-batch" is only expressible by tag. Losing a strict subset of one batch is a
-materially different fault from losing a whole channel — it can leave no
-discontinuity for the receiver to detect.
+The function lets the next `Skip` messages with the tag `Tag` pass, and then
+drops the following `K` messages with that tag. Messages with other tags are not
+affected and are not counted. See `set_policy/1` for the definition of a tag.
 
-See `set_policy/1` for what a tag is.
+The count applies to one kind of message. A batch is interleaved on the channel
+with acknowledgements and replies, so "drop messages 2 to 4 of this batch" can
+only be stated by tag. The loss of a strict subset of one batch differs from the
+loss of a whole channel: the receiver may have no gap to detect.
+
+Raises `{eta_net, {no_network, drop_matching, Text}}` when no network is
+running.
 """.
 -endif.
 -spec drop_matching(dest(), dest(), term(), non_neg_integer(), non_neg_integer()) -> ok.
@@ -3056,15 +3445,18 @@ drop_matching(From0, To0, Tag, Skip, K) ->
 
 -if(?DOCATTRS).
 -doc """
-Removes every cut and every pending `drop_next/3` or `drop_matching/5`.
+Removes every cut and every pending `drop_next/3` and `drop_matching/5`.
 
-Does not touch the random policy — `heal_all/0` plus
-`set_policy(#{drop_p => 0.0, delay_p => 0.0})` is the perfect network to converge
-into.
+The function does not change the following:
 
-Does not touch monitors or topology either. A monitor retired by a `noconnection`
-DOWN stays retired, exactly as `heal_partition/3` leaves it, and a node killed by
-`kill_node/2` stays dead. This restores a *network*; it does not rewind a run.
+- The random policy. To get a perfect network, call `heal_all/0` and
+  `set_policy(#{drop_p => 0.0, delay_p => 0.0})`.
+- Monitors. A monitor that fired `noconnection` is not restored, as with
+  `heal_partition/3`.
+- The topology and the connections. A node killed with `kill_node/2` remains
+  down.
+
+Raises `{eta_net, {no_network, heal_all, Text}}` when no network is running.
 """.
 -endif.
 -spec heal_all() -> ok.
@@ -3082,22 +3474,31 @@ heal_all() ->
 
 -if(?DOCATTRS).
 -doc """
-Message counts by disposition.
+Returns the counters of the network as a map.
 
-`dropped` is what a non-vacuity guard asserts on: a run whose network never lost
-anything tested the same system a perfect one would, and reports the same `ok`.
+| Key | Count |
+|---|---|
+| `delivered` | Messages that were routed and delivered at once. |
+| `delayed` | Messages that were routed and scheduled for a later delivery. |
+| `dropped` | Messages dropped by a cut, by `drop_next/3` or `drop_matching/5`, or by the policy, and delayed messages that were cancelled. |
+| `cancelled` | Delayed messages that were cancelled by a cut, a partition, a disconnect or a node kill. Each is also counted as `dropped`. |
+| `unmanaged` | Sends to a process that the scheduler owns, made by a process that the scheduler was not stepping. See `eta_sched:stepping/0`. |
+| `signalled` | Link event messages sent: signals, and `nodeup` and `nodedown` messages. |
+| `noconnection` | Synthetic `noconnection` DOWNs fired. |
+| `busy` | Sends refused because the link was busy. See `send_nosuspend/3`. |
+| `in_flight` | The result of `in_flight/0`. |
 
-`unmanaged` counts sends made by a process other than the one the scheduler was
-stepping, *into* a process the scheduler owns — see `eta_sched:stepping/0`.
-Non-zero means part of the run was ordered by wall clock, and nothing else
-reports it. Traffic between two processes the run does not own is delivered
-untouched and not counted.
+Use the counters to check that a run was not vacuous:
 
-`signalled` and `noconnection` count link *events* rather than traffic: node
-signals delivered, and synthetic `noconnection` DOWNs fired. They are the
-non-vacuity guard for a partition, the way `dropped` is for a lossy policy — a
-run that partitioned a node nothing was on, or severed no monitor, exercised no
-recovery and reports the same `ok`.
+- With `dropped` at 0, a lossy policy lost nothing. The run tested the same
+  behaviour as a run with a perfect network, and it reports the same `ok`.
+- With `signalled` and `noconnection` at 0, a partition reached no process and
+  severed no monitor. The run exercised no recovery.
+- With `unmanaged` above 0, a part of the run was ordered by real time. No other
+  measurement reports this. A send between two processes that the run does not
+  own is delivered unchanged and is not counted.
+
+Raises `{eta_net, {no_network, stats, Text}}` when no network is running.
 """.
 -endif.
 -spec stats() -> #{atom() => non_neg_integer()}.
@@ -3110,11 +3511,13 @@ stats() ->
 
 -if(?DOCATTRS).
 -doc """
-How many messages are delayed but not yet delivered.
+Returns the number of messages that are delayed and not yet delivered.
 
-The network's analogue of a stray timer: non-zero at the end of a run means a
-message was decided on and never arrived, usually because the run ended or its
-destination died first.
+A result above 0 at the end of a run means that a delayed message was not
+delivered. The usual cause is that the run ended, or the destination died,
+before the deadline. The count corresponds to the stray timers of `eta_time`.
+
+Raises `{eta_net, {no_network, in_flight, Text}}` when no network is running.
 """.
 -endif.
 -spec in_flight() -> non_neg_integer().

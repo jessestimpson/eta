@@ -4,8 +4,8 @@
 
 -if(?DOCATTRS).
 -moduledoc """
-A `parse_transform` that points a module's timer and clock calls at `eta_time` —
-Phase 1 of the DST framework (design: `docs/design.md`).
+A `parse_transform` that points a module's timer and clock calls at `eta_time`
+(design: `docs/design.md`).
 
 Nothing else about the module changes, and the rewrite is a pure call-target
 substitution: `erlang:send_after(T, D, M)` becomes `eta_time:send_after(T, D, M)`,

@@ -4,69 +4,113 @@
 
 -if(?DOCATTRS).
 -moduledoc """
-The run driver — Phase 3 of the DST framework
-(design: `docs/design.md`).
+The run driver (design: `docs/design.md`).
 
-Turns a seed into a run: start the clock, start the system, then alternate between
-injecting client operations, stepping one process at a time, and letting virtual
-time pass — checking the invariants throughout, and recording enough to replay the
-whole thing exactly.
+`eta_run` turns a seed into a run. A run does the following:
 
-The system under test supplies six callbacks; see `eta_harness`.
+1. It starts the virtual clock.
+2. It starts the system under test.
+3. It performs one action at a time. An action injects a client operation, steps
+   one process, or advances virtual time.
+4. It checks the invariants after the actions.
+5. It records every action in a trace that replays the run exactly.
+
+The system under test implements the `eta_harness` behaviour, which has six
+required callbacks.
+
+## Example
 
 ```erlang
 #{outcome := ok} = eta_run:run(my_sut, #{seed => 7, max_ops => 40}).
 ```
 
-## The three things a run can do, and why the choice matters
+## Actions
 
-At every iteration the driver picks one of:
+In each iteration the driver performs one of three actions:
 
-- **step** a runnable process, chosen from the seeded RNG;
-- **inject** the next generated operation;
-- **advance the clock** to the next timer deadline.
+| Action | Effect |
+|---|---|
+| step | Runs one runnable process, chosen with the seeded random generator. |
+| op | Injects the next generated operation. |
+| clock | Advances the clock to the next timer deadline. |
 
-The interesting knob is what to do when *nothing is runnable*. Always injecting
-there is the obvious choice and it is wrong: it means the system is never left
-alone with only its own timers for company, and a whole class of defect lives
-exactly there. A replicated registry's traffic-triggered resync gap only shows when
-nothing else is happening — a follower that lost the tail of the replication
-stream detects it on the next batch, so with a client always poking the system the
-gap is papered over before it can be observed. `quiet_p` is the probability of
-letting time pass instead, and it is the reason that class of bug is reachable.
+The driver chooses the action as follows:
+
+| Runnable processes | Operations left | Action |
+|---|---|---|
+| at least one | yes | op with probability `op_p`, otherwise step |
+| at least one | no | step |
+| none | yes | clock with probability `quiet_p`, otherwise op |
+| none | no | clock |
+
+When the driver chooses clock and no timer is pending, the driver injects an
+operation if one is left. Otherwise the run ends as `quiescent`.
+
+`quiet_p` exists for the case in which no process is runnable. A driver that
+always injects an operation in that case never lets the system run on its own
+timers alone. Some defects occur only in that state. For example, a follower in a
+replicated registry that lost the tail of the replication stream detects the gap
+on the next batch. When a client operation always follows, the next batch repairs
+the gap before an invariant can observe it. `quiet_p` is the probability that the
+driver advances time instead of injecting an operation.
 
 ## Determinism
 
-Everything that varies is drawn from one seeded `rand` state: the scheduling
-choices, the decision between stepping and injecting, and whatever `generate/2`
-draws. Given the same seed and the same system, a run is reproducible.
+Every random choice is drawn from one seeded `rand` state:
 
-Replay does not depend on that reproducibility. `replay/3` follows a recorded
-trace — `{step, Id}`, `{op, Op}` and `{clock, Ms}` entries, in order — so a trace
-that has been edited or shrunk replays as faithfully as one straight from a seed,
-which is what Phase 4 needs. A recorded step naming a process that is not runnable
-is reported as a divergence rather than skipped, because a "replay" that quietly
-does something else is worse than no replay.
+- the choice of the process to step;
+- the choice between a step, an operation and a clock advance;
+- the values that `generate/2` draws.
 
-**An entry that created processes also records their ids**, as a third element:
-`{op, Op, [3, 4]}`. A replay hands those back to the scheduler rather than
-recounting, so deleting one entry cannot rename the processes another entry names
-— which is what lets `eta_shrink` delete an operation and have the rest of the
-trace still mean what it meant. Entries that created nobody keep the plain two
-element shape, so match with `action/1` rather than on the tuple. See
-`eta_sched:pin/2`.
+A run with the same seed and the same system is therefore reproducible.
 
-**All three of the driver's actions are entries**, letting time pass included. A
-trace missing the clock advances is not a trace of a system that has timers: replay
-walks only what it is given, so the clock never moves, nothing ever becomes
-runnable, and every recorded step is refused. See `idle/1`.
+## Trace
 
-## Ordering at startup
+A trace is a list of entries in the order of the actions:
 
-The clock starts before the system, always. A timer armed while `eta_time` is
-inert goes to the real clock and stays there until it fires and re-arms, so
-long-period timers — the interesting ones — would silently never be virtual. This
-is why `init/2` is called by the driver rather than by the caller beforehand.
+| Entry | Meaning |
+|---|---|
+| `{op, Op}` | The driver injected `Op`. |
+| `{step, Id}` | The driver stepped process `Id`. |
+| `{clock, Ms}` | The driver advanced the clock. `Ms` is the clock value after the advance. |
+| `{final, Settled}` | How the run ended. This entry is the last entry of a run that ended normally. |
+
+`replay/3` follows a recorded trace and draws no choice from the seed. A trace
+that was edited or shrunk therefore replays in the same way as a trace from a
+seed. `eta_shrink` depends on this property.
+
+The following rules apply to a trace:
+
+- **Divergence.** A strict replay reports a recorded step of a process that is
+  not runnable as a divergence. It does not skip the step. A replay that performs
+  a different schedule is not a reproduction of the run.
+- **Created processes.** An entry that created processes records their ids as a
+  third element, for example `{op, Op, [3, 4]}`. A replay gives these ids to the
+  scheduler, and the scheduler does not count the processes again. The deletion
+  of one entry therefore does not change the id of a process that another entry
+  names. This property lets `eta_shrink` delete an operation and keep the meaning
+  of the remaining entries. See `eta_sched:pin/2`.
+- **Entry shape.** An entry that created no process has two elements. Match on
+  the result of `action/1`, not on the entry.
+- **Clock advances.** A clock advance is an entry, like a step and an operation.
+  A replay performs only the entries of the trace. Without clock entries the
+  clock would not move during a replay, no process would become runnable, and
+  the replay would refuse every recorded step.
+- **The end of the run.** A replay passes the recorded `Settled` value to
+  `check_final/2`. A replay does not derive the value again.
+
+## Startup order
+
+The driver starts the clock before the system. For this reason the driver calls
+`init/2`, and the caller does not start the system beforehand.
+
+A timer that is armed while `eta_time` is not running is a timer on the real
+clock. The timer stays on the real clock until it fires and is armed again. A
+timer with a long period would therefore not be on the virtual clock during a
+run.
+
+The driver also starts the simulated network, the simulated disk and the seeded
+`rand` streams before `init/2`.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -187,130 +231,179 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
 
 -if(?DOCATTRS).
 -doc """
-Runs `Mod` under a seed and returns what happened.
+Runs `Mod` under a seed and returns the result.
 
-Options, all with defaults:
+## Options
 
-- `seed` (0) — fixes the whole run.
-- `config` (`#{}`) — passed through to `init/2`.
-- `max_ops` (50) — how many operations to inject before letting the system settle.
-- `max_steps` (10000) — the safety bound on steps *and* clock advances together;
-  hitting it is reported as `{error, step_budget_exhausted}`.
-- `settle_steps` (2000) — how much longer to run once every operation has been
-  injected. A system whose timers never stop — anything with a heartbeat — has no
-  natural quiescence to wait for, and without this the only
-  way such a run can end is the safety bound. Reaching the end of the settle phase
-  is a normal `ok`. A harness with `settle_done/1` can end it sooner; see
+Every option has a default.
+
+- `seed` (default 0): the seed of the run. The seed determines every choice of
+  the run.
+- `config` (default `#{}`): the map that the driver passes to `init/2`.
+- `max_ops` (default 50): the number of operations that the driver injects
+  before the settle phase.
+- `max_steps` (default 10000): the bound on the number of actions of the run.
+  Steps, operations and clock advances all count. A run that reaches the bound
+  ends with `{error, step_budget_exhausted}`.
+- `settle_steps` (default 2000): the number of actions that the run continues
+  after the last operation is injected. A system with a periodic timer, such as a
+  heartbeat, never becomes quiescent. Without this option such a run could end
+  only at `max_steps`. A run that reaches the end of the settle phase ends with
+  `ok`. A harness with `settle_done/1` can end the settle phase earlier. See
   `eta_harness`.
-- `op_p` (0.3) — chance of injecting rather than stepping when both are possible.
-- `quiet_p` (0.3) — chance of letting time pass rather than injecting when nothing
-  is runnable. See the module doc; this is not a tuning knob so much as the thing
-  that makes quiet-period bugs reachable.
-- `busy_steps` (`infinity`) — after this many actions without the clock moving,
-  move it to the next deadline anyway. The clock otherwise moves only when
-  nothing is runnable, so a system that spins, such as a client retrying a
-  server that turns it away, stops time and starves the timer that would end the
-  spin. A real machine takes time to spin, and its timers fire through it.
-- `check_every` (1) — run the invariants every N actions.
-- `check_timeout` (5000) — milliseconds of real time that `check/1` or
-  `check_final/2` may take before the run ends with `{error, check_blocked}`.
-  The bound exists to catch an invariant that calls into a suspended process.
-  Raise it for an invariant that is slow; lower it in a test that expects
-  `check_blocked`, so the test does not wait 5 seconds.
-- `log` (`true`) — collect a `eta_log` record of the run. `false` suppresses the
-  events but **not** the sequence numbers `log/1` hands out, so a harness that
-  stamps its operations from them keeps working. See `eta_log`.
-- `net` (`false`) — install a simulated network for the run. `true` for a
-  perfect one, or `#{policy => ...}` to inject loss and delay; see `eta_net`. It
-  is started **before** `init/2`, seeded from the run's seed, so a fault schedule
-  is a function of that seed and nothing else. A harness whose cluster must sync
-  before it can survive faults leaves the policy perfect here and calls
+- `op_p` (default 0.3): the probability that the driver injects an operation
+  instead of stepping a process, when both are possible.
+- `quiet_p` (default 0.3): the probability that the driver advances time instead
+  of injecting an operation, when no process is runnable. Defects that occur only
+  in a period without operations are reachable because of this option. See the
+  module documentation.
+- `busy_steps` (default `infinity`): the number of actions without a clock
+  advance after which the driver advances the clock to the next deadline. The
+  clock otherwise moves only when no process is runnable. A system that spins
+  keeps a process runnable, so the clock stops and the timer that would end the
+  spin never fires. An example is a client that retries at once when a server
+  rejects it. On a real machine a spin takes time, and timers fire during it.
+- `check_every` (default 1): the driver checks the invariants every N actions.
+- `check_timeout` (default 5000): the real time, in milliseconds, that `check/1`
+  or `check_final/2` may take. A check that takes longer ends the run with
+  `{error, check_blocked}`. The bound detects an invariant that calls a
+  suspended process. Raise the value for a slow invariant. Lower the value in a
+  test that expects `check_blocked`, so that the test does not wait 5 seconds.
+- `log` (default `true`): whether `eta_log` collects a record of the run. With
+  `false`, `eta_log` collects no events, but `eta_log:log/1` still returns
+  sequence numbers. A harness that stamps its operations with these numbers
+  works with either value. See `eta_log`.
+- `net` (default `false`): whether the run has a simulated network. `true`
+  starts a network without faults. `#{policy => ...}` starts a network that
+  injects loss and delay. See `eta_net`. The driver starts the network before
+  `init/2` and seeds it from the seed of the run, so the fault schedule is a
+  function of that seed only. A harness with a cluster that must sync before it
+  can tolerate faults leaves the policy without faults here and calls
   `eta_net:set_policy/1` at the end of `init/2`.
-- `disk` (`false`) — install a simulated disk for the run. `true` for the
-  default policy, or `#{policy => ...}`; see `eta_disk`. With a disk, a write to
-  a raw file handle is lost by `eta_net:kill_node/2` unless the system synced
-  it. The disk is started before `init/2` and seeded from the seed of the run.
-- `preload` (`[]`) — applications whose modules to load before the run starts.
-  **Name your own application here.** `kernel`, `stdlib` and `eta` are always
-  included; anything you add is loaded on top. `false` disables it entirely.
+- `disk` (default `false`): whether the run has a simulated disk. `true` starts
+  a disk with the default policy. `#{policy => ...}` sets the policy. See
+  `eta_disk`. With a disk, `eta_net:kill_node/2` loses a write to a raw file
+  handle unless the system synced the write. The driver starts the disk before
+  `init/2` and seeds it from the seed of the run.
+- `preload` (default `[]`): the applications whose modules the driver loads
+  before the run starts. The driver always loads `kernel`, `stdlib` and `eta` in
+  addition. `false` disables preloading. Name the application of the system under
+  test in this option. See the section "Cold code" below.
 
-  This is the fix for `modules_loaded`, and the only reliable one, because
-  warming is per *code path* rather than per VM: running one seed does not warm
-  the branch a later seed takes, so "run it twice" fixes one seed and not the
-  next. Loading your application up front warms all of it.
+## Result
 
-## Fields that mean the run was not deterministic
+The result is a map with these keys:
 
-`stray_timers` counts timers held by a process the scheduler does not own, or
-that has died. A deadline like that cannot make anything runnable, so advancing
-to it would move the clock on behalf of something that can never take a step. The
-driver steps over them, and reports how many it found — a non-zero count means
-your system holds a timer outside the schedule, usually from a process spawned in
-`init/2` or one killed while blocked in a `receive ... after`.
+| Key | Value |
+|---|---|
+| `outcome` | `ok`, `{violation, Violation}` or `{error, Reason}`. |
+| `seed` | The seed of the run. |
+| `trace` | The trace of the run. |
+| `steps` | The number of steps. |
+| `ops` | The number of injected operations. |
+| `clock_ms` | The virtual clock at the end of the run, in milliseconds. |
+| `skipped` | The number of recorded entries that a lenient replay skipped. The value is 0 for a generated run and for a strict replay. |
+| `modules_loaded` | The modules that were loaded during the run. The expected value is `[]`. |
+| `stray_timers` | The number of timers that the clock did not advance to. The expected value is 0. |
+| `net` | The counters of `eta_net:stats/0`, or `#{}` without a simulated network. |
+| `disk` | The counters of `eta_disk:stats/0`, or `#{}` without a simulated disk. |
+| `rand` | The counters of `eta_rand:stats/0`. |
+| `sched` | The counters of `eta_sched:stats/1`. |
 
-`sched.adopted_late` counts processes that ran before the scheduler owned them,
-and `sched.timeouts` counts steps that ended without the process reaching a
-receive.
+`run/2` returns these outcomes:
 
-`modules_loaded` lists modules that were loaded **while the run was in
-progress**, and it should be empty. Loading a module on demand is a synchronous
-call into `code_server`, which the scheduler does not own, so a scheduled
-process that reaches a module it has not touched yet blocks on something
-outside the schedule. The scheduler reads that as the step ending, `code_server`
-makes the process runnable again at a moment decided by wall clock, and every
-choice after that point shifts.
+| `outcome` | Cause |
+|---|---|
+| `ok` | The run ended as `quiescent`, `settle_budget` or `settle_done` with no violation. |
+| `{violation, Violation}` | `check/1` or `check_final/2` returned the violation. |
+| `{error, step_budget_exhausted}` | The run reached `max_steps`. |
+| `{error, check_blocked}` | A check took longer than `check_timeout`. |
+| `{error, {check_returned, Other}}` | A check returned a value that is neither `ok` nor a violation. |
+| `{error, {check_crashed, Reason}}` | The process that ran a check exited with `Reason`. |
 
-The symptom is that the *first* run in a fresh VM produces a different trace
-from every later run of the same seed. Nothing is logged, no scheduler warning
-fires, and `adopted_late` stays 0 throughout, which is why this is reported
-rather than left for you to deduce.
+## Result fields that report nondeterminism
 
-The fix is the `preload` option above. The names reported here tell you which
-application to name in it, and the rule that usually identifies the culprit is
-that **the module which bites is the one only reachable from a scheduled
-process** — anything `init/2` itself touches has already been loaded by the time
-it matters.
+A value other than the expected value in one of these fields means that the seed
+does not reproduce the run. `audit/1` checks all of them:
 
-### The worse failure, and why `preload` is on by default
+```erlang
+ok = eta_run:audit(eta_run:run(Mod, Opts)).
+```
 
-A process waiting on `code_server` is, to `eta_sched`, a process blocked in a
-receive. It is not runnable. So if enough of the system reaches for cold code at
-once, **nothing is runnable, no timer is pending, and the run ends at what looks
-exactly like quiescence** — having done almost nothing, and reporting `ok`.
+- `stray_timers` counts the timers of a process that the scheduler does not own
+  or that has died. Such a deadline cannot make a process runnable. The driver
+  does not advance the clock to it and reports the count. A count above 0 means
+  that the system holds a timer outside the schedule. The usual causes are a
+  process spawned in `init/2` and a process killed while it was blocked in a
+  `receive ... after`.
+- `sched.adopted_late` counts the processes that ran before the scheduler owned
+  them.
+- `sched.timeouts` counts the steps that ended before the process reached a
+  `receive`.
+- `modules_loaded` lists the modules that were loaded during the run. See the
+  section "Cold code" below.
+- `sched.cold_code` lists the processes that waited on the code server when the
+  run ended. See the section "Cold code" below.
 
-Measured on the 2PC harness with preloading disabled and a cold module every
-client touches: 5 operations, **5 steps**, nothing exited, `outcome => ok`. A
-healthy run of the same workload takes around a hundred steps.
+## Cold code
 
-`modules_loaded` does not catch that one, because the loads complete after the
-run has finished — there is nothing to report by the time the run is over. It is
-the reason `preload` defaults to loading `kernel`, `stdlib` and `eta` rather than
-waiting to be asked, and the reason to name your own application there even when
-runs look fine.
+Cold code is a module that is not loaded when a scheduled process first calls
+it. The load is a synchronous call to `code_server`, and the scheduler does not
+own `code_server`. The following happens:
 
-`sched.cold_code` does catch it, from the other side. The scheduler looks once,
-at the moment a run finds nothing runnable and is about to return, for a process
-parked inside the code server's own `call` function — which is where a process
-waiting on the code server always is, since that function is a send followed by a
-one-clause receive. Each entry names the process and the frame that reached the
+1. The scheduled process blocks on a process outside the schedule.
+2. The scheduler treats the block as the end of the step.
+3. `code_server` makes the process runnable again at a time that the wall clock
+   decides.
+4. Every later choice of the run shifts.
+
+The symptom is that the first run in a new VM produces a different trace from
+every later run of the same seed. No message is logged, the scheduler gives no
+warning, and `adopted_late` stays 0. For this reason the result reports
+`modules_loaded`.
+
+The `preload` option is the fix. The names in `modules_loaded` identify the
+application to name in `preload`. The module at fault is usually a module that
+only a scheduled process calls, because every module that `init/2` calls is
+loaded before the run starts.
+
+`preload` is the only reliable fix, because a run loads the modules of one code
+path, not of the VM. A run of one seed does not load the branch that a later
+seed takes, so a second run of the same seed fixes that seed only. `preload`
+loads every module of the application before the run.
+
+### A run that ends early with `ok`
+
+To `eta_sched`, a process that waits on `code_server` is a process blocked in a
+`receive`. The process is not runnable. When enough processes call cold code at
+the same time, no process is runnable and no timer is pending. The run then ends
+in a state that has the form of quiescence, after very few steps, with `ok`.
+
+Measured on the two-phase commit harness with `preload => false` and one cold
+module that every client calls: the run had 5 operations and 5 steps, no process
+exited, and the result was `outcome => ok`. A correct run of the same workload
+takes about 100 steps.
+
+`modules_loaded` does not report this case, because the loads complete after the
+run has ended. For this reason `preload` loads `kernel`, `stdlib` and `eta` by
+default, and a harness names its own application in `preload` even when the runs
+show no problem.
+
+`sched.cold_code` reports this case. When a run finds no runnable process and is
+about to end, the scheduler checks once for a process that is blocked in the
+`call` function of the code server. A process that waits on the code server is
+always in that function, because the function is a send followed by a `receive`
+with one clause. Each entry names the process and the function that called the
 cold module:
 
 ```erlang
 #{sched := #{cold_code := [#{id := 3, pid := _, at := {my_client, commit, 2}}]}}
 ```
 
-so the symptom is no longer "a run that ended far too early with `ok`" and a
-hunch, but a name and a line. A warning is logged too, because a run this
-damaged is worth noticing without being asked.
+The scheduler also logs a warning.
 
-This does not make `preload` optional. Detection is after the fact: the run is
-already spoiled, and all `cold_code` buys you is knowing rather than guessing.
-
-`audit/1` checks these for you, and keeps checking them as more are added:
-
-```erlang
-ok = eta_run:audit(eta_run:run(Mod, Opts)).
-```
+`cold_code` does not replace `preload`. `cold_code` is detected after the run is
+already affected. It identifies the cause and does not repair the run.
 """.
 -endif.
 -spec run(module(), map()) -> result().
@@ -319,18 +412,34 @@ run(Mod, Opts) ->
 
 -if(?DOCATTRS).
 -doc """
-Replays a recorded trace instead of generating one.
+Replays a recorded trace instead of generating a run.
 
-The seed still seeds the system, but no choices are drawn from it: every step and
-every operation comes from `Trace`.
+The seed still seeds the system. The driver draws no choice from the seed: every
+step, operation and clock advance comes from `Trace`. `Opts` takes the options of
+`run/2` and the `lenient` option.
 
-`lenient => true` skips a recorded step whose process is not runnable instead of
-reporting a divergence, and counts them in the result's `skipped`. That is what
-shrinking needs and what verification must not use: removing an operation strands
-the steps that belonged to it, so a strict replay answers `diverged` for nearly
-every candidate and the shrinker learns nothing. A lenient replay's own `trace` is
-the schedule that actually ran, which is how `eta_shrink` recovers a trace that
-replays strictly again.
+A strict replay is the default. A strict replay ends with an error when the
+trace does not apply:
+
+| `outcome` | Cause |
+|---|---|
+| `{error, {diverged, Id, Runnable}}` | The recorded step names process `Id`, which is not in the list of runnable processes. |
+| `{error, {clock_diverged, Ms, Now}}` | The clock advanced to `Now`, not to the recorded `Ms`. |
+| `{error, {clock_diverged, Ms, no_timer}}` | The trace records a clock advance and no timer is pending. |
+
+With `lenient => true`, a replay skips a recorded step of a process that is not
+runnable and a clock advance with no pending timer. A lenient replay accepts
+whatever clock value an advance reaches. The result counts the skipped entries
+in `skipped`.
+
+- Use a lenient replay for shrinking. The removal of an operation leaves the
+  steps of that operation without a runnable process. A strict replay would
+  report a divergence for almost every candidate, and the shrinker would learn
+  nothing.
+- Do not use a lenient replay to verify a trace.
+
+The `trace` of the result of a lenient replay is the schedule that ran.
+`eta_shrink` uses that trace to obtain a trace that replays strictly.
 """.
 -endif.
 -spec replay(module(), [entry()], map()) -> result().
@@ -339,21 +448,25 @@ replay(Mod, Trace, Opts) ->
 
 -if(?DOCATTRS).
 -doc """
-Spawns a process to carry out an operation. Call this from `execute/2` rather than
-`spawn/1`.
+Spawns a process that performs an operation. Call `spawn_op/1` from `execute/2`
+instead of `spawn/1`.
 
-**A plain `spawn` is a determinism hole**, and a quiet one. The driver is not
-traced, so a process it creates is not adopted by `eta_sched` until the driver
-registers it — and in that window the new process runs on the real scheduler. One
-op process racing alone is usually harmless; two of them, from operations injected
-close together, race each other to deliver their first message, and the order they
-arrive in is real-world timing rather than anything the seed controls. It shows up
-as a seed producing two different traces, which is the framework failing at the one
-thing it exists to do.
+A process from a plain `spawn/1` in `execute/2` is not deterministic:
 
-The process spawned here blocks before running `Fun`, so it cannot act before it is
-owned. `eta_run` releases it once registration is done, and from that point the
-scheduler decides when it runs, like every other process.
+1. The driver is not traced. `eta_sched` therefore does not adopt a process that
+   the driver creates until the driver registers it.
+2. Until registration, the new process runs on the real scheduler.
+3. Two such processes, from operations injected close together, both send their
+   first message during that time. Real time decides the order in which the
+   messages arrive. The seed does not.
+
+One such process alone is usually harmless. With two, one seed can produce two
+different traces.
+
+The process that `spawn_op/1` spawns blocks before it runs `Fun`. The process
+therefore cannot act before the scheduler owns it. `eta_run` releases the process
+after registration. From that point the scheduler decides when the process runs,
+as for every other process.
 """.
 -endif.
 -spec spawn_op(fun(() -> term())) -> pid().
@@ -366,26 +479,27 @@ spawn_op(Fun) ->
 
 -if(?DOCATTRS).
 -doc """
-Any trace-carrying result, with the trace replaced by its length. What you want
-when printing.
+Returns a result with the `trace` key replaced by `trace_length`, the length of
+the trace. Use `summary/1` to print a result.
 
-Inspecting one whole is the first thing anybody does after a first successful
-run, and it is useless: a 20-operation run produces a few hundred trace entries,
-so a shell renders the schedule and elides the fields you were looking for
-underneath it.
+A run with 20 operations produces a few hundred trace entries. A shell that
+prints the whole result prints the trace and truncates the other fields.
 
 ```erlang
 #{outcome := ok, steps := 97, trace_length := 213, modules_loaded := []} =
     eta_run:summary(eta_run:run(my_harness, #{seed => 1})).
 ```
 
-Takes a `t:eta_shrink:result/0` too, and there `trace_length` says something the
-other fields do not: which trace you were handed. It matches `shrunk` when
-`verified` is true and `original` when it is false, because an unverified shrink
-gives the original back.
+`summary/1` accepts any map with a `trace` key, including a
+`t:eta_shrink:result/0`. For a shrink result, `trace_length` shows which trace
+the result holds:
 
-The trace itself is for later, and even then it is not what you read. `eta_log`
-is.
+- `trace_length` equals `shrunk` when `verified` is `true`.
+- `trace_length` equals `original` when `verified` is `false`, because an
+  unverified shrink returns the original trace.
+
+To read what a run did, use `eta_log`. The trace is the input of `replay/3` and
+`eta_shrink`.
 """.
 -endif.
 -spec summary(map()) -> map().
@@ -394,40 +508,36 @@ summary(Result = #{trace := Trace}) ->
 
 -if(?DOCATTRS).
 -doc """
-Whether this run's seed means anything.
+Checks whether the seed of a run reproduces the run.
 
 ```erlang
 ok = eta_run:audit(eta_run:run(my_harness, Opts)).
 ```
 
-Several fields in a result say "part of this interleaving was decided by wall
-clock rather than by the schedule", and a run with any of them set is one whose
-seed will not reproduce. They are all silent — nothing fails, nothing is logged
-except the scheduler's own timeout warning, and the invariants stay green.
+Several fields of a result report that the wall clock, not the schedule, decided
+a part of the interleaving. A seed does not reproduce such a run. None of these
+conditions makes an invariant fail. The scheduler logs a warning for a step
+time-out and for cold code. `audit/1` checks every such field, so that a caller
+does not need to know the list of fields.
 
-Rather than asking every caller to know which fields those are, and to keep
-knowing as more are added, this checks them:
+`audit/1` returns `ok`, or `{suspect, Reasons}` with one `{Check, Found}` pair
+for each check that failed:
 
-- `modules_loaded` — code loaded mid-run, so a scheduled process made a
-  synchronous call into `code_server`. Fix with `preload`.
-- `sched.cold_code` — the other half of that: a process still *waiting* on the
-  code server when the run ended, so the run's quiescence was a lie and the load
-  finished too late to be in `modules_loaded` at all. Same fix, and each entry
-  names the line that reached the cold module.
-- `sched.adopted_late` — processes that ran before the scheduler owned them.
-  Fix by spawning through `eta_run:spawn_op/1` and `eta_sched:spawn/1`.
-- `sched.timeouts` — steps that ended without the process reaching a receive,
-  so it was suspended wherever it happened to be.
-- `net.unmanaged` and `rand.unmanaged` — a send, or a `rand` draw, by a process
-  other than the one being stepped, so when it happened was decided by wall
-  clock. See `eta_net` and `eta_rand`.
+| Check | Result field | Expected | Meaning | Fix |
+|---|---|---|---|---|
+| `modules_loaded` | `modules_loaded` | `[]` | Code was loaded during the run, so a scheduled process made a synchronous call to `code_server`. | The `preload` option. |
+| `cold_code` | `sched.cold_code` | `[]` | A process still waited on the code server when the run ended. The run was not quiescent, and the load finished too late to appear in `modules_loaded`. Each entry names the function that called the cold module. | The `preload` option. |
+| `adopted_late` | `sched.adopted_late` | 0 | Processes ran before the scheduler owned them. | Spawn through `eta_run:spawn_op/1` and `eta_sched:spawn/1`. |
+| `timeouts` | `sched.timeouts` | 0 | Steps ended before the process reached a `receive`. The scheduler suspended the process at an arbitrary point. | See `eta_sched`. |
+| `stray_timers` | `stray_timers` | 0 | A process that the scheduler does not own, or a dead process, held a timer. | See `run/2`. |
+| `net_unmanaged` | `net.unmanaged` | 0 | A process other than the stepped process sent a message, so the wall clock decided the time of the send. | See `eta_net`. |
+| `rand_unmanaged` | `rand.unmanaged` | 0 | A process other than the stepped process drew from `rand`, so the wall clock decided the time of the draw. | See `eta_rand`. |
 
-`{suspect, Reasons}` rather than `{error, _}` deliberately: the run happened and
-its violation, if any, is real. What you cannot do is trust the seed to give it
-back.
+The return value is `{suspect, Reasons}` and not `{error, _}`, because the run
+took place and a violation that it found is real. The seed is not certain to
+reproduce that violation.
 
-Assert on this next to your invariants. It is the single most valuable line in a
-simulation suite after the determinism gate itself.
+Assert on `audit/1` next to the invariants in every test.
 """.
 -endif.
 -spec audit(result()) -> ok | {suspect, [{atom(), term()}]}.
@@ -467,47 +577,59 @@ audit(Result = #{modules_loaded := Modules, sched := Sched}) ->
 
 -if(?DOCATTRS).
 -doc """
-Writes a trace to disk as a self-contained reproduction, after checking that it
-still reproduces.
+Writes a trace to a file as a self-contained reproduction, after checking that
+the trace still reproduces.
 
-## Why not just pin the seed
+`save_fixture/4` returns:
 
-Because a seed names a schedule **only in the context of a particular
-`generate/2`**. Change the operation mix and every seed you pinned quietly
-starts testing something else. If the test asserts on a violation it fails and
-you find out; if it asserts `ok` it goes vacuous without a word, which is the
-same silent failure as a quiescence-gated invariant that never evaluates.
+- `{ok, Outcome}` when the fixture was written. `Outcome` is the outcome of the
+  replay.
+- `{error, {did_not_replay, Reason}}` when the strict replay ended with
+  `{error, Reason}`. No file is written.
+- `{error, Reason}` when the file could not be written.
 
-A trace has no such coupling. `replay/3` never calls `generate/2` — it walks the
-entries it is given — so a saved trace survives a rewritten workload entirely.
-It also survives a different seed, since nothing is drawn from one.
+## Comparison with a pinned seed
 
-Pin a seed to test that seeds reproduce. Pin a trace to regress a bug.
+A seed identifies a schedule only for one particular `generate/2`. A change to
+the mix of operations changes what every pinned seed tests:
 
-## What is saved
+- A test that asserts a violation fails, so the change is visible.
+- A test that asserts `ok` still passes and no longer tests the original
+  schedule. Nothing reports the change.
 
-The trace, the harness module, and the options. The options matter as much as
-the trace: a reproduction that needs `config => #{mode => broken}` and is
-replayed without it does not reproduce, and `eta_shrink` reports "nothing to
-shrink" for a failure that just happened. Carrying them means a test cannot get
-that wrong.
+A trace does not depend on `generate/2`. `replay/3` never calls `generate/2` and
+draws nothing from the seed. A saved trace therefore stays valid when the
+workload is rewritten or the seed changes.
 
-## What is checked
+- Pin a seed to test that seeds reproduce.
+- Pin a trace as a regression test for a defect.
 
-The trace is replayed **strictly** before anything is written, and the outcome
-it produced is stored with it. So a fixture on disk is one that has been
-demonstrated to reproduce, rather than one that was believed to.
+## Contents
 
-Take the trace from a `eta_shrink:shrink/3` result whose `verified` is `true`,
-which is `eta_shrink`'s own version of this check.
+A fixture holds the trace, the harness module, the options, the outcome and the
+time of saving. The `lenient` option is not stored.
 
-## What you cannot do with it
+The options are stored because a reproduction depends on them. A trace that
+needs `config => #{mode => broken}` does not reproduce without that option, and
+`eta_shrink` then reports that there is nothing to shrink. A test that replays a
+fixture cannot omit the options.
 
-Write the mirror test. Replaying a *failing* trace against a *fixed*
-implementation does not report `ok` — the fix changes which messages exist, so
-recorded step ids stop being runnable and you get `{error, {diverged, _, _}}`.
-"The fix works" is a claim about the whole system, and a seed sweep is the right
-shape for it.
+## Verification
+
+`save_fixture/4` replays the trace strictly before it writes the file, and
+stores the outcome of that replay in the fixture. Every fixture on disk
+therefore reproduced at the time of saving.
+
+Take the trace from a result of `eta_shrink:shrink/3` whose `verified` is
+`true`. `eta_shrink` performs the same check for that trace.
+
+## Limitations
+
+- A fixture cannot show that a fix works. The replay of a failing trace against
+  a fixed implementation does not return `ok`. The fix changes which messages
+  exist, so the recorded step ids are no longer runnable, and the replay returns
+  `{error, {diverged, _, _}}`. That a fix works is a property of the whole
+  system. Test it with a sweep of seeds.
 """.
 -endif.
 -spec save_fixture(file:name_all(), module(), [entry()], map()) ->
@@ -534,7 +656,7 @@ save_fixture(Path, Mod, Trace, Opts) ->
     end.
 
 -if(?DOCATTRS).
--doc "Reads a fixture without running it. Raises on an unreadable or stale file.".
+-doc "Reads a fixture and does not run it. Raises an error for a file that is not a readable fixture of the supported version.".
 -endif.
 -spec load_fixture(file:name_all()) -> fixture().
 load_fixture(Path) ->
@@ -547,10 +669,10 @@ load_fixture(Path) ->
 
 -if(?DOCATTRS).
 -doc """
-Replays a fixture and returns the full result, using the harness and options it
-was saved with.
+Replays a fixture strictly and returns the full result. The replay uses the
+harness and the options that were saved with the fixture.
 
-The whole point is that a test names a file and nothing else:
+A test therefore needs only the name of the file:
 
 ```erlang
 #{outcome := {violation, #{property := atomicity}}} =
@@ -565,13 +687,15 @@ replay_fixture(Path) ->
 
 -if(?DOCATTRS).
 -doc """
-Replays a fixture and compares the outcome with the one recorded when it was
-saved.
+Replays a fixture and compares the outcome with the outcome that was recorded
+when the fixture was saved.
 
-`ok` means the reproduction still holds. `{changed, _}` means the system no
-longer does what it did, which is what you want to see when a fix lands — though
-note that a genuine fix usually shows up as a *divergence* rather than a clean
-run, for the reason given in `save_fixture/4`.
+- `ok` means that the fixture still reproduces.
+- `{changed, #{expected := Expected, actual := Actual}}` means that the system
+  no longer produces the recorded outcome.
+
+After a fix, the expected result is `{changed, _}`. The actual outcome is then
+usually a divergence error and not `ok`. `save_fixture/4` gives the reason.
 """.
 -endif.
 -spec check_fixture(file:name_all()) ->
@@ -718,15 +842,20 @@ start_disk(Opts, Seed) when is_map(Opts) ->
 %% firing any `-on_load` functions they carry.
 -if(?DOCATTRS).
 -doc """
-Load every module of the named applications, plus `kernel`, `stdlib` and `eta`.
+Loads every module of the named applications and of `kernel`, `stdlib` and
+`eta`.
 
-`run/2` does this for you from its `preload` option; it is exported for code that
-drives `eta_sched` directly, which is otherwise in exactly the position a run with
-`preload => false` is in — and which has no `modules_loaded` to report the damage
-afterwards.
+`run/2` calls `preload/1` with the value of its `preload` option. `preload/1` is
+exported for code that uses `eta_sched` directly. Such code has the cold code
+problem of a run with `preload => false`, and has no `modules_loaded` field that
+reports the problem.
 
-Call it once, before there is a scheduler to be outside of. `false` is accepted
-and does nothing, so the option value can be passed straight through.
+- Call `preload/1` once, before the scheduler is created.
+- `preload(false)` does nothing, so a caller can pass an option value unchanged.
+- `preload/1` raises `{eta_run, {preload_failed, App, Reason}}` when an
+  application cannot be loaded or has no module list.
+
+An example in Elixir:
 
     setup_all do
       :ok = :eta_run.preload([:my_app])
@@ -1068,11 +1197,11 @@ entry(Tag, Payload, Created) -> {Tag, Payload, Created}.
 
 -if(?DOCATTRS).
 -doc """
-What an entry did, without who it created: `{op, Op}`, `{step, Id}`,
-`{clock, Ms}` or `{final, Settled}`.
+Returns the action of an entry without the ids of the processes that the entry
+created: `{op, Op}`, `{step, Id}`, `{clock, Ms}` or `{final, Settled}`.
 
-Match on this rather than on the entry, because an entry that created processes
-carries a third element and one that did not does not:
+Match on the result of `action/1` and not on the entry. An entry that created
+processes has a third element, and an entry that created none has two elements:
 
 ```erlang
 Ops = [Op || E <- Trace, {op, Op} <- [eta_run:action(E)]].
@@ -1085,11 +1214,13 @@ action(Entry) -> Entry.
 
 -if(?DOCATTRS).
 -doc """
-The processes an entry created, oldest first, and `[]` for the entries that
-created none.
+Returns the ids of the processes that an entry created, oldest first. Returns
+`[]` for an entry that created none.
 
-This is what makes a shrunk trace mean the same thing as the trace it came from —
-see `eta_sched:pin/2`. Reading it is for diagnosis; nothing needs to write it.
+A replay uses these ids to give each created process the id that it had in the
+recorded run. A shrunk trace therefore names the same processes as the original
+trace. See `eta_sched:pin/2`. The function is for diagnosis. No caller needs to
+write the ids.
 """.
 -endif.
 -spec created(entry()) -> created().

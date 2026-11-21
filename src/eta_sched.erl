@@ -9,132 +9,221 @@
 
 -if(?DOCATTRS).
 -moduledoc """
-A serializing scheduler for BEAM processes — Phase 0 of the DST framework
-(design: `docs/design.md`).
+A scheduler that runs one BEAM process at a time.
 
-Runs exactly one process at a time, to quiescence, so the interleaving of a
-concurrent system is determined entirely by this scheduler's sequence of choices.
-A seeded choice sequence therefore replays bit-for-bit.
+The scheduler owns a set of scheduled processes and keeps each of them
+suspended. A step resumes one scheduled process, waits until the process blocks
+in a `receive`, and suspends the process again. The sequence of stepped
+processes is the choice sequence. `run/2` draws the choice sequence from a
+seeded random number generator. `replay/2` repeats a recorded choice sequence.
+The design is described in `docs/design.md`.
 
-This module is system-agnostic: it knows about pids, mailboxes, and scheduling,
-and nothing about what the processes do. A replicated process registry was its
-first consumer, not its subject.
+The scheduler uses only pids, message queues and trace events. It does not
+depend on what the scheduled processes do.
 
-## Why controlling *who runs* is enough
+## Example
 
-It is tempting to think a deterministic scheduler must intercept every message to
-control delivery order. It does not. Erlang already guarantees FIFO between an
-ordered pair of processes, so once only one process runs at a time, the global
-order of message *delivery* follows from the order in which senders were stepped.
-Controlling scheduling alone determinises the whole system, which is what makes
-this approach tractable without rewriting the code under test.
+```erlang
+Sched = eta_sched:new(#{seed => 42}),
+eta_sched:register(Sched, [Ping, Pong]),
+gen_server:cast(Ping, {ping, 3}),
+eta_sched:run(Sched, 1000),
+Choices = eta_sched:choices(Sched),
+#{adopted_late := 0, timeouts := 0, cold_code := []} = eta_sched:stats(Sched),
+ok = eta_sched:release(Sched).
+```
 
-## Quiescence, and why the naive check is wrong
+To repeat the run, start the same system again, register the same processes in
+the same order, and call `eta_sched:replay(Sched, Choices)` in place of `run/2`.
 
-A process has finished its step when it is blocked on a receive it cannot
-satisfy. The obvious test — status `waiting` and an empty mailbox — is wrong, and
-wrong in a way that matters: a process blocked in
+## Model
+
+The scheduler does not intercept messages. Erlang delivers the messages between
+one ordered pair of processes in send order. When only one process runs at a
+time, the order in which messages are delivered follows from the order of the
+steps. The choice sequence therefore determines the interleaving of the system.
+
+The scheduler is a `gen_server` process:
+
+- The scheduler is the tracer of every scheduled process. Trace events arrive
+  in the mailbox of the scheduler. The messages that the system under test sends
+  to the driver arrive in the mailbox of the driver.
+- A `receive` for trace events in the process of the driver could consume a
+  `gen_server` reply that is addressed to the driver. A separate scheduler
+  process removes that defect. Every `receive` that waits for a trace event
+  also matches only trace messages.
+- A driver that waits on a predicate, such as `eta_run`, alternates steps with
+  checks of the system under test. The driver needs a mailbox that the scheduler
+  does not read.
+- The scheduler is not a scheduled process. The system under test does not call
+  the scheduler process, so the scheduler does not need to be scheduled.
+- One VM runs one scheduler at a time.
+
+`sched()` is a handle to the scheduler process:
+
+- A function that takes a `sched()` and returns a `sched()` returns the same
+  handle.
+- A handle does not hold a state of the run. Stepping an earlier handle again
+  does not repeat a run, because the scheduled processes have already run.
+- `release/1` stops the scheduler. Call `choices/1` and `stats/1` before
+  `release/1`.
+
+## Steps
+
+A step does the following, in this order:
+
+1. It reads the queue length of the process.
+2. It resumes the process.
+3. It waits for the `in` trace event of the process. A process that is blocked
+   in a `receive` has the status `waiting` before the process has run. The
+   status is therefore valid only after the `in` event.
+4. It waits for an `out` trace event after which the status is `waiting` or the
+   process is dead. An `out` event with any other status is a preemption.
+5. It suspends the process and collects the pending trace events with
+   `erlang:trace_delivered/1`.
+6. It records `blocked_at`, the queue length at which the process blocked. See
+   "Runnability".
+
+A step has one of three outcomes:
+
+| Outcome | Meaning |
+|---|---|
+| `progress` | The process consumed at least 1 message. |
+| `no_progress` | The process blocked and consumed no message. |
+| `exited` | The process exited. |
+
+The number of consumed messages is the sum of two numbers, minus the queue
+length at the block:
+
+- The queue length before the step.
+- The number of messages that the process sent to itself during the step.
+
+The `'receive'` trace event does not measure consumption. The VM produces the
+event when a message enters the queue, whether or not a `receive` later matches
+the message.
+
+A step that does not reach a `receive` ends in a time-out. See "Limitations".
+
+## Runnability
+
+A scheduled process is runnable when the process has not exited and its queue
+is longer than `blocked_at`. `blocked_at` is the queue length at the moment the
+process last blocked. A process with no recorded block has a `blocked_at` of 0,
+so a process with an empty queue is not runnable.
+
+A `receive` blocks only after it has failed to match every queued message. The
+messages that remain after a step are therefore known not to match. The
+consequences are:
+
+- `blocked_at` is recorded after every step that ends in a block.
+- A process that consumed 1 message and blocked on the rest is not runnable
+  until a new message arrives.
+- A new message that does not match makes the process runnable for 1 step. That
+  step has the outcome `no_progress` and records the new `blocked_at`.
+
+The status `waiting` with an empty queue is not a correct test for the end of a
+step. A process that is blocked in
 
 ```erlang
 receive {reply, Ref, V} -> V end
 ```
 
-with a non-matching message queued is `waiting` with a *non-empty* mailbox. That
-is not an edge case; it is what every `gen_server:call/3` does. Treating it as
-runnable makes the scheduler spin on a process that can never progress, and makes
-"no runnable process" — the termination condition — unreachable.
+with a queued message that does not match has the status `waiting` and a queue
+that is not empty. Every `gen_server:call/3` produces this state. A scheduler
+that treats such a process as runnable steps it without end, and the run never
+reaches the state in which no process is runnable.
 
-The two questions are separated properly:
+A message can arrive after the block and before the scheduler reads the queue.
+An example is a process that kills another scheduled process and waits for the
+`DOWN` message. The killed process dies at once although it is suspended, and
+its `EXIT` and `DOWN` messages arrive in real time. `queue_at_block/3` subtracts
+the messages that arrived after the block. It uses the `'receive'` trace events
+that follow the blocking `out` event. When the queue is empty, the result is 0
+and no further check is made.
 
-- **Quiescent?** `waiting` is definitive: the process is blocked in a receive.
-  Detected from `running` trace events, not by polling. Checking status straight
-  after `erlang:resume_process/1` is a trap — a blocked process still reads
-  `waiting` *before it has been scheduled in*, so the step would conclude without
-  the process ever running. `in` is awaited first, as proof it got the CPU.
-- **Runnable?** Has messages, and is not known to be blocked at this exact mailbox
-  state. A `receive` blocks only after failing to match *every* queued message, so
-  after any step the remaining mailbox is known not to match; the process is
-  recorded as blocked at that queue length and skipped until the queue grows.
-  Selective receive is then handled by construction, and the skip is
-  self-correcting: a new non-matching message costs one wasted step and re-arms
-  the block.
+`runnable_ids/1` runs at every choice. It scans only the processes that have
+not exited, and it reads each queue length once, with
+`process_info(Pid, message_queue_len)`. A dead process has a queue length of 0,
+so no separate read of the status is needed.
 
-## Measuring progress
+## Adoption
 
-Consumption is computed from the queue-length delta, corrected for messages the
-process sent to itself (nothing else runs, so those are the only arrivals).
+The scheduler adopts a process when it starts to own the process. An adopted
+process is traced, is suspended and has an id. A process is adopted in one of
+three ways:
 
-The `'receive'` trace flag cannot be used for this, which is worth stating because
-the opposite is the natural assumption: it fires when a receive *scans* a message,
-matching or not, so a non-matching message produces a `'receive'` event and stays
-in the queue.
+| Way | Time of adoption | Counted in `adopted_late` |
+|---|---|---|
+| `register/2` | At the call. | No |
+| A gated spawn or start, such as `spawn/1` or `start_link/3` | Before the child runs. The child starts blocked on a token, and the scheduler sends the token after it has adopted the child. | No |
+| A spawn by code that `eta_transform` did not rewrite | After the child has started, through `set_on_spawn` tracing. | Yes |
 
-## The scheduler owns its own process and mailbox
+A child that is adopted late runs on the BEAM scheduler until the scheduler
+suspends it. A child that exits before it is suspended is adopted as exited, so
+the assignment of ids does not depend on that race.
 
-It runs as a `gen_server` and is the tracer for every process it owns, so trace
-events land in *its* mailbox rather than the driver's.
+`eta_transform` points the spawn and start calls of a transformed module at the
+gated functions of this module. With no scheduler running, each gated function
+delegates to the function that it replaces. A transformed module therefore
+behaves normally outside a simulation.
 
-That was not always so, and the reason it changed is worth keeping. Phase 0 ran
-the scheduler in the calling process, on the argument that a scheduler process
-would itself need scheduling — which is false: nothing under test ever calls the
-scheduler, so it is never part of the system being serialized. The cost of the
-original arrangement was a whole class of bug that only discipline prevented. An
-early version used a catch-all `receive` while awaiting trace events, which
-consumed and discarded whatever the system under test had sent the driver — a
-`gen_server` reply, vanishing, with its caller exiting `:normal`. Every receive
-here still matches trace-shaped messages only, but that is now a tidiness
-property rather than the only thing standing between the framework and a
-mystifying failure.
+## Process ids
 
-It also matters for the driver. A `eta_run`-style helper that waits on a
-predicate has to interleave stepping with checks on the system under test, so it
-needs a mailbox the scheduler is not also reading.
+The scheduler gives every adopted process an id. The choice sequence records
+ids and not pids, because the pids of two runs differ.
 
-## `sched()` is a handle, not a value
+| Id | Assigned to |
+|---|---|
+| A non-negative integer, counted in adoption order | A process of a run without pinning. |
+| An id from the trace | A process of a pinned replay. See `pin/2`. |
+| `{fresh, N}` | A process that a pinned replay adopts when no pinned id remains. See `pin_mode/2`. |
 
-The API threads a `sched()` through, and every function that took one still
-returns one, so call sites read as they always did. It now names a process rather
-than carrying state, and the value returned is the same handle rather than an
-updated copy.
+## Statistics
 
-This removes a false affordance rather than adding one. The old record was never
-usable as a value: the scheduler's real state is the suspend/resume status of live
-OS processes, so holding on to an earlier `sched()` and stepping it again was
-never going to replay anything — the processes had already moved.
+`stats/1` returns the statistics of a run. Three fields report a loss of
+determinism: `adopted_late`, `timeouts` and `cold_code`.
 
-`release/1` ends the scheduler's life, so inspect (`choices/1`, `stats/1`) before
-releasing, not after.
+## Determinism
 
-## Determinism boundary
+A seed reproduces a run only when `stats/1` reports all of the following:
 
-- **Timers.** A process blocked in `receive ... after N` wakes on the real clock
-  unless its module declares `-eta_after(true)` alongside `eta_transform`, which
-  puts the timeout on the virtual clock. Without it, a system under test must
-  avoid real-time-dependent receives (use `infinity` in simulation).
-- **Spawn races.** A child spawned with a plain `erlang:spawn` is adopted via
-  `set_on_spawn` tracing, which reports the spawn *after* the child exists — so it
-  runs briefly, on the real scheduler, before it is suspended. `stats/1`'s
-  `adopted_late` counts these. `spawn/1` and friends close the window by starting
-  the child blocked; `eta_transform` points a transformed module's spawns there, so
-  a system under simulation should show `adopted_late` at or near zero. A run with
-  a high count is a run whose interleaving is partly wall-clock.
-- **Steps that never finished.** A step ends when the process blocks in a receive.
-  If no scheduling event arrives for it at all, the scheduler eventually suspends
-  it wherever it happens to be, and that suspension point was chosen by wall clock
-  rather than by the schedule. `stats/1`'s `timeouts` counts these and a warning is
-  logged for each. It should be 0; anything else means the run is not replayable.
+| Field | Required value | Meaning of any other value | Correction |
+|---|---|---|---|
+| `adopted_late` | 0 | A child ran before the scheduler suspended it. | Build the spawning module with `eta_transform`, or instrument it. |
+| `timeouts` | 0 | A step was suspended at a point that the real clock chose. | None. The run is not replayable. |
+| `cold_code` | `[]` | A process waited on `code_server` when a run ended. | Call `eta_run:preload/1`. |
 
-  The wait is deliberately generous and condition-based rather than a deadline —
-  the scheduler keeps waiting while the process is alive and not suspended, since
-  the event is then in flight. Only a process that is dead, or that did not resume
-  at all, ends a step this way in practice.
-- **Cold code.** A process that reaches a module it has not loaded yet makes a
-  synchronous call into `code_server`, which this scheduler does not own. From
-  here that is indistinguishable from a process blocked in a receive, so if it is
-  the last thing standing the run ends at what looks exactly like quiescence,
-  having done a fraction of the work, and reports success. `stats/1`'s
-  `cold_code` names the processes caught doing it and the line each was on; it
-  should be `[]`, and the fix is `eta_run:preload/1`.
+## Limitations
+
+- **Real-clock timers.** `eta_transform` puts `receive ... after N` on the
+  virtual clock by default. Two kinds of module wake from `receive ... after N`
+  on the real clock: a module that declares `-eta_after(false)`, and a module
+  that is not built with `eta_transform`. A system with such a module must use
+  `infinity` in a simulation.
+- **Late adoption.** `set_on_spawn` tracing reports a spawn after the child
+  exists. A child that is spawned with `erlang:spawn/1` therefore runs on the
+  BEAM scheduler before the scheduler suspends it. A run with a high
+  `adopted_late` has an interleaving that partly depends on the real clock.
+- **Step time-outs.** A step ends in a time-out when the process does not reach
+  a `receive`. The conditions are listed below. The scheduler then suspends the
+  process where it is, logs a warning and adds 1 to `timeouts`. The scheduler
+  does not record `blocked_at` for that step, so the process stays runnable.
+- **Cold code.** A process that calls a module that is not loaded makes a
+  synchronous call to `code_server`, which the scheduler does not own. The
+  scheduler cannot distinguish that process from a process that is blocked in a
+  `receive`. If no other process is runnable, the run ends early and reports no
+  failure. `run/3` records such processes in `cold_code` when it ends.
+- **One scheduler per VM.** A second scheduler fails to start while the first
+  one runs. Runs must be serial.
+
+A step ends in a time-out under one of these conditions:
+
+- The process is still suspended when a wait of 5 ms for a trace event ends.
+  The resume had no effect.
+- The awaited trace event does not arrive during 200 waits of 5 ms each, while
+  the process is alive and not suspended.
+- The scheduler handles 100000 trace events without the awaited event, or the
+  process is scheduled out 100000 times without blocking.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -365,7 +454,7 @@ releasing, not after.
 %% ---------------------------------------------------------------------------
 
 -if(?DOCATTRS).
--doc "A fresh scheduler with the default seed. See `new/1`.".
+-doc "Starts a scheduler with the default seed, which is 0. See `new/1`.".
 -endif.
 -spec new() -> sched().
 new() ->
@@ -373,11 +462,18 @@ new() ->
 
 -if(?DOCATTRS).
 -doc """
-Starts a scheduler and returns a handle to it. `seed` fixes the choice sequence.
+Starts a scheduler process and returns a handle to it.
 
-Linked to the caller, so a driver that dies takes the scheduler with it — and with
-it every suspend it holds, which lets the system under test run free rather than
-leaving it frozen for the rest of the VM's life.
+`Opts` has one key:
+
+- `seed`: an integer that determines the choices of `run/2`. The default is 0.
+
+The scheduler is linked to the caller. When the driver exits, the scheduler
+exits and the suspensions that the scheduler holds end. The system under test
+then runs without a scheduler and does not stay suspended.
+
+One VM runs one scheduler at a time. A second scheduler fails to start with the
+reason `{eta_sched, {scheduler_in_use, Owner, Hint}}`.
 """.
 -endif.
 -spec new(#{seed => integer()}) -> sched().
@@ -386,7 +482,7 @@ new(Opts) ->
     {eta_sched, Pid}.
 
 -if(?DOCATTRS).
--doc "The scheduler's pid. For tests that need to assert on the process itself.".
+-doc "Returns the pid of the scheduler process, for a test that asserts on that process.".
 -endif.
 -spec pid(sched()) -> pid().
 pid({eta_sched, Pid}) ->
@@ -394,10 +490,17 @@ pid({eta_sched, Pid}) ->
 
 -if(?DOCATTRS).
 -doc """
-Takes ownership of a pid (or a list of them): suspends it and begins tracing it.
+Adopts a process or a list of processes. The scheduler traces each process,
+suspends it and gives it an id.
 
-Register every process before any of them is allowed to run, or the run starts
-from a state this scheduler did not choose.
+Register every process of the system before any of them runs. Otherwise the run
+starts from a state that the scheduler did not choose.
+
+- A process that is already adopted is skipped.
+- A process that has exited is skipped.
+- A gated process that has not been sent its token is sent the token.
+
+Returns the same handle.
 """.
 -endif.
 -spec register(sched(), pid() | [pid()]) -> sched().
@@ -407,14 +510,19 @@ register(S, Pids) ->
 
 -if(?DOCATTRS).
 -doc """
-Resumes every process, stops tracing, and shuts the scheduler down.
+Resumes every scheduled process, stops tracing and stops the scheduler.
 
-The system runs freely again. Inspect (`choices/1`, `stats/1`) *before* calling
-this — the handle is dead afterwards.
+The system then runs without a scheduler. The handle is invalid after the call.
+Call `choices/1` and `stats/1` before `release/1`.
 
-`active/0` is false from the moment before the first process resumes, so a
-start a resumed process makes on its way out is a plain one rather than a gated
-start nothing will release.
+`release/1` does the following, in this order:
+
+1. It makes `active/0` return `false`. A start that a resumed process makes
+   afterwards therefore delegates to OTP. A gated start at that point would wait
+   for a token that is never sent.
+2. It sends the token to every gated child that still waits for it.
+3. It stops tracing and resumes every scheduled process that is alive.
+4. It stops the scheduler process.
 """.
 -endif.
 -spec release(sched()) -> ok.
@@ -429,8 +537,9 @@ release(S = {eta_sched, Pid}) ->
 
 -if(?DOCATTRS).
 -doc """
-Whether a scheduler is running in this VM. When false, `spawn/1` and friends are
-plain `erlang` spawns.
+Returns whether a scheduler is running in this VM. When no scheduler is running,
+`spawn/1` and the other gated functions delegate to the functions that they
+replace.
 """.
 -endif.
 -spec active() -> boolean().
@@ -439,20 +548,20 @@ active() ->
 
 -if(?DOCATTRS).
 -doc """
-The process the scheduler is stepping right now, or `undefined` between steps.
+Returns the pid of the process that the scheduler is stepping, or `undefined`
+when no step is in progress.
 
-Exactly one process runs during a step — every other one the scheduler owns is
-suspended — so this is the sharpest available statement of "on the schedule". A
-side effect caused by any other process while this is set happened at a moment
-wall-clock timing chose, not one the seed did.
+During a step, the returned process is the only scheduled process that runs.
+Every other scheduled process is suspended. A side effect that another process
+causes during a step is ordered by the real clock and not by the seed.
 
-`undefined` is not the opposite of that. Between steps the driver itself is
-running, and a harness injecting an operation there is doing something the trace
-records; nothing is off-schedule merely because no step is in progress.
+`undefined` does not mean that an action is outside the schedule. Between steps
+the driver runs. An operation that a harness injects between steps is recorded
+in the trace.
 
-Read out of band, from ETS, because the answer is wanted by processes that could
-not ask for it: the scheduler is a `gen_server` and a call into it from inside a
-step would deadlock against the step.
+The value is read from an ETS table and not from the scheduler process. The
+scheduler is a `gen_server` that is busy during a step, so a call to the
+scheduler from the stepped process would deadlock.
 """.
 -endif.
 -spec stepping() -> pid() | undefined.
@@ -466,17 +575,16 @@ stepping() ->
 
 -if(?DOCATTRS).
 -doc """
-The scheduler running in this VM, or `undefined`.
+Returns the handle of the scheduler that is running in this VM, or `undefined`.
 
-For code that is handed no `sched()` and still has to ask the scheduler something —
-in practice, an invariant asking whether the system is **quiescent**. A property
-that only holds once the system has stopped moving (a registry's replicas agree
-only after speculation settles) is otherwise unstateable: `check/1` receives
-the system under test, not the schedule, so it cannot tell "diverged" from "still
-in flight" on its own.
+Use this function in code that is given no `sched()`. An example is an invariant
+that holds only when the system is quiescent. The replicas of a registry agree
+only after speculation settles. `check/1` is given the system under test and not
+the schedule. The invariant calls `runnable/1` on the returned handle to
+distinguish a system that has diverged from a system that is still working.
 
-Safe to call from an invariant. The scheduler is never part of the system it
-serializes, so it is not suspended, and `runnable/1` is a read.
+An invariant can call this function safely. The scheduler is not a scheduled
+process, so it is never suspended. `runnable/1` only reads state.
 """.
 -endif.
 -spec current() -> sched() | undefined.
@@ -490,30 +598,38 @@ current() ->
 
 -if(?DOCATTRS).
 -doc """
-`erlang:spawn/1` for a system under simulation: the child starts **blocked** and
-runs only once the scheduler owns it.
+Replaces `erlang:spawn/1` for a system under simulation. The child starts gated:
+it blocks on a token and runs only after the scheduler has adopted it.
 
-`set_on_spawn` tracing adopts a child after the fact, which is not the same thing
-and is not enough. Between the spawn and the scheduler handling the trace event the
-child runs on the *real* scheduler, so anything it does in that window is ordered by
-wall clock rather than by the schedule. Porting a distributed registry measured the
-cost: 1212 of a run's 1233 processes were adopted late, because that system spawns a
-short-lived helper for almost every operation — and a seed consequently did not
-reproduce its own schedule.
+`spawn/3`, `spawn_link/1,3`, `spawn_monitor/1,3` and `spawn_opt/2,4` gate their
+children in the same way. `eta_transform` points the spawn calls of a
+transformed module at these functions.
 
-Gating closes it. The child blocks on a token before running anything, so there is
-no window; the scheduler suspends it, adopts it, and sends the token, after which it
-is runnable and stepped like anything else. `stats/1`'s `adopted_late` then counts
-only genuinely ungated children.
+A gated spawn proceeds as follows:
 
-The child is spawned by MFA rather than as a fun so that the spawn trace event
-carries `{eta_sched, gated, _}` — that is how the scheduler tells a gated child from
-one it must chase. `gated_plib`, `statem_gated` and `fsm_gated` are recognised the same way;
-adding a gated entry point means adding it to `is_gated/1` and to `handle_trace/2`
-as well, or its children wait on a token nobody sends.
+1. The child blocks in a `receive` for the token before it runs any other code.
+2. The scheduler reads the spawn trace event and suspends the child.
+3. The scheduler adopts the child and sends the token.
+4. The child is runnable and is stepped like any other scheduled process.
 
-Inert with no scheduler running, exactly as `eta_time` is with no clock, so a
-transformed module behaves normally outside a simulation.
+A gated child is not counted in the `adopted_late` field of `stats/1`.
+
+Adoption through `set_on_spawn` tracing alone is not sufficient. The trace event
+arrives after the child exists. Until the scheduler handles the event, the child
+runs on the BEAM scheduler, and the real clock orders what the child does. In a
+port of a distributed registry, 1212 of the 1233 processes of a run were adopted
+late, because that system spawns a short-lived helper for almost every
+operation. A seed did not reproduce its schedule.
+
+The child is spawned by module, function and arguments, not as a fun. The spawn
+trace event then carries `{eta_sched, gated, _}`, and the scheduler identifies a
+gated child by that value. `gated_plib`, `statem_gated` and `fsm_gated` are
+identified in the same way. A new gated entry point must be added to
+`is_gated/1` and to `handle_trace/2`. Otherwise its children wait for a token
+that is never sent.
+
+With no scheduler running, the function delegates to `erlang:spawn/1`. A
+transformed module therefore behaves normally outside a simulation.
 """.
 -endif.
 -spec spawn(fun(() -> term())) -> pid().
@@ -1048,49 +1164,94 @@ wait_for_token() ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_server:start_monitor/3` for a system under simulation: the child is gated, so
-the scheduler owns it before it runs a line of `init/1`.
+Replaces `gen_server:start_monitor/3` for a system under simulation. The child
+is gated, so the scheduler adopts it before it runs `init/1`.
 
-## Why this exists rather than a shadowed `proc_lib`
+`start_monitor/4`, `start_link/3,4` and `start/3,4` follow the same rules. The
+4-arity functions take the server name as the first argument.
 
-The child of a `gen_server:start_*` is spawned inside OTP —
-`gen:do_spawn/5` calls `proc_lib:start_monitor/5`, which calls
-`erlang:spawn_opt(proc_lib, init_p, …)`. No transform of the system under test
-reaches that, so its children are adopted late and the run stops being replayable.
-On that registry it was one child per group commit, and that alone was enough to
-make a seed produce a different schedule each time.
+## Start sequence
 
-The obvious fix is to shadow `proc_lib` with a transformed copy. It is worse than
-it sounds:
+The gated child does the following, in this order:
 
-- **stdlib is sticky.** Loading a replacement fails with `sticky_directory`; it
-  takes a deliberate `code:unstick_dir/1` on stdlib's ebin first.
-- **The blast radius is the VM.** Every OTP process start goes through `proc_lib`,
-  including ExUnit's and Logger's. With a deliberately broken copy loaded,
-  `Agent.start_link/1` fails immediately with `undef`.
-- **It is 1600 lines of copied OTP** that must track releases, and a mismatch is a
-  subtle breakage rather than a loud one.
+1. It waits for the token of the scheduler.
+2. It sets the `$ancestors` and `$initial_call` process dictionary entries that
+   `proc_lib` sets for a process it starts.
+3. It registers the server name, if a name is given.
+4. It runs `init/1`.
+5. It sends the result of the start to the parent.
+6. It enters the loop through `gen_server:enter_loop/3`, or through
+   `gen_server:enter_loop/4` for a named server.
 
-So the child is built rather than intercepted. A gated process sets up the two
-process-dictionary entries `init_p/3` in `proc_lib` would have set, runs `init/1`
-itself, acknowledges, and then *becomes* the `gen_server` through
-`gen_server:enter_loop/3`. Verified to produce a genuine OTP process: `sys:get_state/1`,
-`sys:get_status/1` and `sys:suspend/1` all work on it, and `$initial_call` reads
-as it should.
+The result is an OTP process. `sys:get_state/1`, `sys:get_status/1` and
+`sys:suspend/1` work on it, and `$initial_call` is `{Mod, init, 1}`.
 
-## What it covers, and what it refuses
+## Supported returns of `init/1`
 
-`init/1` returning `{ok, State}`, `{ok, State, {continue, C}}` — including a
-continue chaining into another, which `enter_loop/3` does not do for you —
-`{stop, Reason}` and `ignore`. Anything else raises rather than guessing: this is
-a stand-in for a start path, and a stand-in that silently mishandles a shape is
-worse than one that stops.
+| Return of `init/1` | Result |
+|---|---|
+| `{ok, State}` | The server starts. |
+| `{ok, State, {continue, C}}` | The server starts and runs `handle_continue/2`. A continue that returns another continue is followed, which `gen_server:enter_loop/3` does not do. |
+| `{ok, State, hibernate}` | The server starts. The hibernation request is dropped. |
+| `{ok, State, infinity}` | The server starts. |
+| `{ok, State, {timeout, Time, {hibernate, Tag}}}` from `supervisor` | The server starts. The hibernation request of the OTP 28 `supervisor` is dropped. |
+| `{stop, Reason}` | The start returns `{error, Reason}`. |
+| `ignore` | The start returns `ignore`. |
+| Any other value, including `{ok, State, Timeout}` | The start returns `{error, {eta_sched, unsupported_init, Return}}`, and the child exits with the same reason. |
 
-A start *timeout* in `Options` is ignored. Waiting on one would be a real-clock
-dependency in the middle of a simulated run, which is the thing the framework
-exists to remove, and no caller seen so far passes one.
+An unsupported return is refused because this function replaces a start path.
+Handling a return incorrectly without a report would be a worse defect than a
+failed start.
 
-Inert with no scheduler running: delegates straight to `gen_server`.
+## Errors
+
+- A server name other than `{local, Name}` returns
+  `{error, {eta_sched, unsupported_server_name, ServerName}}`. `{global, _}` and
+  `{via, _, _}` register through a process that the scheduler does not own.
+- A local name that is already registered returns
+  `{error, {already_started, Pid}}`.
+- A child that is killed before it sends the result returns `{error, Reason}`.
+- A call while a scheduler is running and no step is in progress raises
+  `{eta_sched, {start_outside_schedule, {Mod, Kind}, Hint}}`. `Kind` is
+  `monitor`, `link` or `plain`. No process would send the token. Start the
+  process from an operation with `eta_run:spawn_op/1`, or before the scheduler
+  exists.
+
+## Delegation
+
+The function delegates to `gen_server` in two cases:
+
+- No scheduler is running.
+- The scheduler is stepping a process other than the caller. The caller is then
+  a process that the scheduler does not own, such as `kernel_safe_sup`.
+
+## Limitations
+
+- `Options` is not used when the start is gated. A start time-out in `Options`
+  therefore has no effect. Waiting for a start time-out would make the run
+  depend on the real clock.
+
+## Design
+
+`gen_server:start_*` spawns the child inside OTP. `gen:do_spawn/5` calls
+`proc_lib:start_monitor/5`, which calls `erlang:spawn_opt(proc_lib, init_p, …)`.
+A transform of the system under test does not reach that call. The child would
+be adopted late, and the run would not be replayable. In the registry port, one
+such child per group commit made one seed produce a different schedule on each
+run.
+
+Replacing `proc_lib` with a transformed copy was rejected for these reasons:
+
+- stdlib is a sticky directory. Loading a replacement fails with
+  `sticky_directory` unless `code:unstick_dir/1` is first called on the ebin
+  directory of stdlib.
+- Every OTP process in the VM starts through `proc_lib`, including the processes
+  of ExUnit and Logger. With a broken copy loaded, `Agent.start_link/1` fails
+  with `undef`.
+- The copy is 1600 lines of OTP code that must follow each OTP release.
+
+This function therefore builds an equivalent process and does not intercept
+`proc_lib`.
 """.
 -endif.
 -spec start_monitor(module(), term(), list()) ->
@@ -1144,21 +1305,26 @@ start(Name, Mod, Args, Options) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_statem:start_link/3` for a system under simulation — the `gen_statem` half
-of `start_link/3`, on the same terms and for the same reasons.
+Replaces `gen_statem:start_monitor/3` for a system under simulation.
+`statem_start_monitor/4`, `statem_start_link/3,4` and `statem_start/3,4` follow
+the same rules.
 
-The child is gated identically: it waits for the scheduler's token, sets the two
-process-dictionary entries `proc_lib` would have set, registers its name, runs
-`init/1` itself, acknowledges, and then becomes the state machine through
-`gen_statem:enter_loop/6` — which is the same `enter/8` `gen_statem`'s own
-`init_it/6` converges on, so the callback mode is read and the initial state
-enter call is made exactly as in a real start.
+The function follows the rules of `start_monitor/3`, with these differences:
 
-`init/1` returning `{ok, State, Data}` and `{ok, State, Data, Actions}` is
-covered, along with `{stop, Reason}` and `ignore`. Anything else raises rather
-than being guessed at.
+- The child enters the loop through `gen_statem:enter_loop/6`. That function
+  reaches the same `enter/8` as `init_it/6` of `gen_statem`. The callback mode
+  is therefore read, and the initial state enter call is made, as in a start by
+  OTP.
+- With no scheduler running, the function delegates to `gen_statem`.
+- The supported returns of `init/1` are the following:
 
-Inert with no scheduler running: delegates straight to `gen_statem`.
+| Return of `init/1` | Result |
+|---|---|
+| `{ok, State, Data}` | The state machine starts. |
+| `{ok, State, Data, Actions}` | The state machine starts with `Actions`. |
+| `{stop, Reason}` | The start returns `{error, Reason}`. |
+| `ignore` | The start returns `ignore`. |
+| Any other value | The start returns `{error, {eta_sched, unsupported_init, Return}}`, and the child exits with the same reason. |
 """.
 -endif.
 -spec statem_start_monitor(module(), term(), list()) ->
@@ -1430,16 +1596,25 @@ statem_enter_loop(Mod, Name, State, Data, Actions) ->
 
 -if(?DOCATTRS).
 -doc """
-`gen_fsm:start_link/3` for a system under simulation — the `gen_fsm` half of
-`start_link/3`, on the same terms as `statem_start_link/3`.
+Replaces `gen_fsm:start_link/3` for a system under simulation. `fsm_start_link/4`
+and `fsm_start/3,4` follow the same rules. `gen_fsm` has no `start_monitor`.
 
-`init/1` returning `{ok, StateName, StateData}` and `{ok, StateName, StateData,
-Timeout}` is covered — the time-out goes onto the virtual clock through
-`eta_fsm:init_return/1` when one is running, and is refused when none is —
-along with `{stop, Reason}` and `ignore`. `hibernate` raises rather than being
-guessed at.
+The function follows the rules of `statem_start_link/3`, with these differences:
 
-`gen_fsm` has no `start_monitor`. Inert with no scheduler running.
+- The child enters the loop through `gen_fsm:enter_loop/4`, or through
+  `gen_fsm:enter_loop/5` for a named state machine.
+- With no scheduler running, the function delegates to `gen_fsm`.
+- The supported returns of `init/1` are the following:
+
+| Return of `init/1` | Result |
+|---|---|
+| `{ok, StateName, StateData}` | The state machine starts. |
+| `{ok, StateName, StateData, Timeout}`, with a virtual clock running | The state machine starts. `eta_fsm:init_return/1` puts the time-out on the virtual clock. |
+| `{ok, StateName, StateData, hibernate}`, with a virtual clock running | `eta_fsm` raises `unsupported_timeout` in the child, and the start returns `{error, Reason}`. |
+| `{ok, StateName, StateData, Timeout}`, with no virtual clock running | The start returns `{error, {eta_sched, unsupported_init, Return}}`. |
+| `{stop, Reason}` | The start returns `{error, Reason}`. |
+| `ignore` | The start returns `ignore`. |
+| Any other value | The start returns `{error, {eta_sched, unsupported_init, Return}}`, and the child exits with the same reason. |
 """.
 -endif.
 -spec fsm_start_link(module(), term(), list()) -> {ok, pid()} | ignore | {error, term()}.
@@ -1525,8 +1700,8 @@ own_ancestors() ->
 
 -if(?DOCATTRS).
 -doc """
-Every known process id, ascending. Ids are assigned in registration order, or
-taken from the trace when one is driving — see `pin/2`.
+Returns the id of every adopted process, in ascending order. The list includes
+processes that have exited. See "Process ids" in the module documentation.
 """.
 -endif.
 -spec ids(sched()) -> [id()].
@@ -1535,13 +1710,13 @@ ids(S) ->
 
 -if(?DOCATTRS).
 -doc """
-Every known process, by id.
+Returns a map from id to pid for every adopted process.
 
-Ids are what a trace records and pids are what a caller recognises, so anything
-that wants to say something about a recorded step needs this mapping. `eta_run`
-uses it to turn `{step, 7}` into a name at teardown.
+A trace records ids, and a caller holds pids. The map relates the two. `eta_run`
+uses the map to turn `{step, 7}` into a name at teardown.
 
-Includes processes that have exited, because a trace can name one.
+The map includes processes that have exited, because a trace entry can name an
+exited process.
 """.
 -endif.
 -spec procs(sched()) -> #{id() => pid()}.
@@ -1550,8 +1725,11 @@ procs(S) ->
 
 -if(?DOCATTRS).
 -doc """
-Ids that have work to do: a non-empty mailbox they are not known to be blocked
-against. See the module doc on selective receive.
+Returns the ids of the runnable processes, in ascending order.
+
+A process is runnable when it has not exited and its queue is longer than the
+queue length at which it last blocked. See "Runnability" in the module
+documentation.
 """.
 -endif.
 -spec runnable(sched()) -> [id()].
@@ -1560,27 +1738,35 @@ runnable(S) ->
 
 -if(?DOCATTRS).
 -doc """
-Run statistics: steps taken, processes known, how many have exited, how many
-children were adopted after they had already started running, how many steps
-ended without the process reaching a receive, and any process caught waiting on
-the code server at the moment a run gave up.
+Returns the statistics of the run as a map.
 
-`adopted_late`, `timeouts` and `cold_code` are all determinism failures, and
-should read `0`, `0` and `[]`. See the module doc's determinism boundary.
+| Field | Value | Value in a deterministic run |
+|---|---|---|
+| `steps` | The number of steps taken. | Any |
+| `processes` | The number of adopted processes, including exited processes. | Any |
+| `exited` | The number of adopted processes that have exited. | Any |
+| `adopted_late` | The number of children that were adopted after they had started to run. | 0 |
+| `timeouts` | The number of steps that ended before the process reached a `receive`. | 0 |
+| `cold_code` | A list of `t:cold/0`, one for each process that waited on `code_server` when a run ended. | `[]` |
+| `unpinned` | The number of processes that a pinned replay adopted with no pinned id. See `pin_mode/2`. | 0 in a run without pinning and in a replay that follows its trace |
 
-`cold_code` is a list of `t:cold/0` — the process, and the frame in the system
-under test that reached a module it had not loaded yet:
+A non-zero `adopted_late`, a non-zero `timeouts` or a non-empty `cold_code`
+means that the seed does not reproduce the run. See "Determinism" in the module
+documentation.
+
+Each `cold_code` entry gives the process and the frame of the system under test
+that called a module that was not loaded:
 
 ```erlang
 #{cold_code := [#{id := 3, pid := Pid, at := {my_client, commit, 2}}]} =
     eta_sched:stats(Sched).
 ```
 
-A non-empty list means the run's quiescence was a lie: at least one process was
-about to be woken by the code server rather than by anything the schedule chose,
-so a run that ended here ended early and everything after this point is wall
-clock. The fix is `eta_run:preload/1`, and `at` names the application to give
-it. See `note_cold_code/1`.
+A non-empty `cold_code` means that the run was not quiescent when it ended. The
+code server, and not the schedule, would have woken at least one process. The
+run ended early, and the real clock orders everything after that point. To
+correct this, pass the application that `at` names to `eta_run:preload/1`. See
+`note_cold_code/1`.
 """.
 -endif.
 -spec stats(sched()) -> #{atom() => term()}.
@@ -1588,7 +1774,7 @@ stats(S) ->
     call(S, stats).
 
 -if(?DOCATTRS).
--doc "The choice sequence, oldest first. Feed to `replay/2`.".
+-doc "Returns the choice sequence, oldest first. Pass the result to `replay/2`.".
 -endif.
 -spec choices(sched()) -> [id()].
 choices(S) ->
@@ -1600,27 +1786,31 @@ choices(S) ->
 
 -if(?DOCATTRS).
 -doc """
-Hands the scheduler the ids to give the next processes it adopts.
+Sets the ids that the scheduler gives to the next processes that it adopts.
 
-Ids are otherwise assigned by counting, and a counter is positional: it makes an
-id mean "the Nth process this run created", so deleting the operation that created
-the third one renumbers every process after it. That is survivable in a run and
-fatal in a shrink, where `eta_shrink` deletes entries and replays what is left —
-the surviving `{step, Id}` entries stop naming what they named, the replay skips
-them, and the shrinker concludes the deletion mattered when all that happened was
-arithmetic.
+`eta_run` uses this function in a replay. In the recorded run, `eta_run` stores
+on each trace entry the ids of the processes that the entry created. Before
+`eta_run` replays an entry, it passes those ids to this function.
 
-So a replay does not recount. `eta_run` records, on each trace entry, the ids that
-entry created, and hands them back here before replaying it. An id then means
-"the process the trace called 7", which no deletion elsewhere can change.
+- `Ids` is consumed in adoption order.
+- The ids that are left over are discarded when the entry closes. The entry
+  closes at `take_adopted/1`, `register_adopting/2` or `step_adopting/2`. An
+  entry is not required to create every pinned process. When shrinking removes
+  an operation, the processes of that operation are never adopted, and no other
+  process changes its id.
+- An entry that creates no process needs no call, because the supply of pinned
+  ids is empty at the start of every entry.
+- The call is a cast. The scheduler handles it before the next call or trace
+  event that the caller causes.
+- Use this function only in a run with `pin_mode/2` set to `true`.
 
-`Ids` is consumed in adoption order and is *not* an obligation: leftovers are
-discarded when the entry closes, which is what removing an operation looks like
-from here — the processes it would have created never arrive, and nothing else
-moves. An entry that creates nobody therefore need not call this at all; the
-supply is already empty.
-
-Only meaningful under `pin_mode/2`; a generating run has nothing to pin.
+Without pinning, an id is a count of adoptions: the id N names the Nth process
+that the run created. `eta_shrink` deletes trace entries and replays the rest.
+Deleting the entry that created one process would change the id of every later
+process. The remaining `{step, Id}` entries would then name other processes, and
+the replay would skip them. The shrinker would conclude that the deletion
+changed the result. With pinning, an id names the process that the trace gave
+that id, and deleting another entry does not change it.
 """.
 -endif.
 -spec pin(sched(), [id()]) -> ok.
@@ -1633,17 +1823,20 @@ pin({eta_sched, Pid}, Ids) ->
 
 -if(?DOCATTRS).
 -doc """
-Whether ids come from the trace (`true`) or from the counter (`false`, the
-default).
+Sets whether the run takes ids from the trace (`true`) or from the adoption
+counter (`false`). The default is `false`.
 
-The mode is per run rather than per entry because an entry that pins nothing is
-ambiguous on its own: it means "this one created nobody" in a recorded trace and
-"this trace predates pinning" in one that has no id information at all. `eta_run`
-decides once, by looking at the trace it was given.
+The mode applies to a whole run and not to one entry. An entry with no pinned
+ids has two possible meanings:
 
-Under `true`, a process adopted with nothing left to pin gets a `{fresh, _}` id
-rather than the next integer, so it cannot collide with an id a later entry is
-still going to hand out.
+- In a trace that records ids, the entry created no process.
+- In a trace that records no ids, the entry gives no information.
+
+`eta_run` chooses the mode once, from the trace that it is given.
+
+With `true`, a process that is adopted when no pinned id remains is given a
+`{fresh, N}` id and not the next integer. The id therefore cannot equal an id
+that a later entry pins.
 """.
 -endif.
 -spec pin_mode(sched(), boolean()) -> ok.
@@ -1652,12 +1845,11 @@ pin_mode(S, Pinning) when is_boolean(Pinning) ->
 
 -if(?DOCATTRS).
 -doc """
-The ids adopted since the last call, oldest first, and clears the record.
+Returns the ids that were adopted since the previous call, oldest first, and
+clears that record. The call also discards the pinned ids that were not used.
 
-This is the recording half of `pin/2`: what a run writes into its trace so that a
-later replay can give the same processes the same names. Reading it *takes* it,
-because the question is always "since when" and the answer is always "since I last
-asked".
+A recording run writes the returned ids into its trace entry. A later replay
+passes them to `pin/2`, so the same processes have the same ids.
 """.
 -endif.
 -spec take_adopted(sched()) -> [id()].
@@ -1666,13 +1858,14 @@ take_adopted(S) ->
 
 -if(?DOCATTRS).
 -doc """
-`register/2` and `take_adopted/1`, in one round trip.
+Does the work of `register/2` and `take_adopted/1` in one call to the scheduler.
+Returns `{Sched, Adopted}`.
 
-Two calls are not two calls' worth of latency here, they are two *drains*: the
-second waits behind every trace event the first one's work produced, which is time
-the caller spent doing nothing, and how much of it depends on how many processes
-the system has. The driver asks this after every operation and `step_adopting/2`
-after every step, so a trace costs one round trip per entry rather than two.
+Each call to the scheduler waits until the scheduler has handled the trace
+events that the previous call produced. That wait grows with the number of
+processes in the system. The driver calls this function after every operation,
+and it calls `step_adopting/2` for every step. A trace entry therefore costs 1
+call and not 2.
 """.
 -endif.
 -spec register_adopting(sched(), pid() | [pid()]) -> {sched(), [id()]}.
@@ -1681,7 +1874,7 @@ register_adopting(S, Pids) ->
     {S, Adopted}.
 
 -if(?DOCATTRS).
--doc "`step/2` and `take_adopted/1`, in one round trip. See `register_adopting/2`.".
+-doc "Does `step/2` and `take_adopted/1` in one call to the scheduler. See `register_adopting/2`.".
 -endif.
 -spec step_adopting(sched(), id()) -> {outcome(), [id()], sched()}.
 step_adopting(S, Id) ->
@@ -1694,10 +1887,15 @@ step_adopting(S, Id) ->
 
 -if(?DOCATTRS).
 -doc """
-Runs one process until it blocks, then suspends it again.
+Resumes the process `Id`, waits until it blocks in a `receive`, and suspends it
+again. The step is added to the choice sequence.
 
-Returns `progress` (it consumed at least one message), `no_progress` (it blocked
-without consuming — a selective receive that matched nothing), or `exited`.
+Returns `{Outcome, Sched}`. `Outcome` is one of:
+
+- `progress`: the process consumed at least 1 message.
+- `no_progress`: the process blocked and consumed no message. A selective
+  `receive` matched none of the queued messages.
+- `exited`: the process exited.
 """.
 -endif.
 -spec step(sched(), id()) -> {outcome(), sched()}.
@@ -1705,7 +1903,7 @@ step(S, Id) ->
     {call(S, {step, Id}), S}.
 
 -if(?DOCATTRS).
--doc "Steps up to 10000 times. See `run/2`.".
+-doc "Calls `run/2` with a `MaxSteps` of 10000.".
 -endif.
 -spec run(sched()) -> sched().
 run(S) ->
@@ -1713,10 +1911,12 @@ run(S) ->
 
 -if(?DOCATTRS).
 -doc """
-Steps processes, choosing from the seeded RNG, until nothing is runnable or
-`MaxSteps` is reached.
+Steps runnable processes until no process is runnable or `MaxSteps` steps have
+been taken. The seeded random number generator chooses the process of each
+step.
 
-`choices/1` then gives the sequence to replay.
+Returns the same handle. `choices/1` then returns the choice sequence for
+`replay/2`.
 """.
 -endif.
 -spec run(sched(), non_neg_integer()) -> sched().
@@ -1725,29 +1925,35 @@ run(S, MaxSteps) ->
 
 -if(?DOCATTRS).
 -doc """
-`run/2` with an idle callback — the discrete-event loop.
+Does the work of `run/2` and calls `OnIdle` when no process is runnable. This
+function is the discrete-event loop.
 
-`OnIdle` is invoked only when **nothing is runnable**, and returns whether it
-created new work. That is the hook virtual time plugs into:
+`OnIdle` returns whether it created new work:
+
+- `true`: the run continues. The call counts as 1 step against `MaxSteps`, so a
+  callback that always returns `true` still ends the run.
+- `false`: the run ends. The scheduler then records the processes that wait on
+  `code_server`. See `stats/1`.
+
+Virtual time uses this callback:
 
 ```erlang
 eta_sched:run(Sched, MaxSteps, fun eta_time:advance_to_next/0)
 ```
 
-so the clock jumps straight to the next deadline once the current instant has
-nothing left to do, and the run ends when neither processes nor timers have
-anything pending. Time therefore advances in jumps between events rather than in
-ticks, and never while work remains at the current instant — which is both what
-makes the ordering deterministic and why waiting out a long timeout is free.
+- The clock moves to the next deadline when no process is runnable at the
+  current instant.
+- The clock never moves while a process is runnable. The order of events is
+  therefore deterministic.
+- A long time-out takes no real time.
+- The run ends when no process is runnable and no timer is pending.
 
-The scheduler deliberately knows nothing about time: it asks "is there more work?"
-and the caller decides what that means. An idle callback that returns `true`
-counts against `MaxSteps`, so a callback that always says yes terminates rather
-than spinning.
+The scheduler has no notion of time. The callback defines what more work means.
 
-`OnIdle` runs **in the scheduler's process**, not the caller's. `eta_time` is ETS
-and callable from anywhere, so the usual callback is unaffected; a callback that
-wants the driver's mailbox is not, and should not be one.
+`OnIdle` runs in the scheduler process, not in the process of the caller.
+`eta_time` uses ETS and can be called from any process, so
+`eta_time:advance_to_next/0` is not affected. Do not pass a callback that reads
+the mailbox of the driver.
 """.
 -endif.
 -spec run(sched(), non_neg_integer(), fun(() -> boolean())) -> sched().
@@ -1757,11 +1963,18 @@ run(S, MaxSteps, OnIdle) ->
 
 -if(?DOCATTRS).
 -doc """
-Replays a recorded choice sequence exactly, ignoring the RNG.
+Steps the processes that `Choices` names, in order. The random number generator
+is not used.
 
-A choice naming a process that is not currently runnable is a divergence — the
-run did not follow the same path — and is reported rather than skipped, because
-silently continuing would produce a "replay" that is not one.
+Returns one of:
+
+- `{ok, Sched}`: every choice was stepped.
+- `{{error, {diverged, Id, Runnable}}, Sched}`: the choice `Id` named a process
+  that was not runnable. `Runnable` is the list of runnable ids at that point.
+
+A divergence means that the run did not follow the recorded path. The replay
+stops at the first divergence and does not skip the choice, because a run that
+skips a choice is not the recorded run.
 """.
 -endif.
 -spec replay(sched(), [id()]) ->
@@ -2601,14 +2814,14 @@ queue_len(Pid) ->
 -spec status(pid()) -> atom().
 -if(?DOCATTRS).
 -doc """
-`erlang:is_process_alive/1`, without asking the process.
+Replaces `erlang:is_process_alive/1` for a system under simulation. Returns
+whether `Pid` is alive, and reads the result with `process_info/2`.
 
-`is_process_alive/1` on another process is a signal the target answers when it
-next runs, and under a run every process the scheduler owns is suspended unless
-it is the one stepping. So a process asking whether another is alive waits for an
-answer that only comes once the scheduler happens to resume the other one, and
-the schedule hangs on it. `eta_transform` points the call here, which reads the
-answer the way the scheduler does, with `process_info/2`.
+`erlang:is_process_alive/1` on another process sends a signal, and the target
+replies when it next runs. During a run, every scheduled process other than the
+stepped process is suspended. The caller would wait until the scheduler resumes
+the target, and the step would not end. `eta_transform` points the call at this
+function.
 """.
 -endif.
 -spec is_alive(pid()) -> boolean().
