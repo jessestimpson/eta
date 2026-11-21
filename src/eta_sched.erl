@@ -327,6 +327,13 @@ releasing, not after.
     %% id => queue length at which this process was found blocked.
     blocked_at = #{} :: #{id() => non_neg_integer()},
     exited = #{} :: #{id() => true},
+    %% id => pid for every process not yet known to have exited. `procs` keeps
+    %% every process a run ever registered, and in a system that spawns a
+    %% process per operation nearly all of them have exited. `runnable_ids/1`
+    %% runs at every choice point, so it reads this map instead: its cost then
+    %% depends on how many processes are alive, not on how long the run is.
+    %% Updated only through `adopt/2` and `mark_exited/2`.
+    live = #{} :: #{id() => pid()},
     %% Children spawned through `spawn/1` and friends, which start blocked. Tracked
     %% so `release/1` can let go of any that never got their token.
     gated = #{} :: #{pid() => true},
@@ -1984,7 +1991,7 @@ is_gated(Pid) ->
 adopt_exited(St, Child) ->
     St1 = adopt(St, Child),
     Id = maps:get(Child, St1#st.ids),
-    St1#st{exited = (St1#st.exited)#{Id => true}}.
+    mark_exited(St1, Id).
 
 %% Closing out a trace entry: hand back what it adopted, and drop whatever it did
 %% not use of what was pinned for it.
@@ -2003,12 +2010,17 @@ close_entry(St = #st{adopted = Adopted}) ->
 
 -spec adopt(#st{}, pid()) -> #st{}.
 adopt(St0, Pid) ->
-    {Id, St = #st{procs = Procs, ids = Ids, adopted = Adopted}} = mint(St0),
+    {Id, St = #st{procs = Procs, ids = Ids, live = Live, adopted = Adopted}} = mint(St0),
     St#st{
         procs = Procs#{Id => Pid},
         ids = Ids#{Pid => Id},
+        live = Live#{Id => Pid},
         adopted = [Id | Adopted]
     }.
+
+-spec mark_exited(#st{}, id()) -> #st{}.
+mark_exited(St = #st{exited = Exited, live = Live}, Id) ->
+    St#st{exited = Exited#{Id => true}, live = maps:remove(Id, Live)}.
 
 %% Where an id comes from. A trace that pinned one is answered from the supply; a
 %% generating run counts. The third clause is the interesting one: a *pinned*
@@ -2060,34 +2072,34 @@ do_release(St = #st{procs = Procs, gated = Gated}) ->
         end,
         Procs
     ),
-    St#st{procs = #{}, ids = #{}, gated = #{}}.
+    St#st{procs = #{}, ids = #{}, live = #{}, gated = #{}}.
 
 %% ---------------------------------------------------------------------------
 %% Stepping
 %% ---------------------------------------------------------------------------
 
 -spec runnable_ids(#st{}) -> [id()].
-runnable_ids(St = #st{procs = Procs}) ->
-    lists:sort([Id || {Id, Pid} <- maps:to_list(Procs), is_runnable(St, Id, Pid)]).
+runnable_ids(St = #st{live = Live}) ->
+    lists:sort([Id || {Id, Pid} <- maps:to_list(Live), is_runnable(St, Id, Pid)]).
 
-%% Liveness is read with `process_info/2` rather than `is_process_alive/1`, and it
-%% matters more here than anywhere else: this runs for every process at every
-%% choice point. `is_process_alive/1` is signal-based — it asks the target and
-%% waits for a reply the target produces by *running* — and every process here is
-%% one this scheduler owns and has suspended, several of which it has already sent
-%% a `?GO` token. Asking them would make the scheduler's own progress depend on
-%% when it next resumed them. `process_info/2` reads the target directly, which is
-%% how `queue_len/1` two lines down has always done it.
+%% One `process_info/2` read per live process, and this runs for every live
+%% process at every choice point.
+%%
+%% The queue length is read with `process_info/2` rather than anything that asks
+%% the target. Every process here is one this scheduler owns and has suspended,
+%% several of which it has already sent a `?GO` token, so a question the target
+%% answers by *running* would make the scheduler's own progress depend on when it
+%% next resumed them.
+%%
+%% Liveness needs no read of its own. `queue_len/1` answers 0 for a process that
+%% is gone, and 0 is never greater than a `blocked_at`, so a dead process is not
+%% runnable. A separate `status` read here doubled the cost of the scan, and the
+%% scan was the largest cost of a long run.
 -spec is_runnable(#st{}, id(), pid()) -> boolean().
 is_runnable(#st{exited = Exited, blocked_at = Blocked}, Id, Pid) ->
-    case maps:is_key(Id, Exited) orelse status(Pid) =:= dead of
-        true ->
-            false;
-        false ->
-            %% Default 0: an empty mailbox is nothing to do. Stepping such a
-            %% process is harmless but wastes a choice and pollutes the schedule.
-            queue_len(Pid) > maps:get(Id, Blocked, 0)
-    end.
+    %% Default 0: an empty mailbox is nothing to do. Stepping such a process is
+    %% harmless but wastes a choice and pollutes the schedule.
+    not maps:is_key(Id, Exited) andalso queue_len(Pid) > maps:get(Id, Blocked, 0).
 
 -spec do_step(#st{}, id()) -> {outcome(), #st{}}.
 do_step(St0 = #st{procs = Procs}, Id) ->
@@ -2125,7 +2137,7 @@ do_step(St0 = #st{procs = Procs}, Id) ->
     case hold(Pid) of
         false ->
             {_SelfSends, _Late, StDead} = drain_trace(St2, Pid),
-            {exited, StDead#st{exited = (StDead#st.exited)#{Id => true}}};
+            {exited, mark_exited(StDead, Id)};
         true ->
             {SelfSends, Late, St3} = drain_trace(St2, Pid),
             {QueueAfter, St3a} = queue_at_block(St3, Pid, Late),
@@ -2159,7 +2171,13 @@ do_step(St0 = #st{procs = Procs}, Id) ->
 %% A suspended process still produces these events, because it still takes
 %% signals into its queue.
 %%
-%% The common case has no late arrival: the queue is read, a second drain finds
+%% The most common case is an empty queue. Then the answer is 0 and needs no
+%% further check: a `blocked_at` of 0 cannot count any message as rejected, so
+%% every later arrival makes the process runnable. This case skips the second
+%% `trace_delivered` round trip, which otherwise cost about 20 microseconds on
+%% every step.
+%%
+%% The next case has no late arrival: the queue is read, a second drain finds
 %% nothing new, and the length is exact. Otherwise the queue's contents are
 %% compared with the late messages. The late messages that are still at the end
 %% of the queue are subtracted. A late message that is not in the queue was
@@ -2168,7 +2186,13 @@ do_step(St0 = #st{procs = Procs}, Id) ->
 %% times, and the old reading is the fallback.
 -spec queue_at_block(#st{}, pid(), [term()]) -> {non_neg_integer(), #st{}}.
 queue_at_block(St, Pid, Late0) ->
-    Queue = queue_len(Pid),
+    case queue_len(Pid) of
+        0 -> {0, St};
+        Queue -> queue_at_block(St, Pid, Late0, Queue)
+    end.
+
+-spec queue_at_block(#st{}, pid(), [term()], pos_integer()) -> {non_neg_integer(), #st{}}.
+queue_at_block(St, Pid, Late0, Queue) ->
     case drain_trace(St, Pid) of
         {_, [], St1} when Late0 =:= [] ->
             {Queue, St1};
@@ -2506,7 +2530,7 @@ handle_trace(St = #st{ids = Ids}, {trace, Parent, spawn, Child, _MFA}) ->
                 error:exited -> adopt_exited(St, Child)
             end
     end;
-handle_trace(St = #st{ids = Ids, exited = Exited}, {trace, Pid, exit, Reason}) ->
+handle_trace(St = #st{ids = Ids}, {trace, Pid, exit, Reason}) ->
     %% The scheduler is the tracer for every process in a run, so this is the one
     %% place an exit is observed at a point the schedule fixes rather than
     %% whenever the BEAM happens to run a watcher. `eta_net` has no other source
@@ -2520,7 +2544,7 @@ handle_trace(St = #st{ids = Ids, exited = Exited}, {trace, Pid, exit, Reason}) -
     %% was how it showed up.
     _ = eta_time:forget(Pid),
     case maps:find(Pid, Ids) of
-        {ok, Id} -> St#st{exited = Exited#{Id => true}};
+        {ok, Id} -> mark_exited(St, Id);
         error -> St
     end;
 %% Every other trace event (in, out, 'receive', send elsewhere, link, …) is not
