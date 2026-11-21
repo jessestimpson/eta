@@ -165,6 +165,7 @@ is why `init/2` is called by the driver rather than by the caller beforehand.
     op_p :: float(),
     quiet_p :: float(),
     check_every :: pos_integer(),
+    check_timeout = ?CHECK_TIMEOUT :: non_neg_integer(),
     lenient = false :: boolean(),
     skipped = 0 :: non_neg_integer(),
     %% Snapshot of the code path taken once the scheduler owns the system, so
@@ -211,6 +212,11 @@ Options, all with defaults:
   server that turns it away, stops time and starves the timer that would end the
   spin. A real machine takes time to spin, and its timers fire through it.
 - `check_every` (1) — run the invariants every N actions.
+- `check_timeout` (5000) — milliseconds of real time that `check/1` or
+  `check_final/2` may take before the run ends with `{error, check_blocked}`.
+  The bound exists to catch an invariant that calls into a suspended process.
+  Raise it for an invariant that is slow; lower it in a test that expects
+  `check_blocked`, so the test does not wait 5 seconds.
 - `log` (`true`) — collect a `eta_log` record of the run. `false` suppresses the
   events but **not** the sequence numbers `log/1` hands out, so a harness that
   stamps its operations from them keeps working. See `eta_log`.
@@ -634,6 +640,7 @@ drive(Mod, Opts, Source) ->
             op_p = maps:get(op_p, Opts, 0.3),
             quiet_p = maps:get(quiet_p, Opts, 0.3),
             check_every = maps:get(check_every, Opts, 1),
+            check_timeout = maps:get(check_timeout, Opts, ?CHECK_TIMEOUT),
             lenient = maps:get(lenient, Opts, false),
             busy_limit = maps:get(busy_steps, Opts, infinity)
         },
@@ -897,7 +904,7 @@ do_final(Mod, Settled, Sut, R) ->
         false ->
             {ok, R};
         true ->
-            case safe_check_final(Mod, Settled, Sut) of
+            case safe_check_final(Mod, Settled, Sut, R#r.check_timeout) of
                 ok -> {ok, R};
                 Other -> {Other, R}
             end
@@ -956,8 +963,8 @@ spend1(R = #r{budget = B, since_check = N}) ->
 %% Invariants, every `check_every` actions.
 after_action(R = #r{check_every = Every, since_check = N}) when N < Every ->
     loop(R);
-after_action(R = #r{mod = Mod, sut = Sut}) ->
-    case safe_check(Mod, Sut) of
+after_action(R = #r{mod = Mod, sut = Sut, check_timeout = Timeout}) ->
+    case safe_check(Mod, Sut, Timeout) of
         ok -> loop(R#r{since_check = 0});
         {violation, _} = V -> {V, R};
         {error, _} = E -> {E, R}
@@ -1040,8 +1047,8 @@ replay_entry(R = #r{lenient = Lenient, skipped = Skipped, trace = Trace}, {clock
 
 replay_after(R = #r{check_every = Every, since_check = N}, Rest) when N < Every ->
     replay_loop(R, Rest);
-replay_after(R = #r{mod = Mod, sut = Sut}, Rest) ->
-    case safe_check(Mod, Sut) of
+replay_after(R = #r{mod = Mod, sut = Sut, check_timeout = Timeout}, Rest) ->
+    case safe_check(Mod, Sut, Timeout) of
         ok -> replay_loop(R#r{since_check = 0}, Rest);
         {violation, _} = V -> {V, R};
         {error, _} = E -> {E, R}
@@ -1154,16 +1161,16 @@ harness_labels(Mod, Sut) ->
 %% blocks on a suspended process must not take the run with it. The system is
 %% still frozen here — `finish/2` has not released the scheduler yet — so the
 %% rule that `check/1` may not talk to it holds for this one too.
-safe_check_final(Mod, Settled, Sut) ->
+safe_check_final(Mod, Settled, Sut, Timeout) ->
     {Pid, MRef} =
         spawn_monitor(fun() -> exit({checked, catch Mod:check_final(Settled, Sut)}) end),
-    collect_check(Pid, MRef).
+    collect_check(Pid, MRef, Timeout).
 
-safe_check(Mod, Sut) ->
+safe_check(Mod, Sut, Timeout) ->
     {Pid, MRef} = spawn_monitor(fun() -> exit({checked, catch Mod:check(Sut)}) end),
-    collect_check(Pid, MRef).
+    collect_check(Pid, MRef, Timeout).
 
-collect_check(Pid, MRef) ->
+collect_check(Pid, MRef, Timeout) ->
     receive
         {'DOWN', MRef, process, Pid, {checked, ok}} ->
             ok;
@@ -1173,7 +1180,7 @@ collect_check(Pid, MRef) ->
             {error, {check_returned, Other}};
         {'DOWN', MRef, process, Pid, Reason} ->
             {error, {check_crashed, Reason}}
-    after ?CHECK_TIMEOUT ->
+    after Timeout ->
         erlang:demonitor(MRef, [flush]),
         exit(Pid, kill),
         {error, check_blocked}

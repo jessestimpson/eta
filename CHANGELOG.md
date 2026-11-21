@@ -71,6 +71,31 @@
   child that exits `noconnection`. From a process on no simulated node, or to a
   node the network doesn't know, they still raise while a run is active.
 
+- Added the `check_timeout` run option, in milliseconds, default 5000. It bounds
+  how long `check/1` or `check_final/2` may take before the run ends with
+  `{error, check_blocked}`. The bound was fixed at 5000 ms.
+
+- The scheduler is faster per step. Measured on eta's own test systems,
+  against the scheduler that includes the late-arrival fix below:
+
+  | Workload | Unit | Before | After |
+  |---|---|---|---|
+  | `eta_2pc`, 100 operations, invariants off | µs per step | 83 to 87 | 62 |
+  | `eta_net_faults`, 30 operations, drops and delays | µs per step | 156 to 158 | 124 |
+  | `eta_2pc`, 3,200 operations, invariants off | µs per action | 165 | 97 |
+
+  - Finding the runnable processes reads only processes that have not exited.
+    It read every process the run had registered, so its cost grew with the
+    length of a run that spawns a process per operation.
+  - It reads each process's queue length once. A separate liveness read was
+    redundant.
+  - The check for messages that arrive after a process blocks skips its second
+    `trace_delivered` round trip when the process's queue is empty.
+
+  The last change can move the point at which the scheduler handles another
+  process's trace events, so a seed can produce a different schedule than it
+  did before. A trace recorded with an earlier version may not replay.
+
 ### Bug fixes
 
 - A process that kills a scheduled process and then waits for its `DOWN` or

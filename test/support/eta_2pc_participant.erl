@@ -14,7 +14,7 @@
 -export([start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2]).
 
--export([plan/3, state/3, decisions/2]).
+-export([plan/3, state/3, decisions/1]).
 
 start_link(Tab, Index) ->
     gen_server:start_link(?MODULE, {Tab, Index}, []).
@@ -75,14 +75,19 @@ state(Tab, TxId, Index) ->
         [] -> unknown
     end.
 
-%% Every participant's final word on `TxId`, for the atomicity invariant.
-decisions(Tab, TxId) ->
-    [
-        S
-     || {{state, T, _Index}, S} <- ets:tab2list(Tab),
-        T =:= TxId,
-        S =:= committed orelse S =:= aborted
-    ].
+%% Every participant's final word, per transaction, for the atomicity invariant.
+%% One pass over the table. The invariant runs after every action, and a pass
+%% per transaction made it the largest cost of a long run.
+decisions(Tab) ->
+    lists:foldl(
+        fun({TxId, S}, Acc) -> maps:update_with(TxId, fun(Ss) -> [S | Ss] end, [S], Acc) end,
+        #{},
+        [
+            {T, S}
+         || {{state, T, _Index}, S} <- ets:tab2list(Tab),
+            S =:= committed orelse S =:= aborted
+        ]
+    ).
 
 record(Tab, TxId, Index, S) ->
     ets:insert(Tab, {{state, TxId, Index}, S}).

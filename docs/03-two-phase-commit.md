@@ -248,10 +248,10 @@ waiting on the real clock.
 
 ```erlang
 check(#{tab := Tab, next_tx := Next}) ->
-    first_violation(lists:seq(1, Next - 1), Tab).
+    first_violation(lists:seq(1, Next - 1), Tab, eta_2pc_participant:decisions(Tab)).
 
-first_violation([TxId | Rest], Tab) ->
-    case lists:usort(eta_2pc_participant:decisions(Tab, TxId)) of
+first_violation([TxId | Rest], Tab, Decisions) ->
+    case lists:usort(maps:get(TxId, Decisions, [])) of
         Mixed when length(Mixed) > 1 ->
             {violation, #{property => atomicity,
                           detail => <<"participants disagreed about a transaction">>,
@@ -259,12 +259,15 @@ first_violation([TxId | Rest], Tab) ->
                           decision => coordinator_decision(Tab, TxId),
                           participants => [...]}};
         _ ->
-            first_violation(Rest, Tab)
+            first_violation(Rest, Tab, Decisions)
     end.
 ```
 
-Nothing in there sends a message or waits for anything. It's an
-`ets:tab2list` and some list operations. An invariant that calls into a
+Nothing in there sends a message or waits for anything.
+`eta_2pc_participant:decisions/1` is one `ets:tab2list` that groups the
+participants' decisions by transaction, and the rest is list operations. The
+invariant runs after every action, so it reads the table once rather than once
+per transaction. An invariant that calls into a
 suspended process either hangs or, worse, gets a plausible answer from an API
 that swallowed its own timeout, and then passes while checking nothing.
 

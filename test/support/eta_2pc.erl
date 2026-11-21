@@ -179,7 +179,7 @@ maybe_touch_lazy(true, _TxId) -> ok.
 %% Atomicity: no two participants may reach opposite conclusions about the same
 %% transaction. Read entirely from ETS — nothing here sends a message or waits.
 check(#{tab := Tab, next_tx := Next}) ->
-    first_violation(lists:seq(1, Next - 1), Tab).
+    first_violation(lists:seq(1, Next - 1), Tab, eta_2pc_participant:decisions(Tab)).
 
 terminate(Sut = #{coordinator := Coordinator, participants := Participants, tab := Tab}) ->
     %% Clients first, and by killing rather than asking. `eta_run` has already
@@ -196,10 +196,10 @@ terminate(Sut = #{coordinator := Coordinator, participants := Participants, tab 
 %% Internals
 %% ---------------------------------------------------------------------------
 
-first_violation([], _Tab) ->
+first_violation([], _Tab, _Decisions) ->
     ok;
-first_violation([TxId | Rest], Tab) ->
-    case lists:usort(eta_2pc_participant:decisions(Tab, TxId)) of
+first_violation([TxId | Rest], Tab, Decisions) ->
+    case lists:usort(maps:get(TxId, Decisions, [])) of
         Mixed when length(Mixed) > 1 ->
             {violation, #{
                 property => atomicity,
@@ -212,7 +212,7 @@ first_violation([TxId | Rest], Tab) ->
                 ]
             }};
         _ ->
-            first_violation(Rest, Tab)
+            first_violation(Rest, Tab, Decisions)
     end.
 
 coordinator_decision(Tab, TxId) ->
