@@ -366,20 +366,17 @@ defmodule EtaStatemTest do
   # What is still refused
   # ---------------------------------------------------------------------------
 
-  describe "functions eta_net does not implement" do
-    test "gen_statem's asynchronous interface raises while a network is running" do
+  describe "gen_statem's asynchronous interface" do
+    test "is routed while a network is running, request and reply" do
       :ok = @net.start(%{seed: 1})
       {:ok, _} = :eta_statem_echo.start_link(:async_statem)
       on_exit(fn -> stop_echo(:async_statem) end)
 
-      result =
-        try do
-          {:ok, :eta_statem_echo.async(:async_statem, {:echo, 1})}
-        rescue
-          e in ErlangError -> {:error, e.original}
-        end
+      req = :eta_statem_echo.async(:async_statem, {:echo, 1})
+      assert {:reply, {:echoed, 1}} = :eta_statem_echo.response(req, 1_000)
 
-      assert {:error, {:eta_net, {:unsupported, {:gen_statem, :send_request, 2}, _}}} = result
+      assert %{delivered: n} = @net.stats()
+      assert n >= 2, "expected request and reply to both be routed, got #{n}"
     end
 
     test "and passes straight through with no network" do

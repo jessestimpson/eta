@@ -13,6 +13,7 @@
 -include_lib("eta/include/eta.hrl").
 
 -export([start_link/1, bang/2, qualified/2, cast/2, call/2, call_dirty/2, async/2, stop/1]).
+-export([response/2]).
 -export([callback_mode/0, init/1, handle_event/4]).
 
 start_link(Name) ->
@@ -39,10 +40,13 @@ call(Dest, Msg) ->
 call_dirty(Dest, Msg) ->
     gen_statem:call(Dest, Msg, {dirty_timeout, 5000}).
 
-%% One of the client-side functions eta_net does not implement. Rewritten to
-%% `eta_net:unsupported/2`, which raises while a network is running.
+%% The asynchronous interface. Rewritten to `eta_net:send_request/2`.
 async(Dest, Msg) ->
     gen_statem:send_request(Dest, Msg).
+
+%% Rewritten to `eta_net:receive_response/2`.
+response(ReqId, Timeout) ->
+    gen_statem:receive_response(ReqId, Timeout).
 
 stop(Name) ->
     gen_statem:stop(Name).

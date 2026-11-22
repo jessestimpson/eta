@@ -518,7 +518,7 @@ Lessons from these systems:
 - A transformed module is close to the shipped module but is not the same module.
 - Elixir's `Task` and `Agent` raise under a run unless `Eta.Beam.instrument/1` has
   rewritten them.
-- `gen_statem` support excludes `send_request`/`wait_response`, hibernation and
+- `gen_statem` support excludes hibernation and
   event time-outs (`{timeout, Time, Content}` or a bare integer action). Event
   time-outs raise while a clock runs. State time-outs and generic time-outs are on
   the virtual clock.

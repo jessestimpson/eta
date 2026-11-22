@@ -12,6 +12,7 @@
 -include_lib("eta/include/eta.hrl").
 
 -export([start_link/1, bang/2, qualified/2, cast/2, call/2, call/3, broadcast/2, stop/1]).
+-export([request/3, requests/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
 start_link(Name) ->
@@ -40,6 +41,39 @@ call(Dest, Msg) ->
 %% to wait out on the real clock.
 call(Dest, Msg, Timeout) ->
     gen_server:call(Dest, Msg, Timeout).
+
+%% The asynchronous interface. Rewritten to `eta_net:send_request/2` and
+%% `eta_net:receive_response/2`.
+request(Dest, Msg, Timeout) ->
+    ReqId = gen_server:send_request(Dest, Msg),
+    gen_server:receive_response(ReqId, Timeout).
+
+%% The same interface with a collection of request ids. Sends one request for
+%% each `{Label, Msg}', and returns the responses by label. Each response is
+%% recognised with `gen_server:check_response/3`.
+requests(Dest, Labelled) ->
+    Collection = lists:foldl(
+        fun({Label, Msg}, Acc) -> gen_server:send_request(Dest, Msg, Label, Acc) end,
+        gen_server:reqids_new(),
+        Labelled
+    ),
+    collect(Collection, []).
+
+collect(Collection, Acc) ->
+    case gen_server:reqids_size(Collection) of
+        0 ->
+            lists:sort(Acc);
+        _ ->
+            receive
+                Msg ->
+                    case gen_server:check_response(Msg, Collection, true) of
+                        {Response, Label, Collection1} ->
+                            collect(Collection1, [{Label, Response} | Acc]);
+                        no_reply ->
+                            collect(Collection, Acc)
+                    end
+            end
+    end.
 
 %% One of the client-side functions eta_net does not implement. Rewritten to
 %% `eta_net:unsupported/2`, which raises while a network is running.

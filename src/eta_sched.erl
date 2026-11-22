@@ -2203,6 +2203,7 @@ is_gated(Pid) ->
 %% the dominant cause is gone, not because it was seen to help.
 adopt_exited(St, Child) ->
     St1 = adopt(St, Child),
+    true = ets:insert(?ACTIVE, {{proc, Child}, dead}),
     Id = maps:get(Child, St1#st.ids),
     mark_exited(St1, Id).
 
@@ -2224,6 +2225,8 @@ close_entry(St = #st{adopted = Adopted}) ->
 -spec adopt(#st{}, pid()) -> #st{}.
 adopt(St0, Pid) ->
     {Id, St = #st{procs = Procs, ids = Ids, live = Live, adopted = Adopted}} = mint(St0),
+    %% For `is_alive/1`, which the stepped process calls.
+    true = ets:insert(?ACTIVE, {{proc, Pid}, alive}),
     St#st{
         procs = Procs#{Id => Pid},
         ids = Ids#{Pid => Id},
@@ -2750,6 +2753,9 @@ handle_trace(St = #st{ids = Ids}, {trace, Pid, exit, Reason}) ->
     %% for it, and is inert if no network is running. See
     %% `eta_net:notify_exit/2`.
     ok = eta_net:notify_exit(Pid, Reason),
+    %% For `is_alive/1`. Recorded for every process whose exit is traced,
+    %% whether or not the scheduler has adopted it.
+    true = ets:insert(?ACTIVE, {{proc, Pid}, dead}),
     %% Its timers go with it. A deadline addressed to a dead process can make
     %% nothing runnable, so leaving it in the wheel only gives the clock a
     %% place to advance to for no reason, and the audit a stray to report. A
@@ -2815,18 +2821,57 @@ queue_len(Pid) ->
 -if(?DOCATTRS).
 -doc """
 Replaces `erlang:is_process_alive/1` for a system under simulation. Returns
-whether `Pid` is alive, and reads the result with `process_info/2`.
+whether `Pid` is alive.
 
 `erlang:is_process_alive/1` on another process sends a signal, and the target
 replies when it next runs. During a run, every scheduled process other than the
 stepped process is suspended. The caller would wait until the scheduler resumes
 the target, and the step would not end. `eta_transform` points the call at this
 function.
+
+While a scheduler is active, the function answers from the record of the
+scheduler, and sends no signal:
+
+| `Pid` | Result |
+|---|---|
+| The calling process | `true` |
+| A process whose exit the scheduler has traced, or that `eta_net:kill_node/2` has killed | `false` |
+| A process that the scheduler owns and that has not exited | `true` |
+| Any other process, and every process when no scheduler is active | The result of `process_info(Pid, status)` |
+
+`process_info/2` on a suspended process also sends a signal. The reply arrives
+at a time that the VM decides: before the caller is scheduled out, or after.
+In the second case the scheduler saw the caller blocked and ended the step, and
+the caller became runnable again when the reply arrived. A harness whose
+system called `is_process_alive/1` on a suspended process therefore had seeds
+that produced two schedules. The record of the scheduler removes that wait.
+
+## Limitations
+
+- A process that a harness kills with `exit/2`, and not with
+  `eta_net:kill_node/2`, is reported as alive until the scheduler has handled
+  the exit trace event of the process.
 """.
 -endif.
 -spec is_alive(pid()) -> boolean().
+is_alive(Pid) when Pid =:= self() ->
+    true;
 is_alive(Pid) ->
-    status(Pid) =/= dead.
+    case recorded(Pid) of
+        dead -> false;
+        alive -> not eta_net:exited(Pid);
+        unknown -> status(Pid) =/= dead
+    end.
+
+%% What the scheduler has recorded about `Pid`. See `adopt/2` and the exit
+%% clause of `handle_trace/2`.
+recorded(Pid) ->
+    try ets:lookup(?ACTIVE, {proc, Pid}) of
+        [{_, State}] -> State;
+        [] -> unknown
+    catch
+        error:badarg -> unknown
+    end.
 
 status(Pid) ->
     case erlang:process_info(Pid, status) of

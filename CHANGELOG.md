@@ -18,6 +18,9 @@
 - `eta_net` policy: busy-link fault (`busy_p`, `busy_ms`).
 - `eta_net:register_name/3` accepts `{local, Name}` and `{Name, Node}`.
 - `eta_net:with_node/2`.
+- `eta_net` routes the asynchronous request and response interface of
+  `gen_server` and `gen_statem`: `send_request/2,4`, `wait_response`,
+  `receive_response` and `check_response`.
 - A one-sided partition delivers its events to the other side when it heals.
 - `gen_statem` generic time-outs on the virtual clock.
 - Gated starts for `proc_lib:start*` and `gen:start/5,6`.
@@ -43,6 +46,15 @@
   acknowledges.
 - Messages on one node-to-node link keep their order across senders.
 - `eta_net:send/3` honours `noconnect` and `nosuspend`.
+- `eta_net:call/3` to a callee that has already exited fails with `noproc`
+  without a VM monitor.
+- `eta_net:kill_node/2` waits until the `DOWN` messages of VM monitors on the
+  killed processes have reached the suspended processes that hold them.
+- `erlang:is_process_alive/1` on a suspended process no longer ends the step
+  of the caller at a time that the VM decides. `eta_sched:is_alive/1` answers
+  from the record of the scheduler.
+- A delayed message to a process that has already exited arms no timer, and
+  is not reported as a stray timer.
 - `eta_net` accepts any term as a node name.
 - `eta_net` no longer queries a suspended process during a send.
 - A cast, send or `gen_fsm` event to an unregistered `{Name, Node}` is dropped.

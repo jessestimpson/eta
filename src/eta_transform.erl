@@ -257,8 +257,13 @@ a `gen_statem`-shaped hole the other passes cannot reach, because the timer is
 armed inside `gen_statem` rather than by anything this transform rewrites, and
 the answer is to take the action out of the callback's return before OTP sees it.
 
-**What `gen_statem` support still does not include.** The asynchronous
-`send_request`/`wait_response` interface; `hibernate`; and the *other* two kinds
+`gen_server:send_request/2,4` and `gen_statem:send_request/2,4` are rewritten to
+`eta_net:send_request/2,4`, and the `wait_response`, `receive_response` and
+`check_response` functions of both behaviours to the `eta_net` functions of the
+same name. The request is routed as the request of a call is, and the reply
+comes back through the same two passes. See `eta_net:send_request/2`.
+
+**What `gen_statem` support still does not include.** `hibernate`; and the *other* two kinds
 of time-out — event time-outs and generic (`{timeout, Name}`) ones — which raise
 while a clock is running rather than staying quietly on the real one. See
 `eta_statem` for why they cannot simply be left alone. `init/1` returning
@@ -272,8 +277,7 @@ discoverable by using it instead of by reading a table.
 
 | | when |
 |---|---|
-| `gen_server:abcast`, `multi_call`, `send_request`/`wait_response`/`receive_response`/`check_response` | at run time, while a network is running |
-| `gen_statem`'s `send_request`/`wait_response`/`receive_response`/`check_response` | the same |
+| `gen_server:abcast`, `multi_call` | at run time, while a network is running |
 | `gen_fsm`'s `sync_send_event`/`sync_send_all_state_event` | the same |
 | every client-side function of `gen_event` | the same |
 | `erlang:nodes/2`, Elixir's `Node.monitor/2,3` | the same |
@@ -903,6 +907,27 @@ rewrite(Node, _Locals) ->
     %% `handle_call_pass/1`.
     {gen_statem, call, 2} => {eta_net, call},
     {gen_statem, call, 3} => {eta_net, call},
+    %% The asynchronous request and response interface. The request is the
+    %% request of a call, and the reply comes back through the same passes. See
+    %% `eta_net:send_request/2`.
+    {gen_server, send_request, 2} => {eta_net, send_request},
+    {gen_server, send_request, 4} => {eta_net, send_request},
+    {gen_server, wait_response, 2} => {eta_net, wait_response},
+    {gen_server, wait_response, 3} => {eta_net, wait_response},
+    {gen_server, receive_response, 2} => {eta_net, receive_response},
+    {gen_server, receive_response, 3} => {eta_net, receive_response},
+    {gen_server, check_response, 2} => {eta_net, check_response},
+    {gen_server, check_response, 3} => {eta_net, check_response},
+    {gen_statem, send_request, 2} => {eta_net, send_request},
+    {gen_statem, send_request, 4} => {eta_net, send_request},
+    {gen_statem, wait_response, 1} => {eta_net, wait_response},
+    {gen_statem, wait_response, 2} => {eta_net, wait_response},
+    {gen_statem, wait_response, 3} => {eta_net, wait_response},
+    {gen_statem, receive_response, 1} => {eta_net, receive_response},
+    {gen_statem, receive_response, 2} => {eta_net, receive_response},
+    {gen_statem, receive_response, 3} => {eta_net, receive_response},
+    {gen_statem, check_response, 2} => {eta_net, check_response},
+    {gen_statem, check_response, 3} => {eta_net, check_response},
     %% Elixir's `GenServer` clients speak `gen_server`'s wire protocol — the
     %% requests and replies are byte-identical — so they share `eta_net`'s
     %% targets, and the reply leg comes from `handle_call_pass/1` exactly as it
@@ -1104,9 +1129,10 @@ net_wrap() ->
 %% one of these on a path no simulation ever reaches, and refusing to compile it
 %% would block adoption over code the run never executes.
 %%
-%% What is *not* here is as much of a statement as what is: `call/2,3`, `cast/2`
-%% and `reply/1,2` are supported on both `gen_server` and `gen_statem`.
-%% Everything else in these three interfaces is a gap with a name.
+%% What is *not* here is as much of a statement as what is: `call/2,3`, `cast/2`,
+%% `reply/1,2` and the asynchronous request and response interface are supported
+%% on both `gen_server` and `gen_statem`. Everything else in these three
+%% interfaces is a gap with a name.
 -define(NET_UNSUPPORTED, [
     %% Broadcasts and multi-node calls: distribution, which `eta` does not
     %% simulate at all.
@@ -1115,33 +1141,6 @@ net_wrap() ->
     {gen_server, multi_call, 2},
     {gen_server, multi_call, 3},
     {gen_server, multi_call, 4},
-    %% The asynchronous request/response interface. Routable in principle — the
-    %% request is an ordinary send and the reply comes back through the same
-    %% `handle_call` return this transform already rewrites — but the reply is
-    %% matched by a `ReqId` the caller holds rather than by a receive this module
-    %% controls, so it needs its own design.
-    {gen_server, send_request, 2},
-    {gen_server, send_request, 4},
-    {gen_server, wait_response, 2},
-    {gen_server, wait_response, 3},
-    {gen_server, receive_response, 2},
-    {gen_server, receive_response, 3},
-    {gen_server, check_response, 2},
-    {gen_server, check_response, 3},
-    %% `gen_statem:call/2,3` is *not* here: its reply leg is brought onto the
-    %% network by `statem_return_pass/1`, the same way `handle_call_pass/1` does
-    %% it for `gen_server`. What remains is the asynchronous interface, which has
-    %% the same `ReqId` problem as `gen_server`'s.
-    {gen_statem, send_request, 2},
-    {gen_statem, send_request, 4},
-    {gen_statem, wait_response, 1},
-    {gen_statem, wait_response, 2},
-    {gen_statem, wait_response, 3},
-    {gen_statem, receive_response, 1},
-    {gen_statem, receive_response, 2},
-    {gen_statem, receive_response, 3},
-    {gen_statem, check_response, 2},
-    {gen_statem, check_response, 3},
     %% `gen_fsm`'s synchronous events carry a `'$gen_sync_event'` label rather
     %% than a `'$gen_call'`, and their reply leg is not brought onto the network
     %% by any pass. Refused until they are.
@@ -1151,8 +1150,8 @@ net_wrap() ->
     {gen_fsm, sync_send_all_state_event, 3},
     %% Elixir's `GenServer` broadcasts: distribution again. Its asynchronous
     %% interface is not here because Elixir does not wrap it — an Elixir module
-    %% wanting `send_request` writes `:gen_server.send_request(...)`, which the
-    %% entries above already catch.
+    %% wanting `send_request` writes `:gen_server.send_request(...)`, which
+    %% `?NET_REWRITES' routes.
     {'Elixir.GenServer', abcast, 2},
     {'Elixir.GenServer', abcast, 3},
     {'Elixir.GenServer', multi_call, 2},

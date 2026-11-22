@@ -350,6 +350,80 @@ defmodule DstSchedTest do
   # The scheduler shares a mailbox with the driver
   # ---------------------------------------------------------------------------
 
+  describe "is_alive/1" do
+    # Asks about `target` many times when it receives `{:ask, n}`, and reports
+    # the answers.
+    defp asker(owner, target) do
+      spawn(fn -> asker_loop(owner, target) end)
+    end
+
+    defp asker_loop(owner, target) do
+      receive do
+        {:ask, n} ->
+          answers = for _ <- 1..n, do: :eta_sched.is_alive(target)
+          send(owner, {:answers, Enum.uniq(answers)})
+          asker_loop(owner, target)
+      end
+    end
+
+    defp idle do
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+    end
+
+    test "answers for a suspended process within the step of the caller" do
+      target = idle()
+      pid = asker(self(), target)
+      Process.sleep(20)
+
+      sched = @sched.new(%{seed: 1}) |> @sched.register([pid, target])
+      [id, target_id] = @sched.ids(sched)
+
+      # The answer comes from the record of the scheduler, and the caller
+      # finishes its step. This test does not reproduce the defect of the
+      # earlier implementation, which read `process_info/2`: the test also
+      # passed with that implementation. The defect showed in a harness with
+      # about 30 processes, where 16 of 80 seeds gave two schedules.
+      for _ <- 1..20 do
+        send(pid, {:ask, 500})
+        {outcome, _} = @sched.step(sched, id)
+        assert outcome == :progress
+        assert_received {:answers, [true]}
+        assert @sched.runnable(sched) == []
+      end
+
+      # The scheduler traces the exit of the target, and the answer changes.
+      send(target, :stop)
+      {:exited, _} = @sched.step(sched, target_id)
+      send(pid, {:ask, 5})
+      {:progress, _} = @sched.step(sched, id)
+      assert_received {:answers, [false]}
+
+      @sched.release(sched)
+      Process.exit(pid, :kill)
+    end
+
+    test "asks the VM about a process the scheduler does not own" do
+      outside = idle()
+      dead = spawn(fn -> :ok end)
+      Process.sleep(20)
+
+      sched = @sched.new(%{seed: 1})
+      assert :eta_sched.is_alive(outside)
+      refute :eta_sched.is_alive(dead)
+      assert :eta_sched.is_alive(self())
+      @sched.release(sched)
+
+      # With no scheduler at all.
+      assert :eta_sched.is_alive(outside)
+      refute :eta_sched.is_alive(dead)
+      Process.exit(outside, :kill)
+    end
+  end
+
   describe "driver mailbox" do
     # Phase 0 ran the scheduler in the driver's process, reading trace events from
     # the driver's mailbox. An early version used a catch-all `other ->` clause

@@ -513,6 +513,230 @@ defmodule EtaNetTest do
     end
   end
 
+  describe "a request across a link" do
+    setup do
+      :ok = @time.start(%{start_ms: 0})
+      :ok = @net.start(%{seed: 1})
+      {:ok, pid} = :eta_net_echo.start_link(:req_echo)
+      on_exit(fn -> stop_echo(:req_echo) end)
+      :ok = @net.place(:b, [pid])
+      %{pid: pid}
+    end
+
+    # Runs `fun` in a process on `node`. The result arrives as `{ref, result}`.
+    # The process then answers `{:mailbox, ref2}` with the messages it holds.
+    defp on_node(node, fun) do
+      me = self()
+      ref = make_ref()
+
+      pid =
+        spawn(fn ->
+          receive do
+            :go -> :ok
+          end
+
+          send(me, {ref, fun.()})
+
+          receive do
+            {:mailbox, r} -> send(me, {r, Process.info(self(), :messages)})
+          end
+        end)
+
+      :ok = @net.place(node, [pid])
+      send(pid, :go)
+      {pid, ref}
+    end
+
+    defp result({_pid, ref}) do
+      receive do
+        {^ref, result} -> result
+      after
+        2_000 -> flunk("the requesting process did not finish")
+      end
+    end
+
+    defp mailbox({pid, _ref}) do
+      r = make_ref()
+      send(pid, {:mailbox, r})
+
+      receive do
+        {^r, {:messages, msgs}} -> msgs
+      after
+        2_000 -> flunk("the requesting process did not answer")
+      end
+    end
+
+    test "is answered, with both legs on the network" do
+      # The module is transformed, so this is `eta_net:send_request/2` and
+      # `eta_net:receive_response/2`.
+      task = on_node(:a, fn -> :eta_net_echo.request(:req_echo, {:echo, 1}, 5_000) end)
+      assert {:reply, {:echoed, 1}} = result(task)
+
+      assert %{delivered: n} = @net.stats()
+      assert n >= 2, "expected request and reply to both be routed, got #{n}"
+      assert mailbox(task) == []
+    end
+
+    test "a lost reply ends receive_response in a virtual timeout" do
+      :ok = @net.set_policy(%{drop_p: 1.0, scope: {:tags, [:"$gen_reply"]}})
+
+      task = on_node(:a, fn -> :eta_net_echo.request(:req_echo, {:echo, 2}, 5_000) end)
+      await_armed()
+      @time.advance(5_000)
+
+      assert :timeout = result(task)
+      assert %{dropped: 1} = @net.stats()
+    end
+
+    test "a reply after receive_response has timed out is discarded" do
+      task =
+        on_node(:a, fn ->
+          r = :eta_net_echo.request(:req_echo, {:defer, :k}, 5_000)
+          # Sent from the requester, so the channel orders it before the call.
+          :eta_net.send(:req_echo, {:answer, :k, :too_late})
+          {r, :eta_net.call(:req_echo, {:echo, :sync})}
+        end)
+
+      await_armed()
+      @time.advance(5_000)
+
+      assert {:timeout, {:echoed, :sync}} = result(task)
+      assert mailbox(task) == [], "a reply to an abandoned request reached the mailbox"
+    end
+
+    test "wait_response keeps the request after a timeout" do
+      task =
+        on_node(:a, fn ->
+          req = :eta_net.send_request(:req_echo, {:defer, :w})
+          first = :eta_net.wait_response(req, 100)
+          :eta_net.send(:req_echo, {:answer, :w, :late})
+          {first, :eta_net.wait_response(req, :infinity)}
+        end)
+
+      await_armed()
+      @time.advance(100)
+
+      assert {:timeout, {:reply, :late}} = result(task)
+    end
+
+    test "a partition answers an outstanding request with noconnection", %{pid: pid} do
+      :ok = @net.set_policy(%{drop_p: 1.0, scope: {:tags, [:"$gen_reply"]}})
+
+      task = on_node(:a, fn -> :eta_net_echo.request(:req_echo, {:echo, 3}, :infinity) end)
+      wait_until(fn -> match?(%{dropped: 1}, @net.stats()) end)
+      :ok = @net.partition(:a, :b)
+
+      assert {:error, {:noconnection, ^pid}} = result(task)
+    end
+
+    test "a request into a severed link is answered at once, and sends nothing", %{pid: pid} do
+      # Placing no process on a node creates the node.
+      :ok = @net.place(:a, [])
+      :ok = @net.partition(:a, :b)
+
+      task = on_node(:a, fn -> :eta_net_echo.request(:req_echo, {:echo, 4}, :infinity) end)
+      assert {:error, {:noconnection, ^pid}} = result(task)
+      assert %{delivered: 0} = @net.stats()
+    end
+
+    test "a request to a name nothing holds is noproc" do
+      task =
+        on_node(:a, fn ->
+          {:eta_net_echo.request({:nobody_here, :b}, {:echo, 5}, :infinity),
+           :eta_net_echo.request(:nobody_here, {:echo, 5}, :infinity)}
+        end)
+
+      assert {{:error, {:noproc, {:nobody_here, :b}}}, {:error, {:noproc, {:nobody_here, _}}}} =
+               result(task)
+    end
+
+    test "a request to a dead callee is noproc, and sends nothing", %{pid: pid} do
+      Process.unlink(pid)
+      Process.exit(pid, :kill)
+      wait_until(fn -> not Process.alive?(pid) end)
+
+      task = on_node(:a, fn -> :eta_net_echo.request(pid, {:echo, 6}, :infinity) end)
+      assert {:error, {:noproc, ^pid}} = result(task)
+      assert %{delivered: 0} = @net.stats()
+    end
+
+    test "the exit of a callee on the same node answers the request", %{pid: pid} do
+      # Both ends on one node: the monitor is a VM monitor.
+      Process.unlink(pid)
+      task = on_node(:b, fn -> :eta_net_echo.request(:req_echo, {:defer, :never}, :infinity) end)
+      wait_until(fn -> match?(%{delivered: n} when n >= 1, @net.stats()) end)
+      Process.exit(pid, :kill)
+
+      assert {:error, {:killed, ^pid}} = result(task)
+    end
+
+    test "the exit of a callee on another node answers the request", %{pid: pid} do
+      # A simulated monitor fires when `eta_sched` reports the exit. This test
+      # has no scheduler, so it reports the exit itself.
+      Process.unlink(pid)
+      task = on_node(:a, fn -> :eta_net_echo.request(:req_echo, {:defer, :never}, :infinity) end)
+      wait_until(fn -> match?(%{delivered: n} when n >= 1, @net.stats()) end)
+      :ok = @net.notify_exit(pid, :crashed)
+
+      assert {:error, {:crashed, ^pid}} = result(task)
+    end
+
+    test "a collection gives each response with its label" do
+      task =
+        on_node(:a, fn ->
+          :eta_net_echo.requests(:req_echo, [{:one, {:echo, 1}}, {:two, {:echo, 2}}])
+        end)
+
+      assert [one: {:reply, {:echoed, 1}}, two: {:reply, {:echoed, 2}}] = result(task)
+      assert mailbox(task) == []
+    end
+
+    test "a collection reports a lost link for each outstanding request", %{pid: pid} do
+      :ok = @net.set_policy(%{drop_p: 1.0, scope: {:tags, [:"$gen_reply"]}})
+
+      task =
+        on_node(:a, fn ->
+          :eta_net_echo.requests(:req_echo, [{:one, {:echo, 1}}, {:two, {:echo, 2}}])
+        end)
+
+      wait_until(fn -> match?(%{dropped: 2}, @net.stats()) end)
+      :ok = @net.partition(:a, :b)
+
+      assert [one: {:error, {:noconnection, ^pid}}, two: {:error, {:noconnection, ^pid}}] =
+               result(task)
+    end
+
+    test "receive_response on a collection abandons every request after a timeout" do
+      task =
+        on_node(:a, fn ->
+          c0 = :eta_net.send_request(:req_echo, {:defer, :x}, :x, :gen_server.reqids_new())
+          c1 = :eta_net.send_request(:req_echo, {:defer, :y}, :y, c0)
+          r = :eta_net.receive_response(c1, 1_000, true)
+          :eta_net.send(:req_echo, {:answer, :x, :late})
+          :eta_net.send(:req_echo, {:answer, :y, :late})
+          {r, :eta_net.call(:req_echo, {:echo, :sync}), :eta_net.receive_response(%{}, 0, true)}
+        end)
+
+      await_armed()
+      @time.advance(1_000)
+
+      assert {:timeout, {:echoed, :sync}, :no_request} = result(task)
+      assert mailbox(task) == []
+    end
+  end
+
+  describe "a request with no network" do
+    test "is an ordinary gen_server:send_request" do
+      {:ok, _} = :eta_net_echo.start_link(:plain_req_echo)
+      on_exit(fn -> stop_echo(:plain_req_echo) end)
+
+      assert {:reply, {:echoed, 1}} = :eta_net_echo.request(:plain_req_echo, {:echo, 1}, 1_000)
+
+      assert [a: {:reply, {:echoed, 2}}] =
+               :eta_net_echo.requests(:plain_req_echo, [{:a, {:echo, 2}}])
+    end
+  end
+
   describe "a call with a clock but no network" do
     setup do
       :ok = @time.start(%{start_ms: 0})
@@ -1845,6 +2069,21 @@ defmodule EtaNetTest do
 
       @time.advance(10)
       assert drained(s) == [:later]
+      assert @net.in_flight() == 0
+    end
+
+    test "a delayed message to a process that has exited arms no timer" do
+      :ok = @time.start(%{start_ms: 0})
+      :ok = @net.start(%{seed: 1, policy: %{delay_p: 1.0, max_delay: 10}})
+      s = sink()
+      Process.exit(s, :kill)
+      wait_until(fn -> not Process.alive?(s) end)
+      # `eta_sched` reports an exit in a run. This test has no scheduler.
+      :ok = @net.notify_exit(s, :killed)
+
+      @net.send(s, :to_nobody)
+
+      assert @time.pending() == 0, "a deadline was armed for a dead process"
       assert @net.in_flight() == 0
     end
 

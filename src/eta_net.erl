@@ -292,6 +292,21 @@ See `eta_rpc`.
     unsupported/2
 ]).
 
+%% The asynchronous request and response interface of `gen_server` and
+%% `gen_statem`. See `send_request/2`.
+-export([
+    send_request/2,
+    send_request/4,
+    wait_response/1,
+    wait_response/2,
+    wait_response/3,
+    receive_response/1,
+    receive_response/2,
+    receive_response/3,
+    check_response/2,
+    check_response/3
+]).
+
 %% Policy.
 -export([
     set_policy/1,
@@ -318,7 +333,8 @@ See `eta_rpc`.
     monitor/3,
     demonitor/1,
     demonitor/2,
-    notify_exit/2
+    notify_exit/2,
+    exited/1
 ]).
 
 %% Membership: who a process's node is, who it is connected to, and the
@@ -717,6 +733,9 @@ a simulated monitor for the duration of the call. `partition/3`, `kill_node/2`
 and `disconnect_node/1` then fire it with `noconnection`. Without this, a call
 with an `infinity` time-out across a partition would never return.
 
+A call to a callee that has already exited fails with `noproc` from the record
+of `notify_exit/2`, without a monitor.
+
 ## Exits and errors
 
 The call exits with `{Reason, {eta_net, call, [Dest, Request, Timeout]}}`.
@@ -822,6 +841,15 @@ do_call(To, Dest, Req, Timeout) ->
     %% cut will swallow and waiting out a timeout the caller may not have.
     case link_down(self(), To) of
         true -> exit({{nodedown, node_of(To)}, {eta_net, call, [Dest, Req, Timeout]}});
+        false -> ok
+    end,
+    %% A callee that has already exited is `noproc`, from the record of
+    %% `notify_exit/2`. A VM monitor on such a process is answered by the
+    %% process while the VM removes it, at a time that the VM decides, so the
+    %% `DOWN' message could arrive after the caller has blocked. See
+    %% `simulate_monitor/4`.
+    case target_dead(To) of
+        true -> exit({noproc, {eta_net, call, [Dest, Req, Timeout]}});
         false -> ok
     end,
     Tag = make_ref(),
@@ -1041,6 +1069,371 @@ reply(Replies) when is_list(Replies) ->
 
 -if(?DOCATTRS).
 -doc """
+`gen_server:send_request/2` and `gen_statem:send_request/2`, with the request
+and the reply both routed through the network.
+
+Both behaviours use this function, because both send the request as
+`{'$gen_call', From, Request}`. The result is a request id for
+`wait_response/2`, `receive_response/2` and `check_response/2`.
+
+With no network running, this function and the response functions call the
+`gen_server` functions of the same name.
+
+## Request and reply
+
+- The request is a send that this module routes. The request is tagged by the
+  leading element of `Request`, as for `call/3`.
+- The reply is sent by the callee through `reply/2`, to the pid of the caller.
+  `eta_transform` rewrites the returns of the callee. See `call/3`.
+
+The network can drop or delay the request and the reply independently. A
+request whose reply is dropped has no response until its monitor fires or the
+caller stops waiting.
+
+## Monitor
+
+`gen_server:send_request/2` monitors the callee, and the request id is the
+reference of the monitor. This function does the same:
+
+| Caller and callee | Monitor |
+|---|---|
+| On two simulated nodes | A simulated monitor. See `monitor/2`. `partition/3`, `kill_node/2` and `disconnect_node/1` fire it with `noconnection`, and the exit of the callee fires it with the exit reason. |
+| On one simulated node, or not placed | A VM monitor. |
+
+A request to a callee that has already exited, or to a name that no process
+holds, is answered at once with `noproc`. A request across a link that is down
+is answered at once with `noconnection`. No request is sent in these cases.
+
+## Responses
+
+The response functions return what the `gen_server` functions return:
+
+| Result | Condition |
+|---|---|
+| `{reply, Reply}` | The reply arrived. |
+| `{error, {Reason, ServerRef}}` | The monitor fired. `Reason` is the exit reason of the callee, `noproc` or `noconnection`. |
+| `timeout` | `wait_response/2` or `receive_response/2` waited for the time-out. |
+| `no_reply` | The message that `check_response/2` received is not a response to the request. |
+
+The time-out of `wait_response/2` and `receive_response/2` is virtual under the
+rule of `call/3`. `receive_response/2` abandons the request when the time-out
+passes, as `gen_server:receive_response/2` does.
+
+A reply to a request that the caller has abandoned, or whose monitor has fired,
+is discarded if the callee sends it after that. A reply that the network was
+delaying at that time is delivered to the caller as an ordinary message.
+
+## Limitations
+
+- The reply is sent to the pid of the caller and not to an alias. The request id
+  is therefore not an alias, and `erlang:unalias/1` on it has no effect.
+- A destination that this module cannot resolve to a local process or to a name
+  on a simulated node, such as `{global, Name}` or `{via, Module, Name}`, is
+  passed to `gen_server:send_request/2`. That request is not routed.
+""".
+-endif.
+%% `[alias | Ref]` is the tag shape of `gen:send_request/3`, which the response
+%% functions of `gen_server` also match. It is an improper list on purpose.
+-dialyzer({no_improper_lists, [request/2, abandon/1, response_msg/3]}).
+-spec send_request(dest() | term(), term()) -> reference().
+send_request(Dest, Req) ->
+    case running() of
+        true -> request(Dest, Req);
+        false -> gen_server:send_request(Dest, Req)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`gen_server:send_request/4` and `gen_statem:send_request/4`: sends the request
+and adds its request id to the collection `Collection` with the label `Label`.
+See `send_request/2`.
+""".
+-endif.
+-spec send_request(dest() | term(), term(), term(), gen_server:request_id_collection()) ->
+    gen_server:request_id_collection().
+send_request(Dest, Req, Label, Collection) ->
+    case running() of
+        true -> gen_server:reqids_add(request(Dest, Req), Label, Collection);
+        false -> gen_server:send_request(Dest, Req, Label, Collection)
+    end.
+
+request(Dest, Req) ->
+    Watcher = self(),
+    case normalize(Dest) of
+        To when is_pid(To) ->
+            case request_monitor(Watcher, To) of
+                {established, Ref} ->
+                    Tag = [alias | Ref],
+                    %% Before the request goes out, as in `do_call/4'.
+                    true = ets:insert(?CALLS, {Tag, outstanding}),
+                    _ = route(Watcher, To, {'$gen_call', {Watcher, Tag}, Req}, tag(Req)),
+                    Ref;
+                {fired, Ref} ->
+                    Ref
+            end;
+        _ ->
+            case is_atom(Dest) orelse on_simulated_node(Dest) of
+                true ->
+                    %% No process holds the name. `gen_server:send_request/2'
+                    %% answers this with a `noproc' from the VM monitor.
+                    down_now(Watcher, object(Dest), noproc);
+                false ->
+                    gen_server:send_request(Dest, Req)
+            end
+    end.
+
+%% The monitor of a request. `fired' means that the `DOWN' message is already
+%% in the mailbox of the caller, and that no request must be sent.
+request_monitor(Watcher, To) ->
+    case simulated_pair(Watcher, To) of
+        true ->
+            Ref = simulate_monitor(Watcher, To, To, []),
+            case ets:member(?MONS, Ref) of
+                true -> {established, Ref};
+                false -> {fired, Ref}
+            end;
+        false ->
+            %% The VM is not asked about a callee that has exited. See
+            %% `do_call/4'.
+            case target_dead(To) of
+                true -> {fired, down_now(Watcher, To, noproc)};
+                false -> {established, erlang:monitor(process, To)}
+            end
+    end.
+
+down_now(Watcher, Object, Reason) ->
+    Ref = make_ref(),
+    _ = erlang:send(Watcher, {'DOWN', Ref, process, Object, Reason}),
+    Ref.
+
+-if(?DOCATTRS).
+-doc "`gen_statem:wait_response/1`. See `send_request/2`.".
+-endif.
+-spec wait_response(reference()) -> {reply, term()} | {error, {term(), term()}}.
+wait_response(ReqId) ->
+    wait_response(ReqId, infinity).
+
+-if(?DOCATTRS).
+-doc """
+`gen_server:wait_response/2` and `gen_statem:wait_response/2`. The request
+stays outstanding after a time-out. See `send_request/2`.
+""".
+-endif.
+-spec wait_response(reference(), response_timeout()) ->
+    {reply, term()} | {error, {term(), term()}} | timeout.
+wait_response(ReqId, Timeout) ->
+    case running() of
+        true -> await_response(ReqId, Timeout, keep);
+        false -> gen_server:wait_response(ReqId, Timeout)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`gen_server:wait_response/3` and `gen_statem:wait_response/3`, for a collection
+of request ids. See `send_request/2`.
+""".
+-endif.
+-spec wait_response(gen_server:request_id_collection(), response_timeout(), boolean()) ->
+    {{reply, term()} | {error, {term(), term()}}, term(), gen_server:request_id_collection()}
+    | no_request
+    | timeout.
+wait_response(Collection, Timeout, Delete) ->
+    case running() of
+        true -> await_response(Collection, Timeout, Delete, keep);
+        false -> gen_server:wait_response(Collection, Timeout, Delete)
+    end.
+
+-if(?DOCATTRS).
+-doc "`gen_statem:receive_response/1`. See `send_request/2`.".
+-endif.
+-spec receive_response(reference()) -> {reply, term()} | {error, {term(), term()}}.
+receive_response(ReqId) ->
+    receive_response(ReqId, infinity).
+
+-if(?DOCATTRS).
+-doc """
+`gen_server:receive_response/2` and `gen_statem:receive_response/2`. The
+request is abandoned after a time-out. See `send_request/2`.
+""".
+-endif.
+-spec receive_response(reference(), response_timeout()) ->
+    {reply, term()} | {error, {term(), term()}} | timeout.
+receive_response(ReqId, Timeout) ->
+    case running() of
+        true -> await_response(ReqId, Timeout, abandon);
+        false -> gen_server:receive_response(ReqId, Timeout)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`gen_server:receive_response/3` and `gen_statem:receive_response/3`, for a
+collection of request ids. Every request of the collection is abandoned after a
+time-out. See `send_request/2`.
+""".
+-endif.
+-spec receive_response(gen_server:request_id_collection(), response_timeout(), boolean()) ->
+    {{reply, term()} | {error, {term(), term()}}, term(), gen_server:request_id_collection()}
+    | no_request
+    | timeout.
+receive_response(Collection, Timeout, Delete) ->
+    case running() of
+        true -> await_response(Collection, Timeout, Delete, abandon);
+        false -> gen_server:receive_response(Collection, Timeout, Delete)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`gen_server:check_response/2` and `gen_statem:check_response/2`: whether the
+message `Msg` is the response to the request `ReqId`. See `send_request/2`.
+""".
+-endif.
+-spec check_response(term(), reference()) ->
+    {reply, term()} | {error, {term(), term()}} | no_reply.
+check_response(Msg, ReqId) ->
+    case running() of
+        true ->
+            case response_msg(Msg, ReqId, single) of
+                {ReqId, Response} -> Response;
+                no_reply -> no_reply
+            end;
+        false ->
+            gen_server:check_response(Msg, ReqId)
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`gen_server:check_response/3` and `gen_statem:check_response/3`, for a
+collection of request ids. See `send_request/2`.
+""".
+-endif.
+-spec check_response(term(), gen_server:request_id_collection(), boolean()) ->
+    {{reply, term()} | {error, {term(), term()}}, term(), gen_server:request_id_collection()}
+    | no_request
+    | no_reply.
+check_response(Msg, Collection, Delete) ->
+    case running() of
+        true ->
+            case map_size(Collection) of
+                0 ->
+                    no_request;
+                _ ->
+                    case response_msg(Msg, Collection, collection) of
+                        {ReqId, Response} -> labelled(Response, ReqId, Collection, Delete);
+                        no_reply -> no_reply
+                    end
+            end;
+        false ->
+            gen_server:check_response(Msg, Collection, Delete)
+    end.
+
+%% A request id collection is a map from the request id to the label. The type
+%% is opaque in `gen_server'. This module reads the map, as it copies the tag
+%% shape of `gen', because a response must be matched against the collection in
+%% the guard of a `receive'.
+labelled(Response, ReqId, Collection, Delete) ->
+    Label = maps:get(ReqId, Collection),
+    case Delete of
+        true -> {Response, Label, maps:remove(ReqId, Collection)};
+        false -> {Response, Label, Collection}
+    end.
+
+%% Whether `Msg' is the response to the request `Ids', or to one request of the
+%% collection `Ids'. The answer has the request id, and the request is settled.
+response_msg({[alias | Ref], Reply}, Ids, Kind) when is_reference(Ref) ->
+    case is_request(Ref, Ids, Kind) of
+        true ->
+            %% The monitor has done its work. A `DOWN' message that is already
+            %% in the mailbox is removed.
+            _ = demonitor(Ref, [flush]),
+            {Ref, {reply, Reply}};
+        false ->
+            no_reply
+    end;
+response_msg({'DOWN', Ref, _Type, Object, Reason}, Ids, Kind) when is_reference(Ref) ->
+    case is_request(Ref, Ids, Kind) of
+        true ->
+            ok = abandon(Ref),
+            {Ref, {error, {Reason, Object}}};
+        false ->
+            no_reply
+    end;
+response_msg(_Msg, _Ids, _Kind) ->
+    no_reply.
+
+is_request(Ref, ReqId, single) -> Ref =:= ReqId;
+is_request(Ref, Collection, collection) -> is_map_key(Ref, Collection).
+
+%% The caller no longer waits for the reply to this request. `reply/2' discards
+%% a reply that the callee sends from now on.
+abandon(Ref) ->
+    _ = demonitor(Ref, [flush]),
+    true = ets:insert(?CALLS, {[alias | Ref], abandoned}),
+    ok.
+
+%% A time-out of `gen_server:wait_response/2': a number of milliseconds,
+%% `infinity', or an absolute time of `erlang:monotonic_time(millisecond)'.
+-type response_timeout() :: timeout() | {abs, integer()}.
+
+relative_timeout({abs, At}) ->
+    max(0, At - eta_time:monotonic_time(millisecond));
+relative_timeout(Timeout) ->
+    Timeout.
+
+%% The wait of `wait/3', for one request.
+await_response(ReqId, Timeout0, OnTimeout) when is_reference(ReqId) ->
+    {TRef, Guard, Real} = arm(relative_timeout(Timeout0)),
+    receive
+        {[alias | Ref], _} = Msg when Ref =:= ReqId ->
+            ok = eta_time:disarm_after(TRef, Guard),
+            {ReqId, Response} = response_msg(Msg, ReqId, single),
+            Response;
+        {'DOWN', Ref, _, _, _} = Msg when Ref =:= ReqId ->
+            ok = eta_time:disarm_after(TRef, Guard),
+            {ReqId, Response} = response_msg(Msg, ReqId, single),
+            Response;
+        {'$eta_after', G} when G =:= Guard ->
+            timed_out([ReqId], OnTimeout)
+    after Real ->
+        timed_out([ReqId], OnTimeout)
+    end.
+
+%% The same wait, for any request of a collection.
+await_response(Collection, _Timeout, _Delete, _OnTimeout) when map_size(Collection) =:= 0 ->
+    no_request;
+await_response(Collection, Timeout0, Delete, OnTimeout) ->
+    {TRef, Guard, Real} = arm(relative_timeout(Timeout0)),
+    receive
+        {[alias | Ref], _} = Msg when is_map_key(Ref, Collection) ->
+            ok = eta_time:disarm_after(TRef, Guard),
+            {ReqId, Response} = response_msg(Msg, Collection, collection),
+            labelled(Response, ReqId, Collection, Delete);
+        {'DOWN', Ref, _, _, _} = Msg when is_map_key(Ref, Collection) ->
+            ok = eta_time:disarm_after(TRef, Guard),
+            {ReqId, Response} = response_msg(Msg, Collection, collection),
+            labelled(Response, ReqId, Collection, Delete);
+        {'$eta_after', G} when G =:= Guard ->
+            timed_out(maps:keys(Collection), OnTimeout)
+    after Real ->
+        timed_out(maps:keys(Collection), OnTimeout)
+    end.
+
+%% The deadline of a wait, on the virtual clock when the clock will reach it.
+%% See `wait/3'.
+arm(Timeout) ->
+    Guard = make_ref(),
+    case virtual_timeout() of
+        true -> {eta_time:arm_after(Timeout, Guard), Guard, infinity};
+        false -> {undefined, Guard, Timeout}
+    end.
+
+timed_out(_ReqIds, keep) ->
+    timeout;
+timed_out(ReqIds, abandon) ->
+    lists:foreach(fun abandon/1, ReqIds),
+    timeout.
+
+-if(?DOCATTRS).
+-doc """
 Routes the replies in the return value of a `gen_statem` state callback through
 the network.
 
@@ -1105,7 +1498,7 @@ statem_actions(Other) ->
 The target of the messaging functions that this module does not implement.
 
 `eta_transform` points these functions here: broadcasts, multi-node calls, the
-asynchronous request and response interface, and the `gen_event` client API. The
+synchronous events of `gen_fsm`, and the `gen_event` client API. The
 list is `?NET_UNSUPPORTED` in `eta_transform`.
 
 - With no network running, the function calls the original function with `Args`.
@@ -2825,6 +3218,20 @@ notify_exit(Pid, Reason) ->
             ok
     end.
 
+-if(?DOCATTRS).
+-doc false.
+-endif.
+%% Whether this module has recorded the exit of `Pid`, through `notify_exit/2`
+%% or `kill_node/2`. For `eta_sched:is_alive/1`. `false` when no network is
+%% running.
+-spec exited(pid()) -> boolean().
+exited(Pid) ->
+    try
+        ets:member(?DEAD, Pid)
+    catch
+        error:badarg -> false
+    end.
+
 %% Every simulated monitor whose target is `Pid`, oldest first. Ordered for the
 %% same reason `on_node/1` is: a fan-out whose order came from the table is a
 %% fan-out that differs between runs of one seed.
@@ -3359,6 +3766,7 @@ forget_monitors(Dying) ->
 %% `kill` is untrappable and reaches a suspended process, so this terminates. The
 %% bound is there to fail loudly rather than hang a suite if it ever does not.
 kill_all(Dying) ->
+    Expected = vm_monitor_downs(Dying),
     Mons = [{P, erlang:monitor(process, P)} || P <- Dying],
     lists:foreach(
         fun(P) ->
@@ -3375,7 +3783,70 @@ kill_all(Dying) ->
         Dying
     ),
     lists:foreach(fun await_death/1, Mons),
+    lists:foreach(fun await_vm_down/1, Expected),
     ok.
+
+%% The `DOWN' messages that VM monitors on the dying processes will deliver to
+%% suspended survivors: `{Watcher, QueueLengthAfterDelivery}'.
+%%
+%% A simulated monitor is fired by `sever_from/1' before the kill, at a point
+%% in the schedule. A VM monitor is fired by the VM while it removes the dead
+%% process, and the harness's own `DOWN' in `await_death/1' can arrive before
+%% the VM has sent the others. A watcher on the same node as its target has a
+%% VM monitor, and so does a watcher that is not placed, such as a registry
+%% that every node uses. `eta_sched' reads the queue length of each process at
+%% its next choice. If the `DOWN' arrives after that read, the choice depends on
+%% real time, and the seed stops reproducing its schedule.
+%%
+%% Only a suspended watcher is counted. Its queue cannot shrink, so the queue
+%% reaches the expected length exactly when every `DOWN' has arrived. A watcher
+%% that runs, such as the driver, takes messages out of its queue and gives no
+%% such bound.
+vm_monitor_downs(Dying) ->
+    D = sets:from_list(Dying),
+    Counts = lists:foldl(
+        fun(W, Acc) -> maps:update_with(W, fun(N) -> N + 1 end, 1, Acc) end,
+        #{},
+        [
+            W
+         || P <- Dying,
+            {monitored_by, Ws} <- [erlang:process_info(P, monitored_by)],
+            W <- Ws,
+            is_pid(W),
+            not sets:is_element(W, D)
+        ]
+    ),
+    [
+        {W, Length + N}
+     || {W, N} <- lists:sort(maps:to_list(Counts)),
+        [{status, suspended}, {message_queue_len, Length}] <-
+            [erlang:process_info(W, [status, message_queue_len])]
+    ].
+
+await_vm_down({Watcher, Length}) ->
+    await_vm_down(Watcher, Length, erlang:monotonic_time(millisecond) + 5000).
+
+await_vm_down(Watcher, Length, Deadline) ->
+    case erlang:process_info(Watcher, message_queue_len) of
+        undefined ->
+            ok;
+        {message_queue_len, N} when N >= Length ->
+            ok;
+        {message_queue_len, N} ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true ->
+                    error(
+                        {eta_net,
+                            {down_timeout, Watcher, {N, Length}, <<
+                                "a suspended process that monitors a killed process "
+                                "did not receive its DOWN message within 5s"
+                            >>}}
+                    );
+                false ->
+                    erlang:yield(),
+                    await_vm_down(Watcher, Length, Deadline)
+            end
+    end.
 
 await_death({Pid, Mon}) ->
     receive
@@ -3719,6 +4190,17 @@ draw() ->
 %% outstanding, is sent directly, so a perfect network behaves exactly as no
 %% network does.
 schedule(From, Dest, Msg, Tag, Delay) ->
+    %% A delayed message to a process that has already exited arms no timer.
+    %% The message would reach nobody, and `eta_time` would count its deadline
+    %% as a stray timer: a deadline that can make no process runnable. A reply
+    %% to a caller that was killed is such a message. `eta_time:forget/1`
+    %% removes the timers of a process that exits after the message was sent.
+    case ets:member(?DEAD, Dest) of
+        true -> Msg;
+        false -> schedule_live(From, Dest, Msg, Tag, Delay)
+    end.
+
+schedule_live(From, Dest, Msg, Tag, Delay) ->
     Now = now_ms(),
     {Last0, Pending} = channel(From, Dest, Now),
     Link = link_key(From, Dest),
