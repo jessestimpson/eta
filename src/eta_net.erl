@@ -1149,11 +1149,11 @@ and adds its request id to the collection `Collection` with the label `Label`.
 See `send_request/2`.
 """.
 -endif.
--spec send_request(dest() | term(), term(), term(), gen_server:request_id_collection()) ->
-    gen_server:request_id_collection().
+-spec send_request(dest() | term(), term(), term(), request_ids()) ->
+    request_ids().
 send_request(Dest, Req, Label, Collection) ->
     case running() of
-        true -> gen_server:reqids_add(request(Dest, Req), Label, Collection);
+        true -> Collection#{request(Dest, Req) => Label};
         false -> gen_server:send_request(Dest, Req, Label, Collection)
     end.
 
@@ -1233,8 +1233,8 @@ wait_response(ReqId, Timeout) ->
 of request ids. See `send_request/2`.
 """.
 -endif.
--spec wait_response(gen_server:request_id_collection(), response_timeout(), boolean()) ->
-    {{reply, term()} | {error, {term(), term()}}, term(), gen_server:request_id_collection()}
+-spec wait_response(request_ids(), response_timeout(), boolean()) ->
+    {{reply, term()} | {error, {term(), term()}}, term(), request_ids()}
     | no_request
     | timeout.
 wait_response(Collection, Timeout, Delete) ->
@@ -1271,8 +1271,8 @@ collection of request ids. Every request of the collection is abandoned after a
 time-out. See `send_request/2`.
 """.
 -endif.
--spec receive_response(gen_server:request_id_collection(), response_timeout(), boolean()) ->
-    {{reply, term()} | {error, {term(), term()}}, term(), gen_server:request_id_collection()}
+-spec receive_response(request_ids(), response_timeout(), boolean()) ->
+    {{reply, term()} | {error, {term(), term()}}, term(), request_ids()}
     | no_request
     | timeout.
 receive_response(Collection, Timeout, Delete) ->
@@ -1306,8 +1306,8 @@ check_response(Msg, ReqId) ->
 collection of request ids. See `send_request/2`.
 """.
 -endif.
--spec check_response(term(), gen_server:request_id_collection(), boolean()) ->
-    {{reply, term()} | {error, {term(), term()}}, term(), gen_server:request_id_collection()}
+-spec check_response(term(), request_ids(), boolean()) ->
+    {{reply, term()} | {error, {term(), term()}}, term(), request_ids()}
     | no_request
     | no_reply.
 check_response(Msg, Collection, Delete) ->
@@ -1369,6 +1369,12 @@ abandon(Ref) ->
     _ = demonitor(Ref, [flush]),
     true = ets:insert(?CALLS, {[alias | Ref], abandoned}),
     ok.
+
+%% A request id collection of `gen_server'. That type is opaque, and is a map
+%% from the request id to the label. This module reads and builds the map,
+%% because a response must be matched against the collection in the guard of a
+%% `receive'. The specs therefore name the map and not the opaque type.
+-type request_ids() :: #{reference() => term()}.
 
 %% A time-out of `gen_server:wait_response/2': a number of milliseconds,
 %% `infinity', or an absolute time of `erlang:monotonic_time(millisecond)'.
