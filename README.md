@@ -114,6 +114,21 @@ When a run fails, shrink it:
 
 The seed produces the same trace each time, and the shrink reduces the size of that trace.
 
+### Prompting an LLM
+
+Modern LLMs are effective at building the DST harness and interpretting the results. An initial prompt like the one below has been shown to yield high quality findings for projects that are conducive to deterministic testing, such as implementations of Raft distributed consensus. All findings should be independently confirmed.
+
+```
+Using deterministic simulation testing library eta in path
+../eta, create a comprehensive DST suite for this project,
+where applicable. Start simple and progress to more intense
+fault injection scenarios. Stop when you find a verifiable
+bug. Minimal changes to the project and to the eta project
+are desirable, but if workarounds increase dramatically in
+complexity, then stop and propose changes to one or the
+other. Put findings in dst/FINDINGS.md
+```
+
 ## Examples
 
 `eta` includes some simple distributed systems in order to illustrate DST:
