@@ -274,6 +274,9 @@ A step ends in a time-out under one of these conditions:
 %% `erlang:is_process_alive/1` for a system under simulation. See `is_alive/1`.
 -export([is_alive/1]).
 
+%% Yield points. See `yield/0` and `timeout_return/1`.
+-export([yield/0, timeout_return/1]).
+
 %% The distributed forms. Between simulated nodes they spawn on the named node;
 %% anywhere else they raise while a run is active. See `dist/5`.
 -export([
@@ -385,6 +388,9 @@ A step ends in a time-out under one of these conditions:
 %% What releases a gated child once the scheduler owns it.
 -define(GO, '$eta_sched_go').
 
+%% What resumes a process that yielded. See `yield/0`.
+-define(YIELD_GO, '$eta_sched_yield_go').
+
 %% A plain integer for a process the scheduler named itself, counting in adoption
 %% order. `{fresh, N}` for one adopted during a *pinned* replay that its trace did
 %% not account for — a separate space, so that a process the trace never named can
@@ -426,6 +432,9 @@ A step ends in a time-out under one of these conditions:
     %% Children spawned through `spawn/1` and friends, which start blocked. Tracked
     %% so `release/1` can let go of any that never got their token.
     gated = #{} :: #{pid() => true},
+    %% Processes blocked in `yield/0`. A yielded process is runnable, and the
+    %% step that resumes it sends it ?YIELD_GO. See `yield/0`.
+    yielded = #{} :: #{id() => true},
     %% Id assignment when a trace is driving. `supply` is what the entry now
     %% executing is expected to create, `adopted` is what it actually created, and
     %% `pinning` says which well an unexpected adoption draws from. See `pin/2`.
@@ -1194,10 +1203,11 @@ The result is an OTP process. `sys:get_state/1`, `sys:get_status/1` and
 | `{ok, State, {continue, C}}` | The server starts and runs `handle_continue/2`. A continue that returns another continue is followed, which `gen_server:enter_loop/3` does not do. |
 | `{ok, State, hibernate}` | The server starts. The hibernation request is dropped. |
 | `{ok, State, infinity}` | The server starts. |
+| `{ok, State, 0}` | The server starts, yields (see `yield/0`), and enters its loop with a time-out of 0, which delivers `timeout` when the mailbox is empty. |
 | `{ok, State, {timeout, Time, {hibernate, Tag}}}` from `supervisor` | The server starts. The hibernation request of the OTP 28 `supervisor` is dropped. |
 | `{stop, Reason}` | The start returns `{error, Reason}`. |
 | `ignore` | The start returns `ignore`. |
-| Any other value, including `{ok, State, Timeout}` | The start returns `{error, {eta_sched, unsupported_init, Return}}`, and the child exits with the same reason. |
+| Any other value, including `{ok, State, Timeout}` with `Timeout` above 0 | The start returns `{error, {eta_sched, unsupported_init, Return}}`, and the child exits with the same reason. |
 
 An unsupported return is refused because this function replaces a start path.
 Handling a return incorrectly without a report would be a worse defect than a
@@ -1522,6 +1532,14 @@ gated_init(Parent, Name, Mod, Args) ->
         {ok, State, {continue, C}} ->
             Parent ! {'$eta_started', self(), {ok, self()}},
             gated_continue(Mod, Name, C, State);
+        %% A time-out of 0 reads no clock. `gen_server` delivers `timeout` when
+        %% the mailbox is empty. The server yields first, so the scheduler decides
+        %% what runs before the server continues, and a message that arrives in
+        %% the meantime is handled before `timeout`, as in OTP. See `yield/0`.
+        {ok, State, 0} ->
+            Parent ! {'$eta_started', self(), {ok, self()}},
+            ok = yield(),
+            enter_loop(Mod, Name, State, 0);
         {stop, Reason} ->
             Parent ! {'$eta_started', self(), {error, Reason}},
             exit(Reason);
@@ -1540,6 +1558,9 @@ gated_init(Parent, Name, Mod, Args) ->
 %% answer calls addressed to the name.
 enter_loop(Mod, undefined, State) -> gen_server:enter_loop(Mod, [], State);
 enter_loop(Mod, Name, State) -> gen_server:enter_loop(Mod, [], State, Name).
+
+enter_loop(Mod, undefined, State, Timeout) -> gen_server:enter_loop(Mod, [], State, Timeout);
+enter_loop(Mod, Name, State, Timeout) -> gen_server:enter_loop(Mod, [], State, Name, Timeout).
 
 %% `gen_server` runs handle_continue after the init acknowledgement and before any
 %% message, and a continue may chain into another. `enter_loop/3` takes a state,
@@ -2251,7 +2272,17 @@ mint(St = #st{pinning = false, next_id = Id}) ->
 mint(St = #st{pinning = true, fresh = N}) ->
     {{fresh, N}, St#st{fresh = N + 1}}.
 
-do_release(St = #st{procs = Procs, gated = Gated}) ->
+do_release(St = #st{procs = Procs, gated = Gated, yielded = Yielded}) ->
+    %% A process still blocked in `yield/0` would wait forever otherwise.
+    maps:foreach(
+        fun(Id, true) ->
+            case maps:find(Id, Procs) of
+                {ok, Pid} -> catch Pid ! ?YIELD_GO;
+                error -> ok
+            end
+        end,
+        Yielded
+    ),
     %% Anything still waiting for its token would block forever otherwise.
     %% Only those, though: `gated` holds every child that was ever sent a
     %% token, and a second one to a child that already has, or had, its first
@@ -2288,7 +2319,7 @@ do_release(St = #st{procs = Procs, gated = Gated}) ->
         end,
         Procs
     ),
-    St#st{procs = #{}, ids = #{}, live = #{}, gated = #{}}.
+    St#st{procs = #{}, ids = #{}, live = #{}, gated = #{}, yielded = #{}}.
 
 %% ---------------------------------------------------------------------------
 %% Stepping
@@ -2311,15 +2342,23 @@ runnable_ids(St = #st{live = Live}) ->
 %% is gone, and 0 is never greater than a `blocked_at`, so a dead process is not
 %% runnable. A separate `status` read here doubled the cost of the scan, and the
 %% scan was the largest cost of a long run.
+%%
+%% A process that yielded is runnable while it is alive. Only a yielded process
+%% pays for the liveness read.
 -spec is_runnable(#st{}, id(), pid()) -> boolean().
-is_runnable(#st{exited = Exited, blocked_at = Blocked}, Id, Pid) ->
+is_runnable(#st{exited = Exited, blocked_at = Blocked, yielded = Yielded}, Id, Pid) ->
     %% Default 0: an empty mailbox is nothing to do. Stepping such a process is
     %% harmless but wastes a choice and pollutes the schedule.
-    not maps:is_key(Id, Exited) andalso queue_len(Pid) > maps:get(Id, Blocked, 0).
+    not maps:is_key(Id, Exited) andalso
+        ((maps:is_key(Id, Yielded) andalso erlang:is_process_alive(Pid)) orelse
+            queue_len(Pid) > maps:get(Id, Blocked, 0)).
 
 -spec do_step(#st{}, id()) -> {outcome(), #st{}}.
-do_step(St0 = #st{procs = Procs}, Id) ->
+do_step(St00 = #st{procs = Procs}, Id) ->
     Pid = maps:get(Id, Procs),
+    %% A process that yielded is resumed with its token. The token is sent before
+    %% the queue is read, so the step counts it as a consumed message.
+    St0 = resume_yielded(St00, Id, Pid),
     QueueBefore = queue_len(Pid),
     %% Published for the duration of the step, and erased after it. While a step
     %% is in progress this is the *only* process that is supposed to be running,
@@ -2352,10 +2391,11 @@ do_step(St0 = #st{procs = Procs}, Id) ->
     %% fixes.
     case hold(Pid) of
         false ->
+            _ = ets:take(?ACTIVE, {yielded, Pid}),
             {_SelfSends, _Late, StDead} = drain_trace(St2, Pid),
             {exited, mark_exited(StDead, Id)};
         true ->
-            {SelfSends, Late, St3} = drain_trace(St2, Pid),
+            {SelfSends, Late, St3} = drain_trace(note_yield(St2, Id, Pid), Pid),
             {QueueAfter, St3a} = queue_at_block(St3, Pid, Late),
             Consumed = QueueBefore + SelfSends - QueueAfter,
             St4 = note_quiescence(St3a, Id, Pid, Quiescence, QueueAfter),
@@ -2365,6 +2405,23 @@ do_step(St0 = #st{procs = Procs}, Id) ->
                     false -> no_progress
                 end,
             {Outcome, St4}
+    end.
+
+%% Moves a process that ended its step in `yield/0` into `yielded`. The process
+%% wrote the mark itself, before it blocked.
+note_yield(St = #st{yielded = Yielded}, Id, Pid) ->
+    case ets:take(?ACTIVE, {yielded, Pid}) of
+        [] -> St;
+        [_] -> St#st{yielded = Yielded#{Id => true}}
+    end.
+
+resume_yielded(St = #st{yielded = Yielded}, Id, Pid) ->
+    case maps:is_key(Id, Yielded) of
+        true ->
+            Pid ! ?YIELD_GO,
+            St#st{yielded = maps:remove(Id, Yielded)};
+        false ->
+            St
     end.
 
 %% The length the process's queue had when the process blocked.
@@ -2900,3 +2957,68 @@ safe_untrace(Pid) ->
     catch
         _:_ -> ok
     end.
+
+%% ---------------------------------------------------------------------------
+%% Yield points
+%% ---------------------------------------------------------------------------
+
+-if(?DOCATTRS).
+-doc """
+Ends the step of the calling process, and makes the process runnable.
+
+A step ends when the process blocks in a `receive`. A process that has more
+work and no message to wait for never blocks, so no other process can run until
+the work is done. On the BEAM, preemption lets other processes run in between.
+`yield/0` gives the scheduler that choice point: the process blocks on a token
+that only the scheduler sends, and the scheduler treats it as runnable. When the
+seed chooses the process, the step sends the token and the process continues.
+Other processes may run first, and messages that they send are in the mailbox of
+the process when it continues.
+
+The process writes a mark into the table of the scheduler before it blocks.
+The step that ends reads the mark. A replay follows the same rule, so a trace
+that contains a yield replays exactly.
+
+Returns `ok`. Outside a step of the calling process, for example with no
+scheduler running, `yield/0` returns at once.
+""".
+-endif.
+-spec yield() -> ok.
+yield() ->
+    Self = self(),
+    case stepping() of
+        Self ->
+            true = ets:insert(?ACTIVE, {{yielded, Self}}),
+            receive
+                ?YIELD_GO -> ok
+            end;
+        _ ->
+            ok
+    end.
+
+-if(?DOCATTRS).
+-doc """
+The return value of a `gen_server` callback, after a yield if the value carries
+a time-out of 0.
+
+`eta_transform` passes the value of `handle_call/3`, `handle_cast/2`,
+`handle_info/2` and `handle_continue/2` of a `gen_server` through this function.
+`{noreply, State, 0}` makes `gen_server` deliver `timeout` as soon as the
+mailbox is empty. Without a yield, a server that returns a time-out of 0 again
+from its `timeout` callback runs in one step until it blocks, and no other
+process can run in between. The function yields (see `yield/0`) and then returns
+the value unchanged, so `gen_server` still handles a message that arrived during
+the yield before `timeout`.
+
+`{reply, Reply, State, 0}` is returned unchanged without a yield: the reply is
+sent by `gen_server` after the callback returns, and a yield would delay it. In
+a module with the network pass, the reply pass of `eta_transform` sends the
+reply first and turns the value into `{noreply, State, 0}`, which yields.
+""".
+-endif.
+-spec timeout_return(term()) -> term().
+timeout_return({noreply, _State, 0} = Return) ->
+    ok = yield(),
+    Return;
+timeout_return(Return) ->
+    Return.
