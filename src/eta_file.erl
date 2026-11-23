@@ -19,7 +19,8 @@ Inert in the sense that matters: with no run, the result is still what `file`
 would return.
 
 While a simulated disk is running, `write_file/2,3`, `delete/1` and `rename/2`
-go through `eta_disk`, so a crash can lose what they did.
+go through `eta_disk`, so a crash can lose what they did. `prim_file:write_file/2`
+is pointed at `write_file/2` for the same reason.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -42,7 +43,11 @@ go through `eta_disk`, so a crash can lose what they did.
     ensure_dir/1,
     is_file/1,
     is_dir/1,
-    is_regular/1
+    is_regular/1,
+    ensure_path/1,
+    del_dir_r/1,
+    consult/1,
+    safe_relative_path/2
 ]).
 
 -include_lib("kernel/include/file.hrl").
@@ -179,4 +184,132 @@ is_regular(Name) ->
     case prim_file:read_file_info(Name) of
         {ok, #file_info{type = regular}} -> true;
         _ -> false
+    end.
+
+-if(?DOCATTRS).
+-doc "`filelib:ensure_path/1`, in the calling process.".
+-endif.
+ensure_path(Path) ->
+    case is_dir(Path) of
+        true ->
+            ok;
+        false ->
+            case ensure_dir(Path) of
+                ok ->
+                    case prim_file:make_dir(Path) of
+                        ok -> ok;
+                        {error, eexist} -> ok;
+                        Error -> Error
+                    end;
+                Error ->
+                    Error
+            end
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`file:del_dir_r/1`, in the calling process. A file is deleted with `delete/1`, so
+a running simulated disk records the deletion.
+""".
+-endif.
+del_dir_r(Name) ->
+    case prim_file:read_link_info(Name) of
+        {ok, #file_info{type = directory}} ->
+            case prim_file:list_dir(Name) of
+                {ok, Entries} ->
+                    Results = [del_dir_r(filename:join(Name, E)) || E <- lists:sort(Entries)],
+                    case [E || {error, _} = E <- Results] of
+                        [] -> prim_file:del_dir(Name);
+                        [Error | _] -> Error
+                    end;
+                Error ->
+                    Error
+            end;
+        {ok, _} ->
+            delete(Name);
+        Error ->
+            Error
+    end.
+
+-if(?DOCATTRS).
+-doc "`file:consult/1`, in the calling process.".
+-endif.
+consult(Name) ->
+    case prim_file:read_file(Name) of
+        {ok, Bin} ->
+            case unicode:characters_to_list(Bin) of
+                Chars when is_list(Chars) -> parse_terms(Chars, 1, []);
+                _ -> {error, {1, file_io_server, invalid_unicode}}
+            end;
+        Error ->
+            Error
+    end.
+
+parse_terms(Chars, Line, Acc) ->
+    case erl_scan:tokens([], Chars, Line) of
+        {done, {ok, Tokens, End}, Rest} ->
+            case erl_parse:parse_term(Tokens) of
+                {ok, Term} -> parse_terms(Rest, End, [Term | Acc]);
+                {error, Info} -> {error, Info}
+            end;
+        {done, {eof, _}, _} ->
+            {ok, lists:reverse(Acc)};
+        {done, {error, Info, _}, _} ->
+            {error, Info};
+        {more, _} ->
+            case string:trim(Chars) of
+                "" -> {ok, lists:reverse(Acc)};
+                _ -> {error, {Line, erl_parse, ["syntax error before: ", "end_of_file"]}}
+            end
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`filelib:safe_relative_path/2`, in the calling process. OTP resolves each
+symbolic link with `file:read_link/1`, which is a call to `file_server`. This
+function is a copy of the OTP implementation that calls `prim_file:read_link/1`
+instead.
+""".
+-endif.
+safe_relative_path(Path, "") ->
+    safe_relative_path(Path, ".");
+safe_relative_path(Path, Cwd) ->
+    srp_path(filename:split(Path), Cwd, sets:new(), []).
+
+srp_path([], _Cwd, _Seen, []) ->
+    "";
+srp_path([], _Cwd, _Seen, Acc) ->
+    filename:join(Acc);
+srp_path([Dot | Segs], Cwd, Seen, Acc) when Dot =:= "."; Dot =:= <<".">> ->
+    srp_path(Segs, Cwd, Seen, Acc);
+srp_path([DotDot | _Segs], _Cwd, _Seen, []) when DotDot =:= ".."; DotDot =:= <<"..">> ->
+    unsafe;
+srp_path([DotDot | Segs], Cwd, Seen, [_ | _] = Acc) when DotDot =:= ".."; DotDot =:= <<"..">> ->
+    srp_path(Segs, Cwd, Seen, lists:droplast(Acc));
+srp_path([clear | Segs], Cwd, _Seen, Acc) ->
+    srp_path(Segs, Cwd, sets:new(), Acc);
+srp_path([Seg | _] = Segs, Cwd, Seen, Acc) ->
+    case filename:pathtype(Seg) of
+        relative -> srp_segment(Segs, Cwd, Seen, Acc);
+        _ -> unsafe
+    end.
+
+srp_segment([Seg | Segs], Cwd, Seen, Acc) ->
+    Path = filename:join([Cwd | Acc]),
+    case prim_file:read_link(filename:join(Path, Seg)) of
+        {ok, LinkPath} ->
+            FullLinkPath = filename:join(Path, LinkPath),
+            case sets:is_element(FullLinkPath, Seen) of
+                true ->
+                    unsafe;
+                false ->
+                    srp_path(
+                        filename:split(LinkPath) ++ [clear | Segs],
+                        Cwd,
+                        sets:add_element(FullLinkPath, Seen),
+                        Acc
+                    )
+            end;
+        {error, _} ->
+            srp_path(Segs, Cwd, Seen, Acc ++ [Seg])
     end.

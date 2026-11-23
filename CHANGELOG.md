@@ -12,6 +12,13 @@
 - `eta_app`, `eta_file`, `eta_dets`: `application`, `file`, `filelib` and `dets`
   without VM service processes.
 - `eta_ets`: stable iteration order for hash-based ETS tables.
+- `eta_ets`: `ets:tab2file/2,3` and `ets:file2tab/1,2` without `disk_log`.
+- `eta_file`: `filelib:ensure_path/1`, `filelib:safe_relative_path/2`,
+  `file:del_dir_r/1` and `file:consult/1` without `file_server`.
+- `eta_disk` tracks `prim_file:write_file/2`.
+- `eta_sched:yield/0` ends the step of the calling process and leaves it
+  runnable. A `gen_server` that returns a time-out of 0 from `init/1` or from a
+  callback yields before its `timeout`, so other processes can run in between.
 - `eta_net` answers node identity and membership calls from its topology.
 - `eta_net` simulates distributed spawns, `monitor_node/2,3` and
   `monitor_nodes/1,2` events.
@@ -42,6 +49,9 @@
 - An instrumented OTP 28 `supervisor` arms no real hibernate timer.
 - A gated `supervisor` starts on OTP 28.
 - A gated `gen_server` whose `init/1` returns `{ok, State, hibernate}` starts.
+- A gated `gen_server` whose `init/1` returns `{ok, State, 0}` starts.
+- The functions that the transform generates have a spec, so a module that is
+  compiled with `warn_missing_spec_all` and `warnings_as_errors` compiles.
 - A gated start returns `{error, Reason}` when the child dies before it
   acknowledges.
 - Messages on one node-to-node link keep their order across senders.

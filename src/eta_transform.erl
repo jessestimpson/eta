@@ -388,6 +388,12 @@ while a scheduler is active and calls the original otherwise.
     {ets, match, 2} => eta_ets,
     {ets, match_object, 2} => eta_ets,
     {ets, foldl, 3} => eta_ets,
+    %% OTP writes and reads a table file through `disk_log`, which runs each log
+    %% in a process that the scheduler does not own. See `eta_ets`.
+    {ets, tab2file, 2} => eta_ets,
+    {ets, tab2file, 3} => eta_ets,
+    {ets, file2tab, 1} => eta_ets,
+    {ets, file2tab, 2} => eta_ets,
     %% Spawning. A child spawned plainly runs on the real scheduler until
     %% `set_on_spawn` adoption catches it; `eta_sched:spawn/1` starts it blocked
     %% instead, so there is no window. See `eta_sched:spawn/1`.
@@ -476,6 +482,14 @@ while a scheduler is active and calls the original otherwise.
     {filelib, is_file, 1} => eta_file,
     {filelib, is_dir, 1} => eta_file,
     {filelib, is_regular, 1} => eta_file,
+    {filelib, ensure_path, 1} => eta_file,
+    {file, del_dir_r, 1} => eta_file,
+    {file, consult, 1} => eta_file,
+    {filelib, safe_relative_path, 2} => eta_file,
+    %% `prim_file:write_file/2` runs in the calling process already. It goes
+    %% through `eta_file` so that a running simulated disk tracks the write, as
+    %% it tracks `file:write_file/2`. See `eta_disk`.
+    {prim_file, write_file, 2} => eta_file,
     %% A raw handle works in the calling process already. These go to the
     %% simulated disk, which decides what a crash loses. With no disk
     %% running, each one delegates to `file`. See `eta_disk`.
@@ -698,11 +712,75 @@ parse_transform(Forms, _Options) ->
     %% last also means its own wrapper sits outermost, which is the right order —
     %% the state is published and the replies are sent before the action list is
     %% read for time-outs.
-    fsm_timeout_pass(
-        statem_timeout_pass(
-            observe_pass(after_pass(net_pass(supervisor_pass(Rewritten), Locals)))
-        )
+    spec_pass(
+        fsm_timeout_pass(
+            statem_timeout_pass(
+                gen_server_timeout_pass(
+                    observe_pass(after_pass(net_pass(supervisor_pass(Rewritten), Locals)))
+                )
+            )
+        ),
+        Locals
     ).
+
+%% Routes the return value of every `gen_server` callback that can carry a
+%% time-out through `eta_sched:timeout_return/1`, which yields on a time-out of
+%% 0. See `eta_sched:yield/0`.
+%%
+%% The pass runs after the reply pass and the observability pass, so its wrapper
+%% is outermost: a reply has been sent and the state has been published before
+%% the process yields.
+gen_server_timeout_pass(Forms) ->
+    case is_gen_server(Forms) of
+        false ->
+            Forms;
+        true ->
+            Exported = exported(Forms),
+            Callbacks = [
+                {handle_call, 3}, {handle_cast, 2}, {handle_info, 2}, {handle_continue, 2}
+            ],
+            [gen_server_timeout_form(F, Exported, Callbacks) || F <- Forms]
+    end.
+
+gen_server_timeout_form({function, Anno, Name, Arity, Clauses} = Form, Exported, Callbacks) ->
+    case lists:member({Name, Arity}, Callbacks) andalso sets:is_element({Name, Arity}, Exported) of
+        true ->
+            {function, Anno, Name, Arity, [gen_server_timeout_clause(C) || C <- Clauses]};
+        false ->
+            Form
+    end;
+gen_server_timeout_form(Form, _Exported, _Callbacks) ->
+    Form.
+
+gen_server_timeout_clause({clause, Anno, Pats, Guards, Body}) ->
+    Call =
+        {call, Anno, {remote, Anno, {atom, Anno, eta_sched}, {atom, Anno, timeout_return}}, [
+            {block, Anno, Body}
+        ]},
+    {clause, Anno, Pats, Guards, [Call]}.
+
+%% Gives every function that the passes generated a `-spec` of `term()`
+%% arguments and a `term()` result. A module compiled with
+%% `warn_missing_spec_all` and `warnings_as_errors` otherwise fails to compile,
+%% because the compiler reports the generated functions as missing a spec. A
+%% generated function is a function that the original module did not define.
+spec_pass(Forms, Locals) ->
+    Specced = sets:from_list([FA || {attribute, _, spec, {FA, _}} <- Forms]),
+    Anno = erl_anno:new(0),
+    Term = {type, Anno, term, []},
+    Specs = [
+        {attribute, Anno, spec,
+            {{N, A}, [
+                {type, Anno, 'fun', [{type, Anno, product, lists:duplicate(A, Term)}, Term]}
+            ]}}
+     || {function, _, N, A, _} <- Forms,
+        not sets:is_element({N, A}, Locals),
+        not sets:is_element({N, A}, Specced)
+    ],
+    case Specs of
+        [] -> Forms;
+        _ -> insert_before_eof(Forms, Specs)
+    end.
 
 %% OTP 28's `supervisor` hibernates after a second without a message: every
 %% callback it returns carries `{timeout, 1000, {hibernate, Tag}}`, which
@@ -1091,6 +1169,8 @@ net_wrap() ->
                 {{eta_ets, match, 2}, {1, tab}},
                 {{eta_ets, match_object, 2}, {1, tab}},
                 {{eta_ets, foldl, 3}, {3, tab}},
+                {{eta_ets, tab2file, 2}, {1, tab}},
+                {{eta_ets, tab2file, 3}, {1, tab}},
                 %% Timers, already `eta_time`'s by the time this pass runs, keep
                 %% a name a name, so it is resolved when the timer fires.
                 {{eta_time, send_after, 3}, {2, dest}},
