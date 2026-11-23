@@ -19,8 +19,9 @@ Inert in the sense that matters: with no run, the result is still what `file`
 would return.
 
 While a simulated disk is running, `write_file/2,3`, `delete/1` and `rename/2`
-go through `eta_disk`, so a crash can lose what they did. `prim_file:write_file/2`
-is pointed at `write_file/2` for the same reason.
+go through `eta_disk`, so a crash can lose what they did. For the same reason,
+`eta_transform` points the `write_file` function of `prim_file` at
+`write_file/2`.
 
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
@@ -267,8 +268,8 @@ parse_terms(Chars, Line, Acc) ->
 -doc """
 `filelib:safe_relative_path/2`, in the calling process. OTP resolves each
 symbolic link with `file:read_link/1`, which is a call to `file_server`. This
-function is a copy of the OTP implementation that calls `prim_file:read_link/1`
-instead.
+function is a copy of the OTP implementation that reads each link with the
+`read_link` function of `prim_file` instead.
 """.
 -endif.
 safe_relative_path(Path, "") ->
