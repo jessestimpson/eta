@@ -340,6 +340,12 @@ ok = eta_run:audit(eta_run:run(Mod, Opts)).
   them.
 - `sched.timeouts` counts the steps that ended before the process reached a
   `receive`.
+- `sched.pid_reuse` counts the processes whose pid compares below the pid of a
+  process that was created earlier in the run. A count above 0 means that the
+  VM has created about as many processes as its process limit and reuses pid
+  values. A system or a harness that depends on the order of pids then does
+  not reproduce a run. `audit/1` does not check this field, because a system
+  that never compares pids is not affected. See "Limitations" in `eta_sched`.
 - `modules_loaded` lists the modules that were loaded during the run. See the
   section "Cold code" below.
 - `sched.cold_code` lists the processes that waited on the code server when the

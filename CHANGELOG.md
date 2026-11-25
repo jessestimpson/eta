@@ -16,6 +16,11 @@
 - `eta_file`: `filelib:ensure_path/1`, `filelib:safe_relative_path/2`,
   `file:del_dir_r/1` and `file:consult/1` without `file_server`.
 - `eta_disk` tracks `prim_file:write_file/2`.
+- `eta_sched:stats/1` and the run result report `pid_reuse`: the number of
+  processes whose pid compares below the pid of an earlier process. The VM
+  reuses pid values after it has created about as many processes as its
+  process limit, and code that depends on the order of pids then does not
+  reproduce a run.
 - `eta_sched:yield/0` ends the step of the calling process and leaves it
   runnable. A `gen_server` that returns a time-out of 0 from `init/1` or from a
   callback yields before its `timeout`, so other processes can run in between.
