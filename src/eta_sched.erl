@@ -208,6 +208,17 @@ A seed reproduces a run only when `stats/1` reports all of the following:
   a `receive`. The conditions are listed below. The scheduler then suspends the
   process where it is, logs a warning and adds 1 to `timeouts`. The scheduler
   does not record `blocked_at` for that step, so the process stays runnable.
+- **Pid order.** The term order of pids is their creation order only until
+  the VM has created about as many processes as its process limit
+  (`erlang:system_info(process_limit)`, 1,048,576 by default). After that the
+  VM reuses pid values. Measured on Erlang/OTP 28 with `+S 1`: the process
+  number 1,048,490 after the start of the VM was the first with a pid below
+  the pid of its predecessor. A system or a harness that sorts pids, or that
+  keeps pids as keys of an ordered structure, then has a schedule that depends
+  on how many processes the VM created before the run. The scheduler does not
+  prevent this. It counts the children whose pid compares below the pid of an
+  earlier child in `pid_reuse`. The corrections are a new VM for each group of
+  runs, and an order that does not use pids, such as the ids of `ids/1`.
 - **Cold code.** A process that calls a module that is not loaded makes a
   synchronous call to `code_server`, which the scheduler does not own. The
   scheduler cannot distinguish that process from a process that is blocked in a
@@ -447,6 +458,10 @@ A step ends in a time-out under one of these conditions:
     %% Steps that ended without the process reaching a receive. See
     %% `note_quiescence/5`; any nonzero value means the run is not replayable.
     timeouts = 0 :: non_neg_integer(),
+    %% The highest pid among the children seen so far, and the number of
+    %% children whose pid compares below it. See `note_pid_order/2`.
+    pid_high :: pid() | undefined,
+    pid_reuse = 0 :: non_neg_integer(),
     %% Processes found parked in `code_server` at the moment a run gave up. See
     %% `note_cold_code/1`; any entry means the run's quiescence was a lie.
     cold_code = [] :: [cold()],
@@ -1769,6 +1784,7 @@ Returns the statistics of the run as a map.
 | `adopted_late` | The number of children that were adopted after they had started to run. | 0 |
 | `timeouts` | The number of steps that ended before the process reached a `receive`. | 0 |
 | `cold_code` | A list of `t:cold/0`, one for each process that waited on `code_server` when a run ended. | `[]` |
+| `pid_reuse` | The number of children whose pid compares below the pid of an earlier child. See "Limitations" in the module documentation. | 0, if the system or its harness depends on the order of pids |
 | `unpinned` | The number of processes that a pinned replay adopted with no pinned id. See `pin_mode/2`. | 0 in a run without pinning and in a replay that follows its trace |
 
 A non-zero `adopted_late`, a non-zero `timeouts` or a non-empty `cold_code`
@@ -2069,7 +2085,8 @@ handle_call(stats, _From, St) ->
         adopted_late = Late,
         timeouts = Timeouts,
         cold_code = Cold,
-        fresh = Fresh
+        fresh = Fresh,
+        pid_reuse = PidReuse
     } = St,
     Reply = #{
         steps => Steps,
@@ -2078,6 +2095,9 @@ handle_call(stats, _From, St) ->
         adopted_late => Late,
         timeouts => Timeouts,
         cold_code => Cold,
+        %% Children whose pid compares below the pid of an earlier child. See
+        %% `note_pid_order/2`.
+        pid_reuse => PidReuse,
         %% Processes a pinned replay adopted that its trace did not account for.
         %% Zero on a generating run, and on a faithful replay. See `pin/2`.
         unpinned => Fresh
@@ -2254,6 +2274,23 @@ adopt(St0, Pid) ->
         live = Live#{Id => Pid},
         adopted = [Id | Adopted]
     }.
+
+%% The spawn events of a run arrive in the order in which the children were
+%% created. The VM numbers pids upwards, so a child normally has a higher pid
+%% than every child before it, and the term order of pids is their creation
+%% order. After the VM has created about as many processes as its process
+%% limit (`erlang:system_info(process_limit)`, 1,048,576 by default), it
+%% reuses pid values, and a new process can compare below an older one. Code
+%% that sorts pids, or that keeps pids in an ordered structure, then orders the
+%% same processes differently from one run of a seed to the next. The count is
+%% reported as `pid_reuse` in `stats/1`.
+-spec note_pid_order(#st{}, pid()) -> #st{}.
+note_pid_order(St = #st{pid_high = undefined}, Child) ->
+    St#st{pid_high = Child};
+note_pid_order(St = #st{pid_high = High}, Child) when Child > High ->
+    St#st{pid_high = Child};
+note_pid_order(St = #st{pid_reuse = Reuse}, _Child) ->
+    St#st{pid_reuse = Reuse + 1}.
 
 -spec mark_exited(#st{}, id()) -> #st{}.
 mark_exited(St = #st{exited = Exited, live = Live}, Id) ->
@@ -2753,8 +2790,9 @@ do_drain(St, Pid, Ref, SelfSends, Received) ->
 %% adopt it and hand it its token. It does not count as adopted late, because it
 %% has not run.
 handle_trace(
-    St = #st{ids = Ids, gated = Gated}, {trace, Parent, spawn, Child, {?MODULE, F, _}}
+    St0 = #st{}, {trace, Parent, spawn, Child, {?MODULE, F, _}}
 ) when F =:= gated; F =:= gated_plib; F =:= statem_gated; F =:= fsm_gated ->
+    St = #st{ids = Ids, gated = Gated} = note_pid_order(St0, Child),
     %% A child belongs wherever its parent does. `eta_net` is inert if no network
     %% is running, and a no-op if the parent was never placed — see
     %% `eta_net:place/2` for why a topology that does not follow spawning is a
@@ -2775,7 +2813,8 @@ handle_trace(
                 error:exited -> St
             end
     end;
-handle_trace(St = #st{ids = Ids}, {trace, Parent, spawn, Child, _MFA}) ->
+handle_trace(St0 = #st{}, {trace, Parent, spawn, Child, _MFA}) ->
+    St = #st{ids = Ids} = note_pid_order(St0, Child),
     ok = eta_net:inherit(Parent, Child),
     case maps:is_key(Child, Ids) of
         true ->

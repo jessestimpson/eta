@@ -265,6 +265,51 @@ Only the process-local API is rewritten. `rand:uniform_s/1,2` and the other
   counts these draws as `rand.unmanaged`, and `audit/1` reports the count.
   `net.unmanaged` reports a send from outside the schedule in the same way.
 
+### The order of pids changes after about one million processes
+
+The term order of pids is their creation order only in a young VM. After the
+VM has created about as many processes as its process limit, it reuses pid
+values, and a new process can have a pid that compares below the pid of an
+older process. `erlang:system_info(process_limit)` is 1,048,576 by default.
+
+Measured on Erlang/OTP 28 with `+S 1`: of 2,500,000 processes that were
+spawned one after another, the process number 1,048,490 was the first with a
+pid below the pid of its predecessor.
+
+A system or a harness that depends on the order of pids then has a schedule
+that depends on the number of processes that the VM created before the run.
+Examples of such a dependence:
+
+- `lists:sort/1` or `lists:usort/1` on a list of pids, or on tuples that have a
+  pid before the field that was meant to decide the order.
+- An `ordered_set` table, a `gb_trees` tree or an `orddict` with pids as keys.
+- A comparison of two pids to choose a leader or a winner.
+
+The symptom is a determinism test that passes alone and fails late in a long
+test run of one VM. The seed that fails changes when tests are added or
+removed. No field of `audit/1` reports the problem.
+
+This was found with a harness that listed its replicas with
+`lists:sort(ets:match(Tab, {{replica, '_'}, '$1', '$2'}))`, where `'$1'` is a
+pid. The list was in the order of the pids. A determinism test with 45 seeds
+and 2 kinds of run, 3 runs and 1 replay for each, failed at one of the last 5
+seeds in every run of the test. The VM had then created 1,064,936 processes.
+The same test with 6 seeds passed.
+
+**Detection.** `sched.pid_reuse` in the run result counts the processes whose
+pid compares below the pid of a process that was created earlier in the run.
+The value is 0 in a young VM. A value above 0 means that the order of pids is
+not the creation order in this run.
+
+**Correction.** Either of the following:
+
+- Do not order by pid. Order by a value that the system assigns, such as a
+  name or the number of a replica. A harness can use the ids of
+  `eta_sched:ids/1`, which follow the order of registration.
+- Start a new VM before the VM has created one million processes. A test
+  suite that runs each test in a VM of its own usually stays below the limit.
+  A run of about 500 processes reaches the limit after about 2,000 runs.
+
 ### Distributed spawns work only between simulated nodes
 
 `spawn(Node, Fun)` and the related forms request a process on another node.
