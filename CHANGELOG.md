@@ -44,6 +44,12 @@
 
 ### Bug fixes
 
+- A step no longer ends at an `out` trace event from the middle of the step.
+  `erlang:demonitor(Ref, [flush])` after a reply through a `reply_demonitor`
+  alias schedules the process out and in again, and
+  `gen_server:check_response/3` makes that call. A process that sent a message
+  to itself later in such a step stayed runnable, and two runs of one seed
+  could have different schedules.
 - A process that kills a scheduled process no longer waits out its receive
   time-out for the `DOWN`.
 - `Process.send_after/3,4` is on the virtual clock under Elixir 1.20.

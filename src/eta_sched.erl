@@ -78,7 +78,10 @@ A step does the following, in this order:
    in a `receive` has the status `waiting` before the process has run. The
    status is therefore valid only after the `in` event.
 4. It waits for an `out` trace event after which the status is `waiting` or the
-   process is dead. An `out` event with any other status is a preemption.
+   process is dead. An `out` event with any other status is a preemption. With
+   the status `waiting`, the step calls `erlang:trace_delivered/1` and
+   continues to wait if an `in` event follows the `out` event. The process then
+   ran on after the `out` event and blocked before the status read.
 5. It suspends the process and collects the pending trace events with
    `erlang:trace_delivered/1`.
 6. It records `blocked_at`, the queue length at which the process blocked. See
@@ -2697,7 +2700,7 @@ await_block(St, Pid, Budget) when Budget > 0 ->
             %% Scheduled out — but that also happens on preemption, so only a
             %% `waiting` status means it is genuinely blocked in a receive.
             case status(Pid) of
-                waiting -> {blocked, St1};
+                waiting -> confirm_block(St1, Pid, Budget);
                 dead -> {blocked, St1};
                 _ -> await_block(St1, Pid, Budget - 1)
             end
@@ -2705,6 +2708,46 @@ await_block(St, Pid, Budget) when Budget > 0 ->
 await_block(St, Pid, _Budget) ->
     logger:warning("eta_sched: ~p never blocked; suspending it mid-flight", [Pid]),
     {timeout, St}.
+
+%% Checks that the `out` event that `await_block/3` took was the last `out`
+%% event of the step.
+%%
+%% The status is read after the `out` event, not at the event. The VM can
+%% schedule a process out and in again in the middle of a step. Two causes are
+%% known:
+%%
+%% - The process reaches the reduction limit.
+%% - The process calls `erlang:demonitor(Ref, [flush])` after a reply through
+%%   an alias with the option `reply_demonitor`. The VM then schedules the
+%%   process out in `erts_internal:flush_monitor_messages/3`.
+%%   `gen_server:check_response/3`, `gen_server:receive_response/2` and
+%%   `gen_server:wait_response/2` make this call.
+%%
+%% The process can run on and block in its `receive` before the scheduler reads
+%% the status. The status is then `waiting` at an `out` event from the middle
+%% of the step. Without this check the step ended at that event, and the
+%% `'receive'` events of the rest of the step counted as arrivals after the
+%% block. A message that the process sent to itself in the rest of the step
+%% was then not part of `blocked_at`, and the process stayed runnable.
+%%
+%% `erlang:trace_delivered/1` makes every trace event of the process up to now
+%% arrive. An `in` event among them means that the process ran after the `out`
+%% event, so the wait continues with the next `out` event. The other events
+%% stay in the mailbox for `drain_trace/2`. A status read and
+%% `erlang:trace_delivered/1` do not make a blocked process produce an `in`
+%% event.
+-spec confirm_block(#st{}, pid(), non_neg_integer()) -> {blocked | timeout, #st{}}.
+confirm_block(St, Pid, Budget) ->
+    Ref = erlang:trace_delivered(Pid),
+    receive
+        {trace_delivered, Pid, Ref} -> ok
+    after ?DELIVERED_TIMEOUT ->
+        logger:warning("eta_sched: trace_delivered timed out for ~p", [Pid])
+    end,
+    receive
+        {trace, Pid, in, _} -> await_block(St, Pid, Budget - 1)
+    after 0 -> {blocked, St}
+    end.
 
 %% Consume trace messages until `Want` (`in` or `out`) arrives for this pid.
 %%
