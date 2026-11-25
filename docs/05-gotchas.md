@@ -281,20 +281,24 @@ For a target outside the schedule, the wall clock decides whether that is the
 case. The scheduler reports nothing: `timeouts` is 0, and `audit/1` returns
 `ok`.
 
-Measured on Erlang/OTP 28. One step of a process that makes the call, then
-writes a marker. The step ended before the marker was written in this many
+The scheduler checks an `out` event with `erlang:trace_delivered/1` and
+continues the step if the caller ran again before the check. See "Steps" in
+`eta_sched`. The check finds the answers that arrive before it. It does not
+find an answer that arrives later.
+
+Measured on Erlang/OTP 28, with that check. One step of a process that makes
+the call, then writes a marker. The step ended before the marker was written in this many
 trials:
 
 | Call | Target | Early ends with `+S 1` | Early ends with `+S 4` |
 |---|---|---|---|
 | `process_info/2` | Outside the schedule, idle, small heap | 0 of 200 | 0 of 200 |
 | `process_info/2` | Outside the schedule, idle, heap of 3,000,000 cells | 1 of 200 | 1 of 200 |
-| `process_info/2` | Outside the schedule, runs a loop without allocation | 0 of 200 | 52 of 200 |
-| `process_info/2` | Outside the schedule, collects 2,000,000 cells in a loop | 200 of 200 | 200 of 200 |
+| `process_info/2` | Outside the schedule, runs a loop without allocation | 0 of 200 | 1 of 200 |
+| `process_info/2` | Outside the schedule, collects 2,000,000 cells in a loop | 198 of 200 | 199 of 200 |
 | `process_info/2` | Suspended by the scheduler | 0 of 200 | 0 of 200 |
 | `is_process_alive/1` | Suspended by the scheduler | 0 of 200 | 0 of 200 |
-| `garbage_collect/1` | Suspended by the scheduler | 200 of 200 | 200 of 200 |
-| `check_process_code/2` | Suspended by the scheduler | 60 of 60 | Not measured |
+| `garbage_collect/1` | Suspended by the scheduler | 62 of 200 | 6 of 200 |
 | `garbage_collect/0`, heap of 30,000,000 cells | The process itself | 0 of 5 | 0 of 5 |
 
 The effect on a schedule: 2 scheduled processes each send one message to a
@@ -305,7 +309,7 @@ schedule before its send. In 200 runs of one seed:
 |---|---|---|
 | No call | 1 | 200 |
 | Idle | 1 | 200 |
-| Collects 2,000,000 cells every 2 ms | 2 with `+S 1`, 3 with `+S 4` | 30 and 170 with `+S 1`; 1, 73 and 126 with `+S 4` |
+| Collects 2,000,000 cells every 2 ms | 2 | 53 and 147 with `+S 1`, 81 and 119 with `+S 4` |
 
 Garbage collection has no other effect that was found. With one harness of
 this repository (`eta_2pc`, 40 seeds), 1,440 runs gave the trace of the plain
@@ -327,9 +331,10 @@ functions.
 schedule with `process_info/2`. A harness reads state from its own process,
 which the scheduler does not step. See
 [Invariants must read state without calling a process](#invariants-must-read-state-without-calling-a-process).
-`garbage_collect/1` and `check_process_code/2` of a scheduled process always
-divide the step of the caller, and the caller continues only after the target
-has had a step.
+`garbage_collect/1` of a scheduled process can divide the step of the caller.
+`check_process_code/2` of a scheduled process divided the step in 60 of 60
+trials with `+S 1` before the scheduler had the check with
+`erlang:trace_delivered/1`. It was not measured with the check.
 
 **Not built.** The scheduler could tell this wait from a `receive` of the
 system: the current function of the caller is
