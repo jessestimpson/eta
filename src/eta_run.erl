@@ -395,9 +395,9 @@ run has ended. For this reason `preload` loads `kernel`, `stdlib` and `eta` by
 default, and a harness names its own application in `preload` even when the runs
 show no problem.
 
-`sched.cold_code` reports this case. When a run finds no runnable process and is
-about to end, the scheduler checks once for a process that is blocked in the
-`call` function of the code server. A process that waits on the code server is
+`sched.cold_code` reports this case. When a run ends, for any reason, the
+scheduler checks once for a process that is blocked in the `call` function of
+the code server. A process that waits on the code server is
 always in that function, because the function is a send followed by a `receive`
 with one clause. Each entry names the process and the function that called the
 cold module:
@@ -410,6 +410,11 @@ The scheduler also logs a warning.
 
 `cold_code` does not replace `preload`. `cold_code` is detected after the run is
 already affected. It identifies the cause and does not repair the run.
+
+`preload` loads the modules of the named applications only. A module of the
+harness that is outside these applications, such as a module in a directory of
+`extra_src_dirs`, is cold until a process calls it. Load such a module in
+`init/2` with `code:ensure_loaded/1` before `init/2` spawns a process.
 """.
 -endif.
 -spec run(module(), map()) -> result().
@@ -1329,6 +1334,10 @@ collect_check(Pid, MRef, Timeout) ->
 
 finish(Outcome, R) ->
     #r{mod = Mod, sut = Sut, sched = Sched, trace = Trace} = R,
+    %% `eta_sched:run/3` makes this check when it ends. This module steps the
+    %% scheduler itself, so it asks for the check at the end of the run. A
+    %% process that waits on `code_server` now is then in `sched.cold_code`.
+    _ = eta_sched:check_cold_code(Sched),
     Stats = eta_sched:stats(Sched),
     ClockMs = eta_time:now_ms(),
     Strays = eta_time:strays(),
