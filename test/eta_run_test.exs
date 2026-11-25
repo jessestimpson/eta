@@ -641,5 +641,61 @@ defmodule DstRunTest do
       assert {:suspect, reasons} = :eta_run.audit(result)
       assert {:cold_code, [^cold]} = List.keyfind(reasons, :cold_code, 0)
     end
+
+    test "a run that ends with a process on the code server reports it in sched.cold_code" do
+      # The run itself, not a fabricated result. `eta_run` steps the scheduler
+      # with `step_adopting/2` and never calls `eta_sched:run/3`, so `eta_run`
+      # must ask the scheduler for the check when the run ends.
+      #
+      # The code server is suspended for the run, as in the "cold code" tests
+      # of `eta_sched_test`. Everything that the run touches must be loaded
+      # before that, or the run waits on the code server itself.
+      :ok = :eta_run.preload([])
+      Code.ensure_loaded!(:eta_cold_harness)
+      Code.ensure_loaded!(:eta_cold_probe)
+      _ = :logger.warning("eta_run_test: warming the warning path", [])
+      opts = %{seed: 1, max_ops: 2, max_steps: 200, preload: false}
+      # A warm run of the same harness loads every module that a run calls.
+      _ = :eta_run.run(:eta_cold_harness, opts)
+
+      if :erlang.module_loaded(:eta_cold) do
+        :code.purge(:eta_cold)
+        :code.delete(:eta_cold)
+        :code.purge(:eta_cold)
+      end
+
+      refute :erlang.module_loaded(:eta_cold)
+
+      parent = self()
+      code_server = Process.whereis(:code_server)
+
+      # A suspend ends when the suspending process dies, so a failure of the
+      # test cannot leave the VM without a code server.
+      keeper =
+        spawn(fn ->
+          true = :erlang.suspend_process(code_server)
+          send(parent, {self(), :suspended})
+
+          receive do
+            :resume -> :ok
+          after
+            10_000 -> :ok
+          end
+        end)
+
+      assert_receive {^keeper, :suspended}, 1_000
+
+      result =
+        try do
+          :eta_run.run(:eta_cold_harness, opts)
+        after
+          send(keeper, :resume)
+        end
+
+      assert %{sched: %{cold_code: [entry]}} = result
+      assert %{at: {:eta_cold_probe, :touch, 0}} = entry
+      assert {:suspect, reasons} = :eta_run.audit(result)
+      assert {:cold_code, [^entry]} = List.keyfind(reasons, :cold_code, 0)
+    end
   end
 end

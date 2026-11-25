@@ -44,6 +44,10 @@
 
 ### Bug fixes
 
+- `eta_run:run/2` and `eta_run:replay/3` report `sched.cold_code`. The check
+  ran only in `eta_sched:run/3`, which `eta_run` does not call, so
+  `sched.cold_code` was always `[]` and `audit/1` could not report
+  `cold_code`. `eta_sched:check_cold_code/1` makes the check on request.
 - A step no longer ends at an `out` trace event from the middle of the step.
   `erlang:demonitor(Ref, [flush])` after a reply through a `reply_demonitor`
   alias schedules the process out and in again, and

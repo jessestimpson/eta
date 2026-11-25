@@ -226,7 +226,8 @@ A seed reproduces a run only when `stats/1` reports all of the following:
   synchronous call to `code_server`, which the scheduler does not own. The
   scheduler cannot distinguish that process from a process that is blocked in a
   `receive`. If no other process is runnable, the run ends early and reports no
-  failure. `run/3` records such processes in `cold_code` when it ends.
+  failure. `run/3` records such processes in `cold_code` when it ends, and
+  `check_cold_code/1` records them on request.
 - **One scheduler per VM.** A second scheduler fails to start while the first
   one runs. Runs must be serial.
 
@@ -263,6 +264,7 @@ A step ends in a time-out under one of these conditions:
     replay/2,
     choices/1,
     stats/1,
+    check_cold_code/1,
     pid/1
 ]).
 
@@ -1814,6 +1816,24 @@ stats(S) ->
     call(S, stats).
 
 -if(?DOCATTRS).
+-doc """
+Records in `cold_code` each scheduled process that waits on `code_server` now.
+
+`run/3` makes this check when it ends. A caller that drives the scheduler with
+`step/2` or `step_adopting/2` calls this function when its run ends, before
+`stats/1`. `eta_run` does so.
+
+Call the function only at the end of a run. A process that waits on
+`code_server` in the middle of a run can still finish its load before the run
+ends.
+""".
+-endif.
+-spec check_cold_code(sched()) -> sched().
+check_cold_code(S) ->
+    call(S, check_cold_code),
+    S.
+
+-if(?DOCATTRS).
 -doc "Returns the choice sequence, oldest first. Pass the result to `replay/2`.".
 -endif.
 -spec choices(sched()) -> [id()].
@@ -2080,6 +2100,8 @@ handle_call({pin_mode, Pinning}, _From, St) ->
 handle_call(take_adopted, _From, St) ->
     {Adopted, St1} = close_entry(St),
     {reply, Adopted, St1};
+handle_call(check_cold_code, _From, St) ->
+    {reply, ok, note_cold_code(St)};
 handle_call(stats, _From, St) ->
     #st{
         steps = Steps,
