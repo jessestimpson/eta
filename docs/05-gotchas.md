@@ -265,6 +265,127 @@ Only the process-local API is rewritten. `rand:uniform_s/1,2` and the other
   counts these draws as `rand.unmanaged`, and `audit/1` reports the count.
   `net.unmanaged` reports a send from outside the schedule in the same way.
 
+### A call that waits for another process ends the step early
+
+Some functions of the `erlang` module send a request to another process and
+wait for its answer. `erlang:process_info/2` of another process is one of
+them. If the other process cannot answer at once, the caller waits in a
+`receive` inside the Erlang VM (`erts_internal:await_result/1`). The scheduler
+then finds the caller scheduled out with the status `waiting`, which is its
+test for the end of a step. It ends the step and suspends the caller in the
+middle of the call. The caller continues in a later step, after the answer has
+arrived as a message.
+
+A process cannot answer at once while it runs, and while it collects garbage.
+For a target outside the schedule, the wall clock decides whether that is the
+case. The scheduler reports nothing: `timeouts` is 0, and `audit/1` returns
+`ok`.
+
+Measured on Erlang/OTP 28. One step of a process that makes the call, then
+writes a marker. The step ended before the marker was written in this many
+trials:
+
+| Call | Target | Early ends with `+S 1` | Early ends with `+S 4` |
+|---|---|---|---|
+| `process_info/2` | Outside the schedule, idle, small heap | 0 of 200 | 0 of 200 |
+| `process_info/2` | Outside the schedule, idle, heap of 3,000,000 cells | 1 of 200 | 1 of 200 |
+| `process_info/2` | Outside the schedule, runs a loop without allocation | 0 of 200 | 52 of 200 |
+| `process_info/2` | Outside the schedule, collects 2,000,000 cells in a loop | 200 of 200 | 200 of 200 |
+| `process_info/2` | Suspended by the scheduler | 0 of 200 | 0 of 200 |
+| `is_process_alive/1` | Suspended by the scheduler | 0 of 200 | 0 of 200 |
+| `garbage_collect/1` | Suspended by the scheduler | 200 of 200 | 200 of 200 |
+| `check_process_code/2` | Suspended by the scheduler | 60 of 60 | Not measured |
+| `garbage_collect/0`, heap of 30,000,000 cells | The process itself | 0 of 5 | 0 of 5 |
+
+The effect on a schedule: 2 scheduled processes each send one message to a
+third one, and the first one calls `process_info/2` of a process outside the
+schedule before its send. In 200 runs of one seed:
+
+| Target of the call | Distinct schedules | Runs of each schedule |
+|---|---|---|
+| No call | 1 | 200 |
+| Idle | 1 | 200 |
+| Collects 2,000,000 cells every 2 ms | 2 with `+S 1`, 3 with `+S 4` | 30 and 170 with `+S 1`; 1, 73 and 126 with `+S 4` |
+
+Garbage collection has no other effect that was found. With one harness of
+this repository (`eta_2pc`, 40 seeds), 1,440 runs gave the trace of the plain
+run under each of these conditions, with `+S 1` and with `+S 4`:
+
+- A process outside the schedule calls `garbage_collect/1` for every process
+  in a loop.
+- A process outside the schedule calls `garbage_collect/1` for the driver
+  process in a loop.
+- A process outside the schedule allocates 40 MB in a loop.
+- `fullsweep_after` is 0 for new processes.
+- The driver process keeps 12,000,000 list cells alive.
+
+**What eta does.** The transform rewrites `erlang:is_process_alive/1` to
+`eta_sched:is_alive/1`, which sends no request. It does not rewrite the other
+functions.
+
+**Correction.** A scheduled process must not ask a process outside the
+schedule with `process_info/2`. A harness reads state from its own process,
+which the scheduler does not step. See
+[Invariants must read state without calling a process](#invariants-must-read-state-without-calling-a-process).
+`garbage_collect/1` and `check_process_code/2` of a scheduled process always
+divide the step of the caller, and the caller continues only after the target
+has had a step.
+
+**Not built.** The scheduler could tell this wait from a `receive` of the
+system: the current function of the caller is
+`erts_internal:await_result/1`, `erlang:garbage_collect/2` or
+`erts_internal:check_process_code/3`. It could then keep the step open until
+the answer has arrived, or count the step in `timeouts`.
+
+### A process that dies through a link dies outside the schedule
+
+A VM link between two scheduled processes makes the second one die when the
+first one exits, unless the second one traps exits. The second process is
+suspended at that time. It dies when the VM next handles its signals, which is
+not a step of the scheduler. Its own monitors and links fire after that. A
+process that watches it receives its `DOWN` message at a time that the VM
+chooses.
+
+Measured on Erlang/OTP 28 with `+S 1`, under `eta_sched`. `P` exits in its
+step, and `W` waits for a `DOWN` message. The table has the number of trials
+in which `W` was not runnable directly after the step of `P`:
+
+| Case | `W` not runnable, of 200 trials |
+|---|---|
+| `W` monitors `P` | 0 |
+| `W` monitors `P`, and `P` owns an ETS table of 50,000 rows | 0 |
+| `W` monitors `Y`, and `Y` is linked to `P` | 200 |
+| `W` monitors `Y2`, `Y2` is linked to `Y`, and `Y` is linked to `P` | 200 |
+
+The same without eta: a process kills `X`, waits for the `DOWN` message of
+`X`, performs some work, and then reads the queue length of `W`. `W` monitors
+the last process of a chain of links that starts at `X`. The table has the
+number of trials of 300 in which `W` had no message:
+
+| Chain | No work | 2,000 reductions | 5,000 reductions | 20,000 reductions |
+|---|---|---|---|---|
+| 1 linked process | 0 | 0 | 0 | 0 |
+| 2 linked processes in a row | 300 | 300 | 0 | 0 |
+| 4 linked processes in a row | 300 | 300 | 300 | 0 |
+| 1 linked process that owns an ETS table of 50,000 rows | 300 | 300 | 300 | 300 |
+
+The result depends on the number of reductions that the reading process
+uses. Under a run, that process is the scheduler, so a small change of the
+scheduler or of the driver can move the `DOWN` message to the other side of a
+choice.
+
+**What eta does.** `eta_net:kill_node/2` waits for the death of every process
+of the node, and for the `DOWN` messages of the VM monitors on these
+processes. It does not follow VM links from a dying process to a surviving
+process. A step in which a process exits waits for nothing after the exit.
+
+**Detection.** None. The run result reports nothing.
+
+**Correction.** Not built. The scheduler could wait, after a step or a kill
+with an exit, until every process that has started to exit is no longer in
+`erlang:processes/0`, then make every live process handle its signals with
+`process_info/2`, and repeat this while new exits appear.
+
 ### The order of pids changes after about one million processes
 
 The term order of pids is their creation order only in a young VM. After the
