@@ -81,7 +81,11 @@ A step does the following, in this order:
    process is dead. An `out` event with any other status is a preemption. With
    the status `waiting`, the step calls `erlang:trace_delivered/1` and
    continues to wait if an `in` event follows the `out` event. The process then
-   ran on after the `out` event and blocked before the status read.
+   ran on after the `out` event and blocked before the status read. The step
+   also continues to wait if the current function of the process is in the
+   module `erlang` or `erts_internal`, other than `erlang:hibernate/3`. The
+   process then waits for an answer of the VM inside a call such as
+   `erlang:garbage_collect/1`, and not for a message of the system.
 5. It suspends the process and collects the pending trace events with
    `erlang:trace_delivered/1`.
 6. It records `blocked_at`, the queue length at which the process blocked. See
@@ -2925,8 +2929,53 @@ confirm_block(St, Pid, Budget) ->
     after 0 ->
         case St#st.exit_sent orelse map_size(St#st.dying) > 0 of
             true -> settle_in_step(St#st{exit_sent = false}, Pid, Budget);
-            false -> {blocked, St}
+            false -> blocked_or_vm_wait(St, Pid, Budget)
         end
+    end.
+
+%% Ends the step, unless the process waits for an answer of the VM.
+%%
+%% Some functions of the `erlang` module send a request to another process
+%% and wait for the answer in a `receive` of their own. Examples are
+%% `erlang:process_info/2` of another process, `erlang:garbage_collect/1` and
+%% `erlang:check_process_code/2`. The process is then scheduled out with the
+%% status `waiting`, in the middle of the call. The answer arrives at a time
+%% that the VM chooses, so a step that ended here ended before or after the
+%% rest of the call.
+%%
+%% The step continues until the answer has arrived: the scheduler waits for
+%% the next `in` trace event of the process and then for the next block. When
+%% no answer arrives within the bound of `await_event/4`, the step ends as a
+%% time-out, and `stats/1` counts it in `timeouts`.
+-spec blocked_or_vm_wait(#st{}, pid(), non_neg_integer()) -> {blocked | timeout, #st{}}.
+blocked_or_vm_wait(St, Pid, Budget) ->
+    case vm_wait(Pid) of
+        false ->
+            {blocked, St};
+        true ->
+            case await_event(St, Pid, in, Budget) of
+                {ok, St1} -> await_block(St1, Pid, Budget - 1);
+                {exited, St1} -> {blocked, St1};
+                {timeout, St1} -> {timeout, St1}
+            end
+    end.
+
+%% Whether the process waits in a `receive` of the modules `erlang` or
+%% `erts_internal`. Such a `receive` waits for an answer of the VM to a
+%% request of the process, and not for a message of the system under test.
+%% The functions are `erts_internal:await_result/1`,
+%% `erlang:garbage_collect/2`, `erlang:check_process_code/3` and others of
+%% the same kind.
+%%
+%% `erlang:hibernate/3` is the exception: a hibernating process waits for a
+%% message of the system.
+-spec vm_wait(pid()) -> boolean().
+vm_wait(Pid) ->
+    case erlang:process_info(Pid, current_function) of
+        {current_function, {erlang, hibernate, 3}} -> false;
+        {current_function, {erlang, _, _}} -> true;
+        {current_function, {erts_internal, _, _}} -> true;
+        _ -> false
     end.
 
 %% Settles the deaths that the process of the step caused before the step
@@ -2947,7 +2996,7 @@ confirm_block(St, Pid, Budget) ->
 settle_in_step(St0, Pid, Budget) ->
     case settle(St0) of
         {false, St} ->
-            {blocked, St};
+            blocked_or_vm_wait(St, Pid, Budget);
         {true, St} ->
             case erlang:process_info(Pid, [message_queue_len, status]) of
                 undefined -> {blocked, St};
