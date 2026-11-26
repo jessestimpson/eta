@@ -265,29 +265,49 @@ Only the process-local API is rewritten. `rand:uniform_s/1,2` and the other
   counts these draws as `rand.unmanaged`, and `audit/1` reports the count.
   `net.unmanaged` reports a send from outside the schedule in the same way.
 
-### A call that waits for another process ends the step early
+### A call that waits for another process can time out the step
 
 Some functions of the `erlang` module send a request to another process and
 wait for its answer. `erlang:process_info/2` of another process is one of
 them. If the other process cannot answer at once, the caller waits in a
 `receive` inside the Erlang VM (`erts_internal:await_result/1`). The scheduler
 then finds the caller scheduled out with the status `waiting`, which is its
-test for the end of a step. It ends the step and suspends the caller in the
-middle of the call. The caller continues in a later step, after the answer has
-arrived as a message.
+test for the end of a step.
 
 A process cannot answer at once while it runs, and while it collects garbage.
 For a target outside the schedule, the wall clock decides whether that is the
-case. The scheduler reports nothing: `timeouts` is 0, and `audit/1` returns
-`ok`.
+case.
 
-The scheduler checks an `out` event with `erlang:trace_delivered/1` and
-continues the step if the caller ran again before the check. See "Steps" in
-`eta_sched`. The check finds the answers that arrive before it. It does not
-find an answer that arrives later.
+**What eta does.** The scheduler reads the current function of a process that
+is scheduled out with the status `waiting`. A function of the modules `erlang`
+or `erts_internal`, other than `erlang:hibernate/3`, means that the process
+waits for an answer of the VM. The scheduler then keeps the step open until
+the process has run again and blocked again. The transform also rewrites
+`erlang:is_process_alive/1` to `eta_sched:is_alive/1`, which sends no request.
 
-Measured on Erlang/OTP 28, with that check. One step of a process that makes
-the call, then writes a marker. The step ended before the marker was written in this many
+Measured with `test/eta_vm_wait_test.exs` on Erlang/OTP 28. One step of a
+process that makes the call, then writes a marker. The table has the number of
+trials of 200 in which the step ended before the marker was written:
+
+| Call | Target | Before, `+S 1` | Before, `+S 4` | Now, `+S 1` and `+S 4` |
+|---|---|---|---|---|
+| `garbage_collect/1` | Scheduled, heap of 3,000,000 cells | 53 | 195 | 0 |
+| `garbage_collect/1` | Outside the schedule, builds 2,000,000 cells in a loop | 200 | 200 | 0 |
+| `process_info/2` | Outside the schedule, builds 2,000,000 cells in a loop | 170 to 191 | 199 to 200 | 0 |
+| `check_process_code/2` | Scheduled, heap of 3,000,000 cells | 0 | 0 | 0 |
+
+**Limitations.**
+
+- The step waits in real time for the answer. A target outside the schedule
+  that runs for a long time makes the step slow.
+- When no answer arrives within 1 second, the step ends as a time-out.
+  `stats/1` counts the step in `timeouts`, and `audit/1` reports the run.
+- A wait in a module other than `erlang` and `erts_internal` is not found,
+  such as a wait for a port in `prim_inet`.
+
+The measurements below are from before this check. They show the effect of an
+early end on a schedule. One step of a process that makes the call, then
+writes a marker. The step ended before the marker was written in this many
 trials:
 
 | Call | Target | Early ends with `+S 1` | Early ends with `+S 4` |
@@ -323,24 +343,11 @@ run under each of these conditions, with `+S 1` and with `+S 4`:
 - `fullsweep_after` is 0 for new processes.
 - The driver process keeps 12,000,000 list cells alive.
 
-**What eta does.** The transform rewrites `erlang:is_process_alive/1` to
-`eta_sched:is_alive/1`, which sends no request. It does not rewrite the other
-functions.
-
-**Correction.** A scheduled process must not ask a process outside the
-schedule with `process_info/2`. A harness reads state from its own process,
-which the scheduler does not step. See
+**Correction.** A scheduled process should not ask a process outside the
+schedule with `process_info/2`, because the step then waits in real time. A
+harness reads state from its own process, which the scheduler does not step.
+See
 [Invariants must read state without calling a process](#invariants-must-read-state-without-calling-a-process).
-`garbage_collect/1` of a scheduled process can divide the step of the caller.
-`check_process_code/2` of a scheduled process divided the step in 60 of 60
-trials with `+S 1` before the scheduler had the check with
-`erlang:trace_delivered/1`. It was not measured with the check.
-
-**Not built.** The scheduler could tell this wait from a `receive` of the
-system: the current function of the caller is
-`erts_internal:await_result/1`, `erlang:garbage_collect/2` or
-`erts_internal:check_process_code/3`. It could then keep the step open until
-the answer has arrived, or count the step in `timeouts`.
 
 ### A process that dies through a link dies outside the schedule
 

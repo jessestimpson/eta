@@ -44,6 +44,13 @@
 
 ### Bug fixes
 
+- A step no longer ends while the process waits for an answer of the VM
+  inside a function of the `erlang` module. `erlang:garbage_collect/1`,
+  `erlang:check_process_code/2` and `erlang:process_info/2` of another process
+  wait in a `receive` of their own, and the answer arrives at a time that the
+  VM chooses. The step ended inside the call in 53 to 200 of 200 trials. A
+  step with no answer within 1 second ends as a time-out and counts in
+  `timeouts`.
 - The scheduler settles a death that happens outside a step of the dead
   process: the death of a process that is linked to a process that exits, and
   the death of the target of `erlang:exit/2`. The links and monitors of the
