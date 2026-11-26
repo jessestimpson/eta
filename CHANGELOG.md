@@ -44,6 +44,15 @@
 
 ### Bug fixes
 
+- The scheduler settles a death that happens outside a step of the dead
+  process: the death of a process that is linked to a process that exits, and
+  the death of the target of `erlang:exit/2`. The links and monitors of the
+  dead process fired at a time that the VM chose, so two runs of one seed could
+  have different schedules. A process that calls `erlang:exit/2` and waits for
+  the `DOWN` message takes the message in the same step. See "Deaths outside a
+  step" in `eta_sched`.
+- `eta_sched:release/1` no longer fails when the `exit` trace event of a
+  process arrives during the release.
 - `eta_run:run/2` and `eta_run:replay/3` report `sched.cold_code`. The check
   ran only in `eta_sched:run/3`, which `eta_run` does not call, so
   `sched.cold_code` was always `[]` and `audit/1` could not report

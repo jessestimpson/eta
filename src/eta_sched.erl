@@ -144,10 +144,41 @@ the messages that arrived after the block. It uses the `'receive'` trace events
 that follow the blocking `out` event. When the queue is empty, the result is 0
 and no further check is made.
 
-`runnable_ids/1` runs at every choice. It scans only the processes that have
-not exited, and it reads each queue length once, with
-`process_info(Pid, message_queue_len)`. A dead process has a queue length of 0,
-so no separate read of the status is needed.
+`settled_runnable/1` runs at every choice. It scans only the processes that
+have not exited, and it reads each queue length once, with
+`process_info(Pid, message_queue_len)`. The read returns `undefined` for a dead
+process, so no separate read of the status is needed.
+
+### Deaths outside a step
+
+A process that does not trap exits dies when the VM handles an exit signal for
+the process. The VM does that also while the scheduler holds the process
+suspended. The signal has one of two causes:
+
+- A linked process exits. The death continues along a chain of links.
+- A process calls `erlang:exit/2` on the process.
+
+The dead process then sends the signals of its own links and monitors, at a
+time that the VM chooses. The scheduler settles these deaths at three points:
+
+| Point | What the scheduler does |
+|---|---|
+| The end of a step in which the process exited | Settles before the step returns. |
+| The end of a step in which the process called `erlang:exit/2` | Settles before the step ends. The `EXIT` and `DOWN` messages of the deaths are in the queue of the process, and the process runs on in the same step if it waits for one of them. |
+| Every choice | Settles before it reads which processes are runnable. This covers an `erlang:exit/2` outside a step, such as one by `eta_net:kill_node/2`. |
+
+To settle, the scheduler repeats two actions until the second one finds no
+dead process:
+
+1. It waits for the `out_exited` trace event of every process that has started
+   to exit. The VM sends the signals of the links and the monitors of a process
+   before this event.
+2. It reads every live scheduled process with `process_info/2`. The read makes
+   the process handle the signals that it has received.
+
+The scheduler learns of a call to `erlang:exit/2` from a `call` trace event.
+It sets a trace pattern on `erlang:exit/2` for that purpose, so the module
+that makes the call does not need `eta_transform`.
 
 ## Adoption
 
@@ -364,7 +395,15 @@ A step ends in a time-out under one of these conditions:
 %% `running` gives the in/out scheduling events quiescence is detected from.
 %% `send` lets a step count self-sends, the correction term consumption needs.
 %% `procs` + `set_on_spawn` adopt processes the system under test creates.
--define(TRACE_FLAGS, [running, 'receive', send, procs, set_on_spawn]).
+%% `exiting` gives the `out_exited` event, which a process produces after it has
+%% sent the signals of its links and monitors. `call` gives an event for each
+%% call to `erlang:exit/2`, which is the only function with a trace pattern
+%% that the scheduler sets. See `settle/1`.
+-define(TRACE_FLAGS, [running, exiting, 'receive', send, procs, call, set_on_spawn]).
+
+%% Bound on waiting for the `exit` or the `out_exited` trace event of a process
+%% that is dead.
+-define(EXITED_TIMEOUT, 5000).
 
 %% A step should never take this many scheduling events; bailing out beats hanging
 %% a test suite on a process that never blocks.
@@ -440,11 +479,18 @@ A step ends in a time-out under one of these conditions:
     exited = #{} :: #{id() => true},
     %% id => pid for every process not yet known to have exited. `procs` keeps
     %% every process a run ever registered, and in a system that spawns a
-    %% process per operation nearly all of them have exited. `runnable_ids/1`
+    %% process per operation nearly all of them have exited. `settled_runnable/1`
     %% runs at every choice point, so it reads this map instead: its cost then
     %% depends on how many processes are alive, not on how long the run is.
     %% Updated only through `adopt/2` and `mark_exited/2`.
     live = #{} :: #{id() => pid()},
+    %% Processes with an `exit` trace event and no `out_exited` trace event
+    %% yet. Such a process may not have sent the signals of its links and
+    %% monitors. See `settle/1`.
+    dying = #{} :: #{pid() => true},
+    %% Whether the process of the step in progress has called `erlang:exit/2`.
+    %% See `settle_in_step/3`.
+    exit_sent = false :: boolean(),
     %% Children spawned through `spawn/1` and friends, which start blocked. Tracked
     %% so `release/1` can let go of any that never got their token.
     gated = #{} :: #{pid() => true},
@@ -2068,6 +2114,9 @@ init(Opts) ->
     end,
     _ = ets:new(?ACTIVE, [named_table, public, set]),
     true = ets:insert(?ACTIVE, {sched, {?MODULE, self()}}),
+    %% A traced process then produces a `call` trace event for each call to
+    %% `erlang:exit/2`. See `settle_in_step/3`.
+    _ = erlang:trace_pattern({erlang, exit, 2}, true, []),
     {ok, #st{rand = rand:seed_s(exsss, {Seed, Seed + 1, Seed + 2})}}.
 
 handle_call({register, Pids}, _From, St) ->
@@ -2092,7 +2141,8 @@ handle_call(ids, _From, St = #st{procs = Procs}) ->
 handle_call(procs, _From, St = #st{procs = Procs}) ->
     {reply, Procs, St};
 handle_call(runnable, _From, St) ->
-    {reply, runnable_ids(St), St};
+    {Ids, St1} = settled_runnable(St),
+    {reply, Ids, St1};
 handle_call(choices, _From, St = #st{choices = Choices}) ->
     {reply, lists:reverse(Choices), St};
 handle_call({pin_mode, Pinning}, _From, St) ->
@@ -2269,7 +2319,7 @@ is_gated(Pid) ->
 %% the dominant cause is gone, not because it was seen to help.
 adopt_exited(St, Child) ->
     St1 = adopt(St, Child),
-    true = ets:insert(?ACTIVE, {{proc, Child}, dead}),
+    ok = record_proc(Child, dead),
     Id = maps:get(Child, St1#st.ids),
     mark_exited(St1, Id).
 
@@ -2292,7 +2342,7 @@ close_entry(St = #st{adopted = Adopted}) ->
 adopt(St0, Pid) ->
     {Id, St = #st{procs = Procs, ids = Ids, live = Live, adopted = Adopted}} = mint(St0),
     %% For `is_alive/1`, which the stepped process calls.
-    true = ets:insert(?ACTIVE, {{proc, Pid}, alive}),
+    ok = record_proc(Pid, alive),
     St#st{
         procs = Procs#{Id => Pid},
         ids = Ids#{Pid => Id},
@@ -2363,7 +2413,7 @@ do_release(St = #st{procs = Procs, gated = Gated, yielded = Yielded}) ->
     maps:foreach(
         fun(_Id, Pid) ->
             %% `process_info/2` rather than `is_process_alive/1`, for the reason
-            %% in `is_runnable/3`: these are still suspended when this runs.
+            %% in `proc_state/3`: these are still suspended when this runs.
             %% Both calls are safe rather than guarded, because the status
             %% above is a read and these are actions on something that can die
             %% in between — the same window `step/2` documents, and the same one
@@ -2387,40 +2437,142 @@ do_release(St = #st{procs = Procs, gated = Gated, yielded = Yielded}) ->
 %% Stepping
 %% ---------------------------------------------------------------------------
 
--spec runnable_ids(#st{}) -> [id()].
-runnable_ids(St = #st{live = Live}) ->
-    lists:sort([Id || {Id, Pid} <- maps:to_list(Live), is_runnable(St, Id, Pid)]).
+%% The runnable ids, after every death is settled. The scan of the queue
+%% lengths makes each live process handle its signals, so the scan also finds
+%% a process that an exit signal killed. See `settle/1`.
+-spec settled_runnable(#st{}) -> {[id()], #st{}}.
+settled_runnable(St0) ->
+    St1 = await_dying(St0),
+    Live = lists:sort(maps:to_list(St1#st.live)),
+    States = [{Id, Pid, proc_state(St1, Id, Pid)} || {Id, Pid} <- Live],
+    case [Pid || {_Id, Pid, dead} <- States] of
+        [] -> {[Id || {Id, _Pid, runnable} <- States], St1};
+        Dead -> settled_runnable(note_deaths(Dead, St1))
+    end.
 
 %% One `process_info/2` read per live process, and this runs for every live
-%% process at every choice point.
+%% process at every choice.
 %%
-%% The queue length is read with `process_info/2` rather than anything that asks
-%% the target. Every process here is one this scheduler owns and has suspended,
-%% several of which it has already sent a `?GO` token, so a question the target
-%% answers by *running* would make the scheduler's own progress depend on when it
-%% next resumed them.
+%% The queue length is read with `process_info/2`, which does not need the
+%% target to run. Every process here is suspended by the scheduler.
 %%
-%% Liveness needs no read of its own. `queue_len/1` answers 0 for a process that
-%% is gone, and 0 is never greater than a `blocked_at`, so a dead process is not
-%% runnable. A separate `status` read here doubled the cost of the scan, and the
+%% Liveness needs no read of its own: the read returns `undefined` for a dead
+%% process. A separate `status` read doubled the cost of the scan, and the
 %% scan was the largest cost of a long run.
 %%
-%% A process that yielded is runnable while it is alive. Only a yielded process
-%% pays for the liveness read.
--spec is_runnable(#st{}, id(), pid()) -> boolean().
-is_runnable(#st{exited = Exited, blocked_at = Blocked, yielded = Yielded}, Id, Pid) ->
-    %% Default 0: an empty mailbox is nothing to do. Stepping such a process is
-    %% harmless but wastes a choice and pollutes the schedule.
-    not maps:is_key(Id, Exited) andalso
-        ((maps:is_key(Id, Yielded) andalso erlang:is_process_alive(Pid)) orelse
-            queue_len(Pid) > maps:get(Id, Blocked, 0)).
+%% A process that yielded is runnable while it is alive. A process with an
+%% empty queue and no `blocked_at` is not runnable: a step of such a process
+%% wastes a choice.
+-spec proc_state(#st{}, id(), pid()) -> runnable | idle | dead.
+proc_state(#st{blocked_at = Blocked, yielded = Yielded}, Id, Pid) ->
+    case erlang:process_info(Pid, message_queue_len) of
+        undefined ->
+            dead;
+        {message_queue_len, N} ->
+            case maps:is_key(Id, Yielded) orelse N > maps:get(Id, Blocked, 0) of
+                true -> runnable;
+                false -> idle
+            end
+    end.
+
+%% Settles the deaths of scheduled processes that happened outside a step of
+%% the dead process. Returns whether a process died or finished its exit.
+%%
+%% A process that does not trap exits dies when the VM handles an exit signal
+%% for the process, also while the scheduler holds the process suspended. The
+%% signal comes from a linked process that exits or from `erlang:exit/2`. The
+%% dead process then sends the signals of its own links and monitors, at a
+%% time that the VM chooses.
+%%
+%% 1. The scheduler waits for the `out_exited` trace event of every process
+%%    that has an `exit` trace event. The VM sends the signals of the links
+%%    and the monitors of a process before the `out_exited` event. The VM
+%%    removes the process from `erlang:processes/0` before it sends these
+%%    signals, so the absence of the process there is not a sufficient
+%%    condition.
+%% 2. The scheduler reads the status of every live scheduled process. The
+%%    signals of step 1 were sent before the read, so a process that one of
+%%    them kills is found dead. A process that traps exits has the `EXIT`
+%%    message in its queue after its next read, and a process with a monitor
+%%    has the `DOWN` message.
+%% 3. The scheduler handles the `exit` trace event of every process that step
+%%    2 found dead, and starts again at step 1. The procedure ends when step 2
+%%    finds no dead process.
+%%
+%% Only trace events of dead processes are taken from the mailbox, so the
+%% trace events of the step in progress stay for `drain_trace/2`.
+-spec settle(#st{}) -> {boolean(), #st{}}.
+settle(St) ->
+    settle(St, false).
+
+settle(St0, Changed0) ->
+    Changed = Changed0 orelse map_size(St0#st.dying) > 0,
+    St1 = await_dying(St0),
+    Live = lists:sort(maps:to_list(St1#st.live)),
+    case [Pid || {_Id, Pid} <- Live, status(Pid) =:= dead] of
+        [] -> {Changed, St1};
+        Dead -> settle(note_deaths(Dead, St1), true)
+    end.
+
+%% Waits for the `out_exited` trace event of every process in `dying`.
+-spec await_dying(#st{}) -> #st{}.
+await_dying(St = #st{dying = Dying}) when map_size(Dying) =:= 0 ->
+    St;
+await_dying(St = #st{dying = Dying}) ->
+    lists:foldl(
+        fun(Pid, Acc) ->
+            receive
+                {trace, Pid, out_exited, _} = T -> handle_trace(Acc, T)
+            after ?EXITED_TIMEOUT ->
+                logger:warning("eta_sched: no out_exited trace event for ~p", [Pid]),
+                Acc#st{dying = maps:remove(Pid, Acc#st.dying)}
+            end
+        end,
+        St,
+        lists:sort(maps:keys(Dying))
+    ).
+
+%% Handles the `exit` trace event of each process of `Dead`, in the given
+%% order. A dead process with no such event is marked as exited.
+-spec note_deaths([pid()], #st{}) -> #st{}.
+note_deaths(Dead, St) ->
+    lists:foldl(
+        fun(Pid, Acc = #st{ids = Ids, live = Live}) ->
+            Id = maps:get(Pid, Ids),
+            case maps:is_key(Id, Live) of
+                false ->
+                    Acc;
+                true ->
+                    receive
+                        {trace, Pid, exit, _} = T -> handle_trace(Acc, T)
+                    after ?EXITED_TIMEOUT ->
+                        logger:warning("eta_sched: no exit trace event for ~p", [Pid]),
+                        ok = record_proc(Pid, dead),
+                        mark_exited(Acc, Id)
+                    end
+            end
+        end,
+        St,
+        Dead
+    ).
+
+%% Records the state of a process for `is_alive/1`. A trace event can arrive
+%% after `release/1` has deleted the table, so a missing table is not an
+%% error.
+-spec record_proc(pid(), alive | dead) -> ok.
+record_proc(Pid, State) ->
+    try ets:insert(?ACTIVE, {{proc, Pid}, State}) of
+        true -> ok
+    catch
+        error:badarg -> ok
+    end.
 
 -spec do_step(#st{}, id()) -> {outcome(), #st{}}.
 do_step(St00 = #st{procs = Procs}, Id) ->
     Pid = maps:get(Id, Procs),
     %% A process that yielded is resumed with its token. The token is sent before
     %% the queue is read, so the step counts it as a consumed message.
-    St0 = resume_yielded(St00, Id, Pid),
+    St0 = resume_yielded(St00#st{exit_sent = false}, Id, Pid),
     QueueBefore = queue_len(Pid),
     %% Published for the duration of the step, and erased after it. While a step
     %% is in progress this is the *only* process that is supposed to be running,
@@ -2455,7 +2607,9 @@ do_step(St00 = #st{procs = Procs}, Id) ->
         false ->
             _ = ets:take(?ACTIVE, {yielded, Pid}),
             {_SelfSends, _Late, StDead} = drain_trace(St2, Pid),
-            {exited, mark_exited(StDead, Id)};
+            %% The exit can make a linked process die. See `settle/1`.
+            {_Changed, StSettled} = settle(mark_exited(StDead, Id)),
+            {exited, StSettled};
         true ->
             {SelfSends, Late, St3} = drain_trace(note_yield(St2, Id, Pid), Pid),
             {QueueAfter, St3a} = queue_at_block(St3, Pid, Late),
@@ -2768,7 +2922,38 @@ confirm_block(St, Pid, Budget) ->
     end,
     receive
         {trace, Pid, in, _} -> await_block(St, Pid, Budget - 1)
-    after 0 -> {blocked, St}
+    after 0 ->
+        case St#st.exit_sent orelse map_size(St#st.dying) > 0 of
+            true -> settle_in_step(St#st{exit_sent = false}, Pid, Budget);
+            false -> {blocked, St}
+        end
+    end.
+
+%% Settles the deaths that the process of the step caused before the step
+%% ends. The process called `erlang:exit/2`, or a process started to exit
+%% during the step.
+%%
+%% The `EXIT` and `DOWN` messages of these deaths are in the queue of the
+%% process after `settle/1`. A process that kills another process and waits
+%% for the `DOWN` message, as `supervisor:shutdown/2` does, then takes the
+%% message in the same step in every run. Without this, the message arrived
+%% before or after the end of the step, at a time that the VM chose.
+%%
+%% A message that arrived makes the VM schedule the process in, so the wait
+%% for the block starts again. The read of `message_queue_len` makes the
+%% process handle the signals that it has received before the read of the
+%% status.
+-spec settle_in_step(#st{}, pid(), non_neg_integer()) -> {blocked | timeout, #st{}}.
+settle_in_step(St0, Pid, Budget) ->
+    case settle(St0) of
+        {false, St} ->
+            {blocked, St};
+        {true, St} ->
+            case erlang:process_info(Pid, [message_queue_len, status]) of
+                undefined -> {blocked, St};
+                [_, {status, waiting}] -> confirm_block(St, Pid, Budget - 1);
+                _ -> await_block(St, Pid, Budget - 1)
+            end
     end.
 
 %% Consume trace messages until `Want` (`in` or `out`) arrives for this pid.
@@ -2787,8 +2972,8 @@ await_event(St, Pid, Want, Budget, Patience) when Budget > 0, Patience > 0 ->
     receive
         {trace, Pid, Want, _} ->
             {ok, St};
-        {trace, Pid, out_exited, _} ->
-            {exited, St};
+        {trace, Pid, out_exited, _} = T ->
+            {exited, handle_trace(St, T)};
         {trace, Pid, exit, Reason} ->
             %% Reason is passed through rather than flattened to `normal`: nothing
             %% here reads it, but `eta_net` does — a simulated monitor's DOWN
@@ -2916,17 +3101,25 @@ handle_trace(St = #st{ids = Ids}, {trace, Pid, exit, Reason}) ->
     ok = eta_net:notify_exit(Pid, Reason),
     %% For `is_alive/1`. Recorded for every process whose exit is traced,
     %% whether or not the scheduler has adopted it.
-    true = ets:insert(?ACTIVE, {{proc, Pid}, dead}),
+    ok = record_proc(Pid, dead),
     %% Its timers go with it. A deadline addressed to a dead process can make
     %% nothing runnable, so leaving it in the wheel only gives the clock a
     %% place to advance to for no reason, and the audit a stray to report. A
     %% `gen_fsm` that crashed on a partition with a 60-second time-out armed
     %% was how it showed up.
     _ = eta_time:forget(Pid),
+    St1 = St#st{dying = (St#st.dying)#{Pid => true}},
     case maps:find(Pid, Ids) of
-        {ok, Id} -> mark_exited(St, Id);
-        error -> St
+        {ok, Id} -> mark_exited(St1, Id);
+        error -> St1
     end;
+%% The process has sent the signals of its links and monitors. See `settle/1`.
+handle_trace(St = #st{dying = Dying}, {trace, Pid, out_exited, _}) ->
+    St#st{dying = maps:remove(Pid, Dying)};
+%% Only the process of a step runs during the step, so the call is a call of
+%% that process. See `settle_in_step/3`.
+handle_trace(St, {trace, _Pid, call, {erlang, exit, [_, _]}}) ->
+    St#st{exit_sent = true};
 %% Every other trace event (in, out, 'receive', send elsewhere, link, …) is not
 %% scheduling-relevant.
 handle_trace(St, {trace, _Pid, _Event, _A}) ->
@@ -2941,8 +3134,9 @@ handle_trace(St, {trace, _Pid, _Event, _A, _B}) ->
 -spec do_run(#st{}, non_neg_integer(), fun(() -> boolean())) -> #st{}.
 do_run(St, 0, _OnIdle) ->
     St;
-do_run(St, MaxSteps, OnIdle) ->
-    case runnable_ids(St) of
+do_run(St0, MaxSteps, OnIdle) ->
+    {Runnable, St} = settled_runnable(St0),
+    case Runnable of
         [] ->
             case OnIdle() of
                 true -> do_run(St, MaxSteps - 1, OnIdle);
@@ -2958,13 +3152,14 @@ do_run(St, MaxSteps, OnIdle) ->
 -spec do_replay(#st{}, [id()]) -> {ok | {error, {diverged, id(), [id()]}}, #st{}}.
 do_replay(St, []) ->
     {ok, St};
-do_replay(St, [Id | Rest]) ->
-    case lists:member(Id, runnable_ids(St)) of
+do_replay(St0, [Id | Rest]) ->
+    {Runnable, St} = settled_runnable(St0),
+    case lists:member(Id, Runnable) of
         true ->
             {_Outcome, St1} = do_step(St, Id),
             do_replay(St1, Rest);
         false ->
-            {{error, {diverged, Id, runnable_ids(St)}}, St}
+            {{error, {diverged, Id, Runnable}}, St}
     end.
 
 %% ---------------------------------------------------------------------------

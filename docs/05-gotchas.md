@@ -379,17 +379,52 @@ uses. Under a run, that process is the scheduler, so a small change of the
 scheduler or of the driver can move the `DOWN` message to the other side of a
 choice.
 
-**What eta does.** `eta_net:kill_node/2` waits for the death of every process
-of the node, and for the `DOWN` messages of the VM monitors on these
-processes. It does not follow VM links from a dying process to a surviving
-process. A step in which a process exits waits for nothing after the exit.
+A call to `erlang:exit/2` has the same effect. The target dies when the VM
+handles the signal, and the links and monitors of the target fire after that.
 
-**Detection.** None. The run result reports nothing.
+**What eta does.** The scheduler settles these deaths: at the end of a step in
+which the process exited or called `erlang:exit/2`, and before every choice.
+To settle, the scheduler repeats two actions until the second one finds no
+dead process:
 
-**Correction.** Not built. The scheduler could wait, after a step or a kill
-with an exit, until every process that has started to exit is no longer in
-`erlang:processes/0`, then make every live process handle its signals with
-`process_info/2`, and repeat this while new exits appear.
+1. It waits for the `out_exited` trace event of every process that has started
+   to exit. The VM sends the signals of the links and the monitors of a process
+   before this event.
+2. It reads every live scheduled process with `process_info/2`, which makes the
+   process handle the signals that it has received.
+
+The absence of a process from `erlang:processes/0` is not a sufficient
+condition for step 1. The VM removes an exiting process from the process table
+before it sends the signals of the links and the monitors of the process.
+
+A process that calls `erlang:exit/2` and waits for the `DOWN` message of the
+target, as `supervisor:shutdown/2` does, takes the message in the same step in
+every run. The scheduler learns of the call from a `call` trace event, so the
+calling module does not need `eta_transform`.
+
+Measured with `test/eta_exit_signal_test.exs` on Erlang/OTP 28. The table has
+the number of trials with a result that depends on the wall clock:
+
+| Case | Schedulers | Before the correction | With the correction |
+|---|---|---|---|
+| `W` monitors the last process of a chain of 4 links from `P` | 1 | 46 to 51 of 200 | 0 of 200 |
+| The same with a chain of 8 links | 1 | 200 of 200 | 0 of 200 |
+| The same with a chain of 16 links, and 8 processes that never block | 8 | not measured | 0 of 1,000 |
+| `A` calls `exit(B, shutdown)` and waits for the `DOWN` message, with 8 processes that never block | 8 | 19 of 5,000 | 0 of 5,000 |
+
+**Detection.** None is needed for scheduled processes.
+
+**Limitations.**
+
+- The scheduler settles only the deaths of processes that it has adopted. A
+  process outside the schedule that dies through a link is not settled.
+- The scheduler sets a trace pattern on `erlang:exit/2` and the `call` trace
+  flag on every scheduled process. A trace pattern that another tool sets
+  makes the scheduled processes send `call` trace events to the scheduler,
+  which ignores them.
+- The `exit` trace events of processes that die in one settling are handled in
+  the order of the process ids of the scheduler, but an `exit` trace event
+  that arrives during a step is handled when it arrives.
 
 ### The order of pids changes after about one million processes
 
