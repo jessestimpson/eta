@@ -50,6 +50,9 @@
 
 ### Bug fixes
 
+- `eta_transform` rewrites `dets:delete_object/2` to the new function
+  `eta_dets:delete_object/2`. The call reached the real `dets`, which has no
+  table that `eta_dets:open_file/2` opened, and raised `badarg`.
 - The first `handle_continue/2` of a `gen_server` that is started during a run
   is run by `gen_server`. The scheduler ran the callback and accepted 3 returns.
   `{noreply, State, hibernate}` and `{noreply, State, Timeout}` ended the server

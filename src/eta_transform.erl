@@ -145,7 +145,7 @@ simulation.
 | `file:read_file/1`, `write_file/2,3`, `make_dir/1`, `del_dir/1`, `delete/1`, `rename/2`, `list_dir/1`, `read_file_info/1,2`, `read_link_info/1,2`, `get_cwd/0` | `eta_file:*` |
 | `filelib:ensure_dir/1`, `is_file/1`, `is_dir/1`, `is_regular/1` | `eta_file:*` |
 | `file:open/2`, `write/2`, `pwrite/3`, `truncate/1`, `sync/1`, `datasync/1`, `close/1` | `eta_disk:*` |
-| `dets:open_file/2`, `close/1`, `sync/1`, `lookup/2`, `member/2`, `insert/2`, `delete/2`, `delete_all_objects/1`, `select/2`, `select_delete/2`, `foldl/3`, `to_ets/2`, `info/2` | `eta_dets:*` |
+| `dets:open_file/2`, `close/1`, `sync/1`, `lookup/2`, `member/2`, `insert/2`, `delete/2`, `delete_object/2`, `delete_all_objects/1`, `select/2`, `select_delete/2`, `foldl/3`, `to_ets/2`, `info/2` | `eta_dets:*` |
 
 Each of the last group is a call that waits on a process the scheduler doesn't
 own, or a process that never runs:
@@ -457,6 +457,7 @@ while a scheduler is active and calls the original otherwise.
     {dets, member, 2} => eta_dets,
     {dets, insert, 2} => eta_dets,
     {dets, delete, 2} => eta_dets,
+    {dets, delete_object, 2} => eta_dets,
     {dets, delete_all_objects, 1} => eta_dets,
     {dets, select, 2} => eta_dets,
     {dets, select_delete, 2} => eta_dets,

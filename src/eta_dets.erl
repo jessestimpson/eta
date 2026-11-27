@@ -44,6 +44,7 @@ ignored. Functions not listed here raise while a scheduler is active.
     member/2,
     insert/2,
     delete/2,
+    delete_object/2,
     delete_all_objects/1,
     select/2,
     select_delete/2,
@@ -116,6 +117,17 @@ insert(Name, Objects) -> change(Name, fun(T) -> ets:insert(T, Objects) end).
 -doc "`dets:delete/2`, written before it returns.".
 -endif.
 delete(Name, Key) -> change(Name, fun(T) -> ets:delete(T, Key) end).
+
+-if(?DOCATTRS).
+-doc """
+`dets:delete_object/2`, written before it returns.
+
+Deletes every instance of `Object` from the table. In a `set` table, the
+function deletes the object with the key of `Object` only if the stored object
+equals `Object`.
+""".
+-endif.
+delete_object(Name, Object) -> change(Name, fun(T) -> ets:delete_object(T, Object) end).
 
 -if(?DOCATTRS).
 -doc "`dets:delete_all_objects/1`, written before it returns.".
