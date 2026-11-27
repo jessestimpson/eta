@@ -118,6 +118,35 @@ defmodule EtaPreemptTest do
       end
     end
 
+    test "a check that reads the table at every step sees the state between the 2 writes" do
+      # The atomic store is correct, so the readers never see a wrong sum. The
+      # rows `a` and `b` are not used in that mode, so this test uses the mode
+      # with 2 rows and looks only for the violation `table`.
+      opts = Map.put(@preempt, :config, %{check_table: :always})
+      sweep = :eta_run.sweep(@sut, @seeds, Map.merge(opts, %{shrink: false, match: nil}))
+
+      assert {:violation, %{property: property}} = sweep.outcome
+      assert property in [:table, :total]
+
+      tables =
+        for seed <- @seeds,
+            {:violation, %{property: :table}} <- [
+              :eta_run.run(@sut, Map.put(opts, :seed, seed)).outcome
+            ],
+            do: seed
+
+      assert tables != [], "no seed has the violation of the table"
+    end
+
+    test "preempted/1 lets the check skip the table while the store is preempted" do
+      # With the default configuration the check skips the table while the
+      # store waits at a preemption point. No seed has the violation `table`.
+      for seed <- @seeds do
+        outcome = :eta_run.run(@sut, Map.put(@preempt, :seed, seed)).outcome
+        refute match?({:violation, %{property: :table}}, outcome), "seed #{seed}"
+      end
+    end
+
     test "with the probability 1.0 every point preempts" do
       opts = Map.merge(@opts, %{preempt: 1.0, seed: 3, config: %{atomic: true}})
       result = :eta_run.run(@sut, opts)
@@ -141,6 +170,7 @@ defmodule EtaPreemptTest do
     test "the store works, and preempt/0 returns ok" do
       refute :eta_sched.active()
       assert :eta_sched.preempt() == :ok
+      refute :eta_sched.preempted(self())
 
       {:ok, store} = :eta_preempt_store.start_link(false)
       handle = :eta_preempt_store.handle(store)

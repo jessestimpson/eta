@@ -11,8 +11,9 @@
   1.0, a process yields before such a call as the seed decides, so that another
   process can run between 2 calls of one callback, as on the BEAM. The default
   is 0.0, which is the behaviour of before. `eta_sched:preempt/0` is the
-  function behind the attribute. The `sched` statistics have the new counters
-  `preempt_points` and `preemptions`.
+  function behind the attribute. `eta_sched:preempted/1` tells a harness whether
+  a process waits at a preemption point. The `sched` statistics have the new
+  counters `preempt_points` and `preemptions`.
 - `eta_run:sweep/3` runs a list of seeds, stops at the first run that does not
   pass, and shrinks the trace of a violation. With the option `audit`, a run
   that passes its invariants and fails `eta_run:audit/1` does not pass.
