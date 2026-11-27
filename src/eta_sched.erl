@@ -1259,8 +1259,8 @@ The gated child does the following, in this order:
 3. It registers the server name, if a name is given.
 4. It runs `init/1`.
 5. It sends the result of the start to the parent.
-6. It enters the loop through `gen_server:enter_loop/3`, or through
-   `gen_server:enter_loop/4` for a named server.
+6. It enters the loop through `gen_server:enter_loop/3,4`, or through
+   `gen_server:enter_loop/4,5` for a named server.
 
 The result is an OTP process. `sys:get_state/1`, `sys:get_status/1` and
 `sys:suspend/1` work on it, and `$initial_call` is `{Mod, init, 1}`.
@@ -1270,7 +1270,7 @@ The result is an OTP process. `sys:get_state/1`, `sys:get_status/1` and
 | Return of `init/1` | Result |
 |---|---|
 | `{ok, State}` | The server starts. |
-| `{ok, State, {continue, C}}` | The server starts and runs `handle_continue/2`. A continue that returns another continue is followed, which `gen_server:enter_loop/3` does not do. |
+| `{ok, State, {continue, C}}` | The server starts and enters its loop with `{continue, C}`. `gen_server` runs `handle_continue/2` before it takes a message, and handles every return of the callback as it does after any `init/1`. See "The first continue". |
 | `{ok, State, hibernate}` | The server starts. The hibernation request is dropped. |
 | `{ok, State, infinity}` | The server starts. |
 | `{ok, State, 0}` | The server starts, yields (see `yield/0`), and enters its loop with a time-out of 0, which delivers `timeout` when the mailbox is empty. |
@@ -1282,6 +1282,24 @@ The result is an OTP process. `sys:get_state/1`, `sys:get_status/1` and
 An unsupported return is refused because this function replaces a start path.
 Handling a return incorrectly without a report would be a worse defect than a
 failed start.
+
+## The first continue
+
+`gen_server` runs the `handle_continue/2` that `init/1` asks for. The scheduler
+does not run the callback.
+
+| Return of `handle_continue/2` | Result |
+|---|---|
+| `{noreply, State}` | The server waits for a message. |
+| `{noreply, State, {continue, C}}` | `gen_server` runs `handle_continue/2` again. |
+| `{noreply, State, hibernate}` | The server hibernates and waits for a message. |
+| `{noreply, State, infinity}` | The server waits for a message. |
+| `{noreply, State, 0}` | The server yields (see `timeout_return/1`), and `gen_server` delivers `timeout` when the mailbox is empty. |
+| `{noreply, State, Timeout}` with `Timeout` above 0 | `gen_server` arms the time-out on the real clock, as it does when another callback returns the value. The time-out is not on the virtual clock. |
+| `{stop, Reason, State}` | `gen_server` calls `terminate/2`, and the server exits with `Reason`. |
+| An error or an exit | `gen_server` calls `terminate/2`, and the server exits with the reason. |
+| A throw | `gen_server` takes the thrown value as the return of the callback. |
+| Any other value | `gen_server` calls `terminate/2`, and the server exits with `{bad_return_value, Value}`. |
 
 ## Errors
 
@@ -1601,7 +1619,7 @@ gated_init(Parent, Name, Mod, Args) ->
             enter_loop(Mod, Name, State);
         {ok, State, {continue, C}} ->
             Parent ! {'$eta_started', self(), {ok, self()}},
-            gated_continue(Mod, Name, C, State);
+            enter_loop(Mod, Name, State, {continue, C});
         %% A time-out of 0 reads no clock. `gen_server` delivers `timeout` when
         %% the mailbox is empty. The server yields first, so the scheduler decides
         %% what runs before the server continues, and a message that arrives in
@@ -1629,18 +1647,11 @@ gated_init(Parent, Name, Mod, Args) ->
 enter_loop(Mod, undefined, State) -> gen_server:enter_loop(Mod, [], State);
 enter_loop(Mod, Name, State) -> gen_server:enter_loop(Mod, [], State, Name).
 
-enter_loop(Mod, undefined, State, Timeout) -> gen_server:enter_loop(Mod, [], State, Timeout);
-enter_loop(Mod, Name, State, Timeout) -> gen_server:enter_loop(Mod, [], State, Name, Timeout).
-
-%% `gen_server` runs handle_continue after the init acknowledgement and before any
-%% message, and a continue may chain into another. `enter_loop/3` takes a state,
-%% not a continue, so this is done here.
-gated_continue(Mod, Name, C, State) ->
-    case Mod:handle_continue(C, State) of
-        {noreply, State1} -> enter_loop(Mod, Name, State1);
-        {noreply, State1, {continue, C2}} -> gated_continue(Mod, Name, C2, State1);
-        {stop, Reason, _State1} -> exit(Reason)
-    end.
+%% `Action` is a time-out of 0 or `{continue, C}`. `gen_server` runs
+%% `handle_continue/2` before it takes a message, and `gen_server` handles every
+%% return of the callback.
+enter_loop(Mod, undefined, State, Action) -> gen_server:enter_loop(Mod, [], State, Action);
+enter_loop(Mod, Name, State, Action) -> gen_server:enter_loop(Mod, [], State, Name, Action).
 
 -if(?DOCATTRS).
 -doc false.
