@@ -66,6 +66,21 @@
 
 ### Bug fixes
 
+- A process that a process outside the schedule wakes after the end of its
+  step is no longer idle for the rest of the run. An example is a process
+  that waits for an answer of `file_server_2`. The answer can arrive while
+  the scheduler confirms the block. The process then runs on, and the
+  scheduler suspends it outside a `receive`. The scheduler now finds this
+  case in the trace events of the process, keeps the process runnable, logs a
+  warning that names the receiver of the last message of the process, and
+  adds 1 to the new statistic `ran_on`. `eta_run:audit/1` reports a run with
+  a `ran_on` above 0.
+- A process that the scheduler suspends in a step time-out stays runnable
+  when its message queue is empty. `eta_sched` reported such a process as
+  idle and did not step it again.
+- `eta_transform` rewrites `filelib:file_size/1` and `filelib:last_modified/1`
+  to the new functions `eta_file:file_size/1` and `eta_file:last_modified/1`.
+  Both functions of `filelib` ask `file_server_2`.
 - `eta_transform` rewrites `dets:delete_object/2` to the new function
   `eta_dets:delete_object/2`. The call reached the real `dets`, which has no
   table that `eta_dets:open_file/2` opened, and raised `badarg`.

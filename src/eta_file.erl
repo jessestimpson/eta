@@ -45,6 +45,8 @@ go through `eta_disk`, so a crash can lose what they did. For the same reason,
     is_file/1,
     is_dir/1,
     is_regular/1,
+    file_size/1,
+    last_modified/1,
     ensure_path/1,
     del_dir_r/1,
     consult/1,
@@ -176,6 +178,24 @@ is_dir(Name) ->
     case prim_file:read_file_info(Name) of
         {ok, #file_info{type = directory}} -> true;
         _ -> false
+    end.
+
+-if(?DOCATTRS).
+-doc "`filelib:file_size/1`, in the calling process.".
+-endif.
+file_size(Name) ->
+    case prim_file:read_file_info(Name) of
+        {ok, #file_info{size = Size}} -> Size;
+        _ -> 0
+    end.
+
+-if(?DOCATTRS).
+-doc "`filelib:last_modified/1`, in the calling process.".
+-endif.
+last_modified(Name) ->
+    case prim_file:read_file_info(Name) of
+        {ok, #file_info{mtime = Mtime}} -> Mtime;
+        _ -> 0
     end.
 
 -if(?DOCATTRS).
