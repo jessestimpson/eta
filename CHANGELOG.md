@@ -44,6 +44,11 @@
 
 ### Bug fixes
 
+- The first `handle_continue/2` of a `gen_server` that is started during a run
+  is run by `gen_server`. The scheduler ran the callback and accepted 3 returns.
+  `{noreply, State, hibernate}` and `{noreply, State, Timeout}` ended the server
+  with `case_clause`. `{stop, Reason, State}` and an exception did not call
+  `terminate/2`. A throw ended the server with `{nocatch, Value}`.
 - A step no longer ends while the process waits for an answer of the VM
   inside a function of the `erlang` module. `erlang:garbage_collect/1`,
   `erlang:check_process_code/2` and `erlang:process_info/2` of another process
