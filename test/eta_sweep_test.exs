@@ -15,14 +15,16 @@ defmodule EtaSweepTest do
      failing seed of a loop over `eta_run:run/2`.
   3. **A sweep shrinks a violation**, unless the option `shrink` is `false`.
   4. **A sweep stops at an error and does not shrink the error.**
-  5. **`shrink/3` reaches the least operation.** For each failing seed, the
+  5. **A sweep with the option `audit` stops at a suspect run.** Without the
+     option, the same sweep passes.
+  6. **`shrink/3` reaches the least operation.** For each failing seed, the
      shrunk trace has the one operation `{put, 1, Limit}`, and the trace
      replays strictly.
-  6. **Without `shrink_op/1`, `shrink/3` changes no operation.**
-  7. **`shrink/3` removes entries again after it replaces an operation.** With
+  7. **Without `shrink_op/1`, `shrink/3` changes no operation.**
+  8. **`shrink/3` removes entries again after it replaces an operation.** With
      the configuration `pair`, a trace with 2 operations on the keys 2 and 3
      shrinks to the one operation `{put, 1, Limit}`.
-  8. **The `max_tests` budget ends the search** when `shrink_op/1` returns the
+  9. **The `max_tests` budget ends the search** when `shrink_op/1` returns the
      operation that it received.
   """
   use ExUnit.Case, async: false
@@ -96,6 +98,58 @@ defmodule EtaSweepTest do
     assert sweep.runs == 1
     assert sweep.seed == 1
     refute Map.has_key?(sweep, :shrunk)
+  end
+
+  describe "the audit option" do
+    @suspect %{max_ops: 3, max_steps: 2_000, config: %{driver_draw: true}}
+
+    test "a sweep stops at a run that passes its invariants and is suspect" do
+      sweep = :eta_run.sweep(@sut, @seeds, Map.put(@suspect, :audit, true))
+
+      assert {:error, {:suspect, reasons}} = sweep.outcome
+      assert Keyword.has_key?(reasons, :rand_unmanaged)
+      assert sweep.runs == 1
+      assert sweep.seed == 1
+      assert sweep.result.outcome == :ok
+      assert sweep.audit == {:suspect, reasons}
+      refute Map.has_key?(sweep, :shrunk)
+    end
+
+    test "without the option, the same sweep passes" do
+      assert :eta_run.sweep(@sut, @seeds, @suspect) == %{outcome: :ok, runs: 40}
+    end
+
+    test "a sweep of clean runs passes with the option" do
+      opts = %{max_ops: 3, max_steps: 2_000, audit: true}
+
+      assert :eta_run.sweep(@sut, @seeds, opts) == %{outcome: :ok, runs: 40}
+    end
+
+    test "a violation of a clean run reports the audit ok and is shrunk" do
+      sweep = :eta_run.sweep(@sut, @seeds, Map.put(@opts, :audit, true))
+
+      assert {:violation, _} = sweep.outcome
+      assert sweep.audit == :ok
+      assert sweep.shrunk.verified
+    end
+
+    test "a violation of a suspect run keeps the violation and reports the audit" do
+      opts = %{@opts | config: %{limit: @limit, driver_draw: true}}
+      first = Enum.find(@seeds, &failing?/1)
+
+      sweep =
+        :eta_run.sweep(@sut, Enum.drop_while(@seeds, &(&1 != first)), Map.put(opts, :audit, true))
+
+      assert {:violation, %{property: :small_values}} = sweep.outcome
+      assert {:suspect, _} = sweep.audit
+      assert Map.has_key?(sweep, :shrunk)
+    end
+
+    test "without the option, a failed run has no audit key" do
+      sweep = :eta_run.sweep(@sut, @seeds, @opts)
+
+      refute Map.has_key?(sweep, :audit)
+    end
   end
 
   test "shrink/3 reaches the least operation for every failing seed" do

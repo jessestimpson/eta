@@ -367,11 +367,10 @@ error that is unrelated to the run.
 The following call runs the correct mode over 40 seeds:
 
 ```erlang
-[eta_run:run(eta_2pc, #{seed => S, max_ops => 25, max_steps => 20000})
- || S <- lists:seq(1, 40)].
+eta_run:sweep(eta_2pc, lists:seq(1, 40), #{max_ops => 25, max_steps => 20000}).
 ```
 
-Every run returns `#{outcome := ok}`.
+The call returns `#{outcome => ok, runs => 40}`.
 
 The following call turns the defect on:
 

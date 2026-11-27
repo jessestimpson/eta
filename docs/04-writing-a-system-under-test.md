@@ -30,6 +30,7 @@ correct.
 -callback labels(state()) -> #{pid() => term()}.
 -callback check_final(settled(), state()) -> ok | {violation, violation()}.
 -callback settle_done(state()) -> boolean().
+-callback shrink_op(op()) -> [op()].
 ```
 
 `state()` is any term. A map is conventional.
@@ -171,6 +172,40 @@ operation and resolve the position in `execute/2`.
 - `execute/2` therefore spawns a process that performs the operation.
 - `execute/2` spawns through `eta_run:spawn_op/1`, so that the new process
   does not run before the scheduler owns it.
+
+## shrink_op/1
+
+`shrink_op/1` is optional. It returns the operations that `eta_shrink` tries
+in place of an operation of a failing trace, in the order to try them.
+Without the callback, `eta_shrink` removes operations and does not change an
+operation.
+
+Write the callback when an operation has content that the generator draws
+from a range, such as a size, a number of keys or the length of a partition.
+The shrunk trace then shows the least content that still fails.
+
+```erlang
+generate(_Sut, Rand0) ->
+    {Key, Rand1} = rand:uniform_s(5, Rand0),
+    {Size, Rand2} = rand:uniform_s(40, Rand1),
+    {{put, Key, Size}, Rand2}.
+
+shrink_op({put, Key, Size}) ->
+    [{put, 1, Size} || Key > 1] ++
+        [{put, Key, S} || S <- [1, Size div 2, Size - 1], S >= 1, S < Size].
+```
+
+With this callback, a trace that fails with `{put, 2, 31}` shrinks to
+`{put, 1, 30}` when the defect needs a size of 30 or more.
+
+- Return operations that are smaller than the argument. `eta_shrink` calls
+  the callback again on an operation that it keeps, so a callback that
+  returns its argument spends the `max_tests` budget without a result.
+- Return the most reduced operation first. Each operation that `eta_shrink`
+  tries costs one replay.
+- `execute/2` must accept every operation that the callback returns.
+
+`eta_harness` has the full description.
 
 ## check/1
 

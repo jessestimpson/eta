@@ -21,6 +21,10 @@
 %% operation by an operation on the key 1 makes the second operation
 %% unnecessary, so the shrinker must remove entries again.
 %%
+%% The configuration `driver_draw => true' makes `execute/2' draw from
+%% `eta_rand' on the driver. The scheduler is not stepping the driver, so
+%% `eta_run:audit/1' reports the run as suspect.
+%%
 %% The configuration `cycle => true' makes `shrink_op/1' return the operation
 %% that it received. That is a defective callback. It shows that the
 %% `max_tests' budget ends the search.
@@ -36,6 +40,7 @@ init(_Seed, Config) ->
         store => Pid,
         limit => maps:get(limit, Config, infinity),
         pair => maps:get(pair, Config, false),
+        driver_draw => maps:get(driver_draw, Config, false),
         procs => [Pid]
     }}.
 
@@ -47,7 +52,8 @@ generate(_Sut, Rand0) ->
     {Size, Rand2} = rand:uniform_s(40, Rand1),
     {{put, Key, Size}, Rand2}.
 
-execute({put, Key, Size}, Sut = #{store := Store, procs := Procs}) ->
+execute({put, Key, Size}, Sut = #{store := Store, procs := Procs, driver_draw := DriverDraw}) ->
+    _ = [eta_rand:uniform(10) || DriverDraw],
     Pid = eta_run:spawn_op(fun() -> eta_sweep_store:put(Store, Key, Size) end),
     Sut#{procs := Procs ++ [Pid]}.
 

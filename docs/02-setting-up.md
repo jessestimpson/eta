@@ -519,6 +519,32 @@ Replayed = eta_run:replay(my_harness, maps:get(trace, Original), Opts),
 This check is different from the seed reproduction check. It exercises
 `replay/3`, and the seed reproduction check exercises `run/2`.
 
+### Sweep of seeds
+
+One seed is one schedule. To test a system, run many seeds with
+`eta_run:sweep/3`:
+
+```erlang
+#{outcome := ok, runs := 200} =
+    eta_run:sweep(my_harness, lists:seq(1, 200), Opts#{audit => true}).
+```
+
+`sweep/3` calls `eta_run:run/2` for each seed and stops at the first run that
+does not pass.
+
+| Run | Result of `sweep/3` |
+|---|---|
+| Every run passes | `outcome` is `ok`, and `runs` is the number of seeds. |
+| A run violates an invariant | `outcome` is the violation, `seed` is the seed of the run, and `shrunk` is the result of `eta_shrink:shrink/3` on the trace of the run. |
+| A run passes its invariants and is suspect, with `audit => true` | `outcome` is `{error, {suspect, Reasons}}`, and `seed` is the seed of the run. |
+| A run ends with an error | `outcome` is the error, and `seed` is the seed of the run. |
+
+Set `audit => true` in a test, so that one assertion on `outcome` covers the
+invariants and the audit of every run.
+
+Use a loop over `eta_run:run/2` instead when the test needs the result of
+every run, for example to count the seeds that fail.
+
 ## Results
 
 Do not print a complete result. The two-phase commit example produces a
