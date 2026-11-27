@@ -9,7 +9,7 @@
 
 -include_lib("eta/include/eta.hrl").
 
--export([append/3, overwrite/3, replace/3, create/2, remove/2, read/1]).
+-export([append/3, overwrite/3, replace/3, create/2, remove/2, move/3, read/1]).
 
 %% Appends `Data' to `File'. Syncs the file if `Sync' is true.
 append(File, Data, Sync) ->
@@ -61,6 +61,12 @@ create(File, SyncDir) ->
 remove(File, SyncDir) ->
     ok = file:delete(File),
     _ = SyncDir andalso (ok = sync_dir(filename:dirname(File))),
+    ok.
+
+%% Renames `From' to `To'. Syncs the directory of `To' if `SyncDir' is true.
+move(From, To, SyncDir) ->
+    ok = file:rename(From, To),
+    _ = SyncDir andalso (ok = sync_dir(filename:dirname(To))),
     ok.
 
 read(File) ->

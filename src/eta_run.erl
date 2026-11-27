@@ -302,8 +302,10 @@ Every option has a default.
 - `disk` (default `false`): whether the run has a simulated disk. `true` starts
   a disk with the default policy. `#{policy => ...}` sets the policy. See
   `eta_disk`. With a disk, `eta_net:kill_node/2` loses a write to a raw file
-  handle unless the system synced the write. The driver starts the disk before
-  `init/2` and seeds it from the seed of the run.
+  handle unless the system synced the write. With
+  `#{policy => #{sync => barrier}}`, a sync orders the writes and does not make
+  them durable, as on macOS, and `eta_disk:flush/0` makes them durable. The
+  driver starts the disk before `init/2` and seeds it from the seed of the run.
 - `preload` (default `[]`): the applications whose modules the driver loads
   before the run starts. The driver always loads `kernel`, `stdlib` and `eta` in
   addition. `false` disables preloading. Name the application of the system under
