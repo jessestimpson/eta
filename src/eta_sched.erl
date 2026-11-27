@@ -326,7 +326,7 @@ A step ends in a time-out under one of these conditions:
 -export([is_alive/1]).
 
 %% Yield points. See `yield/0`, `preempt/0` and `timeout_return/1`.
--export([yield/0, preempt/0, timeout_return/1]).
+-export([yield/0, preempt/0, preempted/1, timeout_return/1]).
 
 %% The distributed forms. Between simulated nodes they spawn on the named node;
 %% anywhere else they raise while a run is active. See `dist/5`.
@@ -3412,9 +3412,9 @@ default, the function reads one ETS row and returns.
 
 A harness reads the state of the system between steps. With a probability above
 0.0, a step can end inside a callback, so `check/1` of the harness can see the
-state between 2 writes of one callback. An invariant must hold in that state, or
-the harness must read only state that the system publishes at the end of a
-callback.
+state between 2 writes of one callback. An invariant on the shared state of a
+process must hold in that state, or the harness must skip the invariant while
+`preempted/1` is `true` for the process.
 
 Returns `ok`.
 """.
@@ -3432,7 +3432,19 @@ preempt() ->
                     case Draw < P of
                         true ->
                             _ = ets:update_counter(?ACTIVE, preemptions, 1),
-                            yield();
+                            %% The mark is for `preempted/1`. A process that
+                            %% dies while it waits leaves the mark, which is
+                            %% then a mark of a dead process.
+                            true = ets:insert(?ACTIVE, {{preempted, Self}}),
+                            ok = yield(),
+                            %% The scheduler releases a waiting process when a
+                            %% run ends, and then deletes the table.
+                            try
+                                true = ets:delete(?ACTIVE, {preempted, Self}),
+                                ok
+                            catch
+                                error:badarg -> ok
+                            end;
                         false ->
                             ok
                     end;
@@ -3441,6 +3453,28 @@ preempt() ->
             end;
         _ ->
             ok
+    end.
+
+-if(?DOCATTRS).
+-doc """
+Whether `Pid` waits in `preempt/0`: the process yielded at a preemption point
+and has not continued.
+
+A harness calls the function in `check/1`. While it returns `true`, the process
+is between 2 calls of one callback, and the state that the process shares with
+other processes can be between 2 writes. An invariant that holds only at the end
+of a callback is skipped for that process and checked at a later call of
+`check/1`.
+
+Returns `false` with no scheduler running.
+""".
+-endif.
+-spec preempted(pid()) -> boolean().
+preempted(Pid) when is_pid(Pid) ->
+    try
+        ets:member(?ACTIVE, {preempted, Pid})
+    catch
+        error:badarg -> false
     end.
 
 preempt_counter(Counter) ->

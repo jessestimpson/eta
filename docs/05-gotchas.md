@@ -546,8 +546,9 @@ in `eta_transform` and `eta_sched:preempt/0`.
   until a run sets the option.
 - `check/1` of the harness runs between steps. With the option, a step can end
   inside a callback, so `check/1` can see the state between 2 writes. Check the
-  values that the processes of the system observed, or state that the system
-  publishes at the end of a callback.
+  values that the processes of the system observed. For an invariant on the
+  shared state itself, skip the check while `eta_sched:preempted(Pid)` is `true`
+  for the process that writes the state.
 - A replay and a shrink need the same value of the option.
 - `sched.preempt_points` and `sched.preemptions` of the result count the
   declared calls that ran and the calls that yielded. Assert that
