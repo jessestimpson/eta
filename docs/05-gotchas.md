@@ -168,6 +168,47 @@ instrumentation that is needed to find these calls after a failure.
 
 The transform handles `logger`. See the next section.
 
+**What eta does for a call that it does not rewrite.** The calling process
+blocks in a `receive` for the answer, so its step ends. The service process is
+outside the schedule and answers at a time that the real clock decides. There
+are 2 cases:
+
+1. The answer arrives after the scheduler has suspended the calling process.
+   The message queue of the process grows, so the process is runnable at the
+   next choice. No statistic reports this case.
+2. The answer arrives while the scheduler confirms the block. The process
+   runs on, and the scheduler suspends it outside a `receive`. The scheduler
+   finds this case in the trace events of the process: an `in` or `out` event
+   after the block names a function other than the function of the block. The
+   scheduler keeps the process runnable, adds 1 to `sched.ran_on` and logs a
+   warning. `audit/1` reports the run.
+
+The warning names the function of the block, the last message that the process
+sent and the receiver of that message, with its registered name, and the
+current stack of the process. A receiver such as `file_server_2` identifies
+the call to replace.
+
+Measured with `test/eta_outside_reply_test.exs` on Erlang/OTP 29 with
+`+SDio 1`. A process calls `file:read_file_info/1` in a module without the
+transform, and then a dirty NIF. The table has the number of trials of 500 in
+which the process was not stepped again:
+
+| Build | 1 scheduler | 4 schedulers |
+|---|---|---|
+| Before the check | 57 | 312 |
+| With the check | 0 | 0 |
+
+**Limitations.**
+
+- The check reports case 2 only. A run with case 1 has a `ran_on` of 0 and
+  still depends on the real clock.
+- A process that runs on and blocks again in the same function is not found.
+  An example is a process that makes 2 consecutive calls to the same service
+  process.
+- The check does not make the run reproducible. The correction is to replace
+  the call. `eta_transform` replaces the calls of `file` and `filelib` that
+  its documentation lists.
+
 ### Logger calls are recorded by eta_logger
 
 A `logger` call passes the event to a handler. The default

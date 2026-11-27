@@ -481,6 +481,7 @@ run was not determined by the seed.
 | `sched.cold_code` | A process was still waiting on `code_server` when the run ended, so the run was not quiescent when it appeared to be. Each entry names the line that called the module that was not loaded. | Set `preload`. |
 | `sched.adopted_late` | Processes ran before the scheduler owned them. | Spawn through `eta_run:spawn_op/1`. |
 | `sched.timeouts` | Steps ended before the process reached a `receive`, so the process was suspended at an arbitrary point. | See `eta_sched`. |
+| `sched.ran_on` | Steps ended as a block, and the process then ran on, because a process outside the schedule answered it. | See [Hazards](05-gotchas.md). |
 | `sched.pid_reuse` | The VM reuses pid values, so the order of pids is not the creation order. `audit/1` does not check this field. It matters only for a system or a harness that depends on the order of pids. | See [Hazards](05-gotchas.md). |
 | `stray_timers` | Timers were held by a process that the scheduler does not own, or by a process that has died. | See [Hazards](05-gotchas.md). |
 | `net.unmanaged` | A process other than the process being stepped sent a message. | See `eta_net`. |

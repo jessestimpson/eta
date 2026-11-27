@@ -335,7 +335,7 @@ system against a clock that does not move.
 
 `audit/1` checks the fields that indicate a run's interleaving was partly decided
 by the wall clock: `modules_loaded`, `sched.cold_code`, `sched.adopted_late`,
-`sched.timeouts`, `net.unmanaged` and `rand.unmanaged`.
+`sched.timeouts`, `sched.ran_on`, `net.unmanaged` and `rand.unmanaged`.
 
 ## Shrinking
 

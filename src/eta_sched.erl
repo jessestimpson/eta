@@ -218,8 +218,8 @@ ids and not pids, because the pids of two runs differ.
 
 ## Statistics
 
-`stats/1` returns the statistics of a run. Three fields report a loss of
-determinism: `adopted_late`, `timeouts` and `cold_code`.
+`stats/1` returns the statistics of a run. Four fields report a loss of
+determinism: `adopted_late`, `timeouts`, `ran_on` and `cold_code`.
 
 ## Determinism
 
@@ -229,6 +229,7 @@ A seed reproduces a run only when `stats/1` reports all of the following:
 |---|---|---|---|
 | `adopted_late` | 0 | A child ran before the scheduler suspended it. | Build the spawning module with `eta_transform`, or instrument it. |
 | `timeouts` | 0 | A step was suspended at a point that the real clock chose. | None. The run is not replayable. |
+| `ran_on` | 0 | A process ran on after its step had ended as a block, woken by something outside the schedule. | Point the call that waits on a process the scheduler does not own at a function that works in the calling process, as `eta_transform` does for `file`. |
 | `cold_code` | `[]` | A process waited on `code_server` when a run ended. | Call `eta_run:preload/1`. |
 
 ## Limitations
@@ -245,7 +246,14 @@ A seed reproduces a run only when `stats/1` reports all of the following:
 - **Step time-outs.** A step ends in a time-out when the process does not reach
   a `receive`. The conditions are listed below. The scheduler then suspends the
   process where it is, logs a warning and adds 1 to `timeouts`. The scheduler
-  does not record `blocked_at` for that step, so the process stays runnable.
+  does not record `blocked_at` for that step, and the process stays runnable
+  while it is alive, whatever its queue.
+- **Wake-ups from outside the schedule.** A process that waits on a process the
+  scheduler does not own, such as `file_server_2`, can get its answer while the
+  scheduler confirms the block, and run on after its step ended. The scheduler
+  sees it from the process's trace events after the step, logs a warning, adds
+  1 to `ran_on` and keeps the process runnable, as after a time-out. A process
+  that ran on and blocked again in the same function is not seen.
 - **Pid order.** The term order of pids is their creation order only until
   the VM has created about as many processes as its process limit
   (`erlang:system_info(process_limit)`, 1,048,576 by default). After that the
@@ -495,12 +503,24 @@ A step ends in a time-out under one of these conditions:
     %% Whether the process of the step in progress has called `erlang:exit/2`.
     %% See `settle_in_step/3`.
     exit_sent = false :: boolean(),
+    %% The function of the last `in` or `out` event of the step in progress that
+    %% the scheduler waited for, and the first other function in which the
+    %% process was scheduled in or out after the step ended. See `do_drain/5`.
+    last_mfa :: mfa() | undefined,
+    ran_into :: mfa() | undefined,
+    %% The last message that the process of the step sent, and to whom: the
+    %% call that a process that ran on was waiting for. See `note_quiescence/5`.
+    last_send :: {term(), term()} | undefined,
     %% Children spawned through `spawn/1` and friends, which start blocked. Tracked
     %% so `release/1` can let go of any that never got their token.
     gated = #{} :: #{pid() => true},
     %% Processes blocked in `yield/0`. A yielded process is runnable, and the
     %% step that resumes it sends it ?YIELD_GO. See `yield/0`.
     yielded = #{} :: #{id() => true},
+    %% Processes whose last step ended in a time-out, suspended mid-step. Such a
+    %% process is runnable while it is alive, whatever its queue. See
+    %% `note_quiescence/5`.
+    mid_step = #{} :: #{id() => true},
     %% Id assignment when a trace is driving. `supply` is what the entry now
     %% executing is expected to create, `adopted` is what it actually created, and
     %% `pinning` says which well an unexpected adoption draws from. See `pin/2`.
@@ -513,6 +533,9 @@ A step ends in a time-out under one of these conditions:
     %% Steps that ended without the process reaching a receive. See
     %% `note_quiescence/5`; any nonzero value means the run is not replayable.
     timeouts = 0 :: non_neg_integer(),
+    %% Steps that ended as a block, after which the process ran on. See
+    %% `note_running/2`; any nonzero value means the run is not replayable.
+    ran_on = 0 :: non_neg_integer(),
     %% The highest pid among the children seen so far, and the number of
     %% children whose pid compares below it. See `note_pid_order/2`.
     pid_high :: pid() | undefined,
@@ -1855,13 +1878,14 @@ Returns the statistics of the run as a map.
 | `exited` | The number of adopted processes that have exited. | Any |
 | `adopted_late` | The number of children that were adopted after they had started to run. | 0 |
 | `timeouts` | The number of steps that ended before the process reached a `receive`. | 0 |
+| `ran_on` | The number of steps that ended as a block, after which the process ran on because something outside the schedule woke it. | 0 |
 | `cold_code` | A list of `t:cold/0`, one for each process that waited on `code_server` when a run ended. | `[]` |
 | `pid_reuse` | The number of children whose pid compares below the pid of an earlier child. See "Limitations" in the module documentation. | 0, if the system or its harness depends on the order of pids |
 | `unpinned` | The number of processes that a pinned replay adopted with no pinned id. See `pin_mode/2`. | 0 in a run without pinning and in a replay that follows its trace |
 | `preempt_points` | The number of calls of `preempt/0` by a stepped process, while the probability of the `preempt` option is above 0.0. | Any |
 | `preemptions` | The number of those calls that yielded. | Any |
 
-A non-zero `adopted_late`, a non-zero `timeouts` or a non-empty `cold_code`
+A non-zero `adopted_late`, `timeouts` or `ran_on`, or a non-empty `cold_code`,
 means that the seed does not reproduce the run. See "Determinism" in the module
 documentation.
 
@@ -2197,6 +2221,7 @@ handle_call(stats, _From, St) ->
         exited = Exited,
         adopted_late = Late,
         timeouts = Timeouts,
+        ran_on = RanOn,
         cold_code = Cold,
         fresh = Fresh,
         pid_reuse = PidReuse
@@ -2207,6 +2232,7 @@ handle_call(stats, _From, St) ->
         exited => maps:size(Exited),
         adopted_late => Late,
         timeouts => Timeouts,
+        ran_on => RanOn,
         cold_code => Cold,
         %% Children whose pid compares below the pid of an earlier child. See
         %% `note_pid_order/2`.
@@ -2506,12 +2532,15 @@ settled_runnable(St0) ->
 %% empty queue and no `blocked_at` is not runnable: a step of such a process
 %% wastes a choice.
 -spec proc_state(#st{}, id(), pid()) -> runnable | idle | dead.
-proc_state(#st{blocked_at = Blocked, yielded = Yielded}, Id, Pid) ->
+proc_state(#st{blocked_at = Blocked, yielded = Yielded, mid_step = MidStep}, Id, Pid) ->
     case erlang:process_info(Pid, message_queue_len) of
         undefined ->
             dead;
         {message_queue_len, N} ->
-            case maps:is_key(Id, Yielded) orelse N > maps:get(Id, Blocked, 0) of
+            case
+                maps:is_key(Id, Yielded) orelse maps:is_key(Id, MidStep) orelse
+                    N > maps:get(Id, Blocked, 0)
+            of
                 true -> runnable;
                 false -> idle
             end
@@ -2614,7 +2643,17 @@ do_step(St00 = #st{procs = Procs}, Id) ->
     Pid = maps:get(Id, Procs),
     %% A process that yielded is resumed with its token. The token is sent before
     %% the queue is read, so the step counts it as a consumed message.
-    St0 = resume_yielded(St00#st{exit_sent = false}, Id, Pid),
+    St0 = resume_yielded(
+        St00#st{
+            exit_sent = false,
+            last_mfa = undefined,
+            ran_into = undefined,
+            last_send = undefined,
+            mid_step = maps:remove(Id, St00#st.mid_step)
+        },
+        Id,
+        Pid
+    ),
     QueueBefore = queue_len(Pid),
     %% Published for the duration of the step, and erased after it. While a step
     %% is in progress this is the *only* process that is supposed to be running,
@@ -2656,7 +2695,7 @@ do_step(St00 = #st{procs = Procs}, Id) ->
             {SelfSends, Late, St3} = drain_trace(note_yield(St2, Id, Pid), Pid),
             {QueueAfter, St3a} = queue_at_block(St3, Pid, Late),
             Consumed = QueueBefore + SelfSends - QueueAfter,
-            St4 = note_quiescence(St3a, Id, Pid, Quiescence, QueueAfter),
+            St4 = note_quiescence(St3a, Id, Pid, ran_on(St3a, Quiescence), QueueAfter),
             Outcome =
                 case Consumed > 0 of
                     true -> progress;
@@ -2664,6 +2703,28 @@ do_step(St00 = #st{procs = Procs}, Id) ->
                 end,
             {Outcome, St4}
     end.
+
+%% A step that ended as a block, of a process that then ran on, did not end at a
+%% block. It ends as `ran_on`, which `note_quiescence/5` counts in `ran_on`, and
+%% the process stays runnable as after a time-out.
+ran_on(#st{ran_into = {_, _, _}}, blocked) -> ran_on;
+ran_on(_St, Quiescence) -> Quiescence.
+
+mfa_string({M, F, A}) -> io_lib:format("~p:~p/~p", [M, F, A]).
+
+send_string(undefined) ->
+    "none";
+send_string({Msg, To}) ->
+    io_lib:format("~100000tP to ~s", [Msg, 8, dest_string(To)]).
+
+%% A registered name says more than a pid: `file_server_2`, `code_server`.
+dest_string(To) when is_pid(To) ->
+    case erlang:process_info(To, registered_name) of
+        {registered_name, Name} -> io_lib:format("~p (~p)", [To, Name]);
+        _ -> io_lib:format("~p", [To])
+    end;
+dest_string(To) ->
+    io_lib:format("~p", [To]).
 
 %% Moves a process that ended its step in `yield/0` into `yielded`. The process
 %% wrote the mark itself, before it blocked.
@@ -2808,17 +2869,49 @@ hold(Pid) ->
 %% mark it blocked at a queue length it may never grow past, stranding it for
 %% the rest of the run. Leaving `blocked_at` alone keeps it runnable, so the
 %% next step re-runs it and the schedule usually repairs itself.
--spec note_quiescence(#st{}, id(), pid(), blocked | timeout, non_neg_integer()) -> #st{}.
+-spec note_quiescence(#st{}, id(), pid(), blocked | timeout | ran_on, non_neg_integer()) -> #st{}.
 note_quiescence(St = #st{blocked_at = Blocked}, Id, _Pid, blocked, QueueAfter) ->
     St#st{blocked_at = Blocked#{Id => QueueAfter}};
-note_quiescence(St = #st{timeouts = Timeouts}, _Id, Pid, timeout, _QueueAfter) ->
+note_quiescence(
+    St = #st{
+        ran_on = RanOn,
+        mid_step = MidStep,
+        last_mfa = BlockedIn,
+        ran_into = RanInto,
+        last_send = LastSend
+    },
+    Id,
+    Pid,
+    ran_on,
+    _QueueAfter
+) ->
+    %% Read on the suspended process, once per such step. The read makes the
+    %% process handle a signal, and its `in` and `out` events go with the drain,
+    %% not into the next step.
+    Stack =
+        case erlang:process_info(Pid, current_stacktrace) of
+            {current_stacktrace, S} -> S;
+            undefined -> dead
+        end,
+    {_SelfSends, _Late, St1} = drain_trace(St, Pid),
+    logger:warning(
+        "eta_sched: ~p ran on after its step had ended as a block in ~s, into ~s, "
+        "so it was suspended mid-step. Something outside the schedule woke it, such "
+        "as the answer of a VM service. The last message it sent in the step: ~s. "
+        "Its stack now: ~100000tP. "
+        "This run's interleaving is partly wall clock and its seed will not "
+        "reproduce. See stats/1's `ran_on`.",
+        [Pid, mfa_string(BlockedIn), mfa_string(RanInto), send_string(LastSend), Stack, 30]
+    ),
+    St1#st{ran_on = RanOn + 1, mid_step = MidStep#{Id => true}};
+note_quiescence(St = #st{timeouts = Timeouts, mid_step = MidStep}, Id, Pid, timeout, _QueueAfter) ->
     logger:warning(
         "eta_sched: no scheduling event for ~p within ~wms, so it was suspended "
         "mid-step. This run's interleaving is partly wall clock and its seed will "
         "not reproduce. See stats/1's `timeouts`.",
         [Pid, ?EVENT_POLL * ?EVENT_PATIENCE]
     ),
-    St#st{timeouts = Timeouts + 1}.
+    St#st{timeouts = Timeouts + 1, mid_step = MidStep#{Id => true}}.
 
 %% Called at the one moment it can be called: a run has found nothing runnable
 %% and its idle hook has declined to move the clock, so it is about to return —
@@ -3057,8 +3150,8 @@ await_event(St, Pid, Want, Budget) ->
     {ok | exited | timeout, #st{}}.
 await_event(St, Pid, Want, Budget, Patience) when Budget > 0, Patience > 0 ->
     receive
-        {trace, Pid, Want, _} ->
-            {ok, St};
+        {trace, Pid, Want, MFA} ->
+            {ok, St#st{last_mfa = MFA}};
         {trace, Pid, out_exited, _} = T ->
             {exited, handle_trace(St, T)};
         {trace, Pid, exit, Reason} ->
@@ -3068,6 +3161,10 @@ await_event(St, Pid, Want, Budget, Patience) when Budget > 0, Patience > 0 ->
             {exited, handle_trace(St, {trace, Pid, exit, Reason})};
         {trace, _, _, _} = T ->
             await_event(handle_trace(St, T), Pid, Want, Budget - 1, Patience);
+        {trace, Pid, send, Msg, To} = T ->
+            await_event(
+                handle_trace(St#st{last_send = {Msg, To}}, T), Pid, Want, Budget - 1, Patience
+            );
         {trace, _, _, _, _} = T ->
             await_event(handle_trace(St, T), Pid, Want, Budget - 1, Patience)
     after ?EVENT_POLL ->
@@ -3111,6 +3208,8 @@ do_drain(St, Pid, Ref, SelfSends, Received) ->
             do_drain(St, Pid, Ref, SelfSends + 1, Received);
         {trace, Pid, 'receive', Msg} ->
             do_drain(St, Pid, Ref, SelfSends, [Msg | Received]);
+        {trace, Pid, Running, MFA} when Running =:= in; Running =:= out ->
+            do_drain(note_running(St, MFA), Pid, Ref, SelfSends, Received);
         {trace, _, _, _} = T ->
             do_drain(handle_trace(St, T), Pid, Ref, SelfSends, Received);
         {trace, _, _, _, _} = T ->
@@ -3119,6 +3218,28 @@ do_drain(St, Pid, Ref, SelfSends, Received) ->
         logger:warning("eta_sched: trace_delivered timed out for ~p", [Pid]),
         {SelfSends, lists:reverse(Received), St}
     end.
+
+%% An `in` or `out` event after the block. A blocked process is still scheduled
+%% in and out after its step, without running any code of its own, to handle a
+%% signal, such as a read of its `current_function` or of its messages. Those
+%% events carry the function of the `receive` it blocked in. An event in another
+%% function means that the process left the `receive` and ran on, because
+%% something outside the schedule woke it during the confirmation of the block.
+%% `confirm_block/3` cannot see that: the `in` event of that wake-up can arrive
+%% after the answer to `erlang:trace_delivered/1`. Measured on Erlang/OTP 29,
+%% with a process that asks `file_server_2` and then calls a dirty NIF: the step
+%% ended as a block in 17 of 500 trials with 1 scheduler and 234 of 500 with 4,
+%% and nothing stepped the process again.
+%%
+%% A process that ran on and blocked again in the same function is not seen.
+%%
+%% Only a function of the form `{Module, Function, Arity}` is recorded. The VM
+%% can report another term when it does not know the function. Such a term
+%% must not take the place of a later function.
+note_running(St = #st{last_mfa = MFA}, MFA) -> St;
+note_running(St = #st{last_mfa = undefined}, _MFA) -> St;
+note_running(St = #st{ran_into = undefined}, MFA = {_, _, _}) -> St#st{ran_into = MFA};
+note_running(St, _MFA) -> St.
 
 %% Trace events that are not about the step in progress: adopt spawned children,
 %% note exits, ignore the rest.

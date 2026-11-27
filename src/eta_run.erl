@@ -367,6 +367,8 @@ ok = eta_run:audit(eta_run:run(Mod, Opts)).
   them.
 - `sched.timeouts` counts the steps that ended before the process reached a
   `receive`.
+- `sched.ran_on` counts the steps that ended as a block, after which the
+  process ran on because a process outside the schedule answered it.
 - `sched.pid_reuse` counts the processes whose pid compares below the pid of a
   process that was created earlier in the run. A count above 0 means that the
   VM has created about as many processes as its process limit and reuses pid
@@ -685,6 +687,7 @@ for each check that failed:
 | `cold_code` | `sched.cold_code` | `[]` | A process still waited on the code server when the run ended. The run was not quiescent, and the load finished too late to appear in `modules_loaded`. Each entry names the function that called the cold module. | The `preload` option. |
 | `adopted_late` | `sched.adopted_late` | 0 | Processes ran before the scheduler owned them. | Spawn through `eta_run:spawn_op/1` and `eta_sched:spawn/1`. |
 | `timeouts` | `sched.timeouts` | 0 | Steps ended before the process reached a `receive`. The scheduler suspended the process at an arbitrary point. | See `eta_sched`. |
+| `ran_on` | `sched.ran_on` | 0 | Steps ended as a block, and the process then ran on, because a process outside the schedule answered it. The scheduler suspended the process at an arbitrary point. | The warning of the scheduler names the receiver of the last message. Replace the call with a function that works in the calling process. |
 | `stray_timers` | `stray_timers` | 0 | A process that the scheduler does not own, or a dead process, held a timer. | See `run/2`. |
 | `net_unmanaged` | `net.unmanaged` | 0 | A process other than the stepped process sent a message, so the wall clock decided the time of the send. | See `eta_net`. |
 | `rand_unmanaged` | `rand.unmanaged` | 0 | A process other than the stepped process drew from `rand`, so the wall clock decided the time of the draw. | See `eta_rand`. |
@@ -704,6 +707,9 @@ audit(Result = #{modules_loaded := Modules, sched := Sched}) ->
         {modules_loaded, Modules, []},
         {adopted_late, maps:get(adopted_late, Sched, 0), 0},
         {timeouts, maps:get(timeouts, Sched, 0), 0},
+        %% A step that ended as a block, after which a process outside the
+        %% schedule woke the process. See `eta_sched:stats/1`.
+        {ran_on, maps:get(ran_on, Sched, 0), 0},
         %% The half of the cold-code problem `modules_loaded` cannot see: a load
         %% that had not finished when the run did. See `eta_sched:stats/1`.
         {cold_code, maps:get(cold_code, Sched, []), []},
