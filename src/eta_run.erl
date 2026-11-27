@@ -118,6 +118,9 @@ The driver also starts the simulated network, the simulated disk and the seeded
 
 -export([run/2, replay/3, spawn_op/1, preload/1]).
 
+%% Many seeds, with the first failure shrunk. See `sweep/3`.
+-export([sweep/3]).
+
 %% Reading a trace entry. See `action/1`.
 -export([action/1, created/1]).
 
@@ -127,7 +130,7 @@ The driver also starts the simulated network, the simulated disk and the seeded
 %% Trace fixtures — a failure pinned to disk. See `save_fixture/4`.
 -export([save_fixture/4, load_fixture/1, replay_fixture/1, check_fixture/1]).
 
--export_type([entry/0, created/0, outcome/0, result/0, fixture/0]).
+-export_type([entry/0, created/0, outcome/0, result/0, sweep/0, fixture/0]).
 
 -type entry() ::
     {op, eta_harness:op()}
@@ -174,6 +177,20 @@ The driver also starts the simulated network, the simulated disk and the seeded
     %% the scheduler was not stepping. See `eta_rand:stats/0`.
     rand := #{atom() => non_neg_integer()},
     sched := #{atom() => term()}
+}.
+
+-type sweep() :: #{
+    %% `ok` when every seed passed. Otherwise the outcome of the first run that
+    %% did not pass.
+    outcome := outcome(),
+    %% The number of seeds that were run, the failing seed included.
+    runs := non_neg_integer(),
+    %% The seed and the result of the first run that did not pass.
+    seed => integer(),
+    result => result(),
+    %% The result of `eta_shrink:shrink/3` on the trace of that run. Present for
+    %% a violation, unless the `shrink` option is `false`.
+    shrunk => eta_shrink:result()
 }.
 
 -type fixture() :: #{
@@ -456,6 +473,83 @@ The `trace` of the result of a lenient replay is the schedule that ran.
 -spec replay(module(), [entry()], map()) -> result().
 replay(Mod, Trace, Opts) ->
     drive(Mod, Opts, {replay, Trace}).
+
+-if(?DOCATTRS).
+-doc """
+Runs one seed after another and stops at the first run that does not pass. A
+violation is shrunk.
+
+`Seeds` is a list of seeds. `sweep/3` calls `run/2` once for each seed, in the
+order of the list, with `seed` set to that seed. `Opts` takes the options of
+`run/2` and the following options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `shrink` | `true` | Shrinks the trace of a violation with `eta_shrink:shrink/3`. |
+| `match` | see `eta_shrink:shrink/3` | Passed to `eta_shrink:shrink/3`. |
+| `max_tests` | 500 | Passed to `eta_shrink:shrink/3`. |
+
+A `seed` in `Opts` is ignored.
+
+The result has the following keys:
+
+| Key | Present | Value |
+|---|---|---|
+| `outcome` | always | `ok` when every seed passed. Otherwise the outcome of the first run that did not pass. |
+| `runs` | always | The number of seeds that were run, the failing seed included. |
+| `seed` | when a run did not pass | The seed of that run. |
+| `result` | when a run did not pass | The result of `run/2` for that seed. |
+| `shrunk` | for a violation, unless `shrink` is `false` | The result of `eta_shrink:shrink/3` on the trace of that run. |
+
+A run with the outcome `{error, Reason}` also stops the sweep. `eta_shrink`
+shrinks violations only, so the result has no `shrunk` key in that case.
+
+```erlang
+case eta_run:sweep(my_harness, lists:seq(1, 200), #{max_ops => 25, preload => [my_app]}) of
+    #{outcome := ok} ->
+        ok;
+    #{outcome := {violation, V}, seed := Seed, shrunk := #{trace := Minimal, verified := true}} ->
+        error({violation, V, Seed, Minimal})
+end.
+```
+
+To reproduce the failure, replay the `trace` of `shrunk` with the same options
+and the reported seed. If `verified` of `shrunk` is `false`, replay the `trace`
+of `result`.
+
+`sweep/3` does not call `audit/1`. A sweep that returns `ok` shows that no seed
+of the list reached a violation. It does not show that the runs were
+deterministic.
+""".
+-endif.
+-spec sweep(module(), [integer()], map()) -> sweep().
+sweep(Mod, Seeds, Opts) when is_atom(Mod), is_list(Seeds), is_map(Opts) ->
+    RunOpts = maps:without([shrink, match, max_tests], Opts),
+    sweep(Mod, Seeds, Opts, RunOpts, 0).
+
+sweep(_Mod, [], _Opts, _RunOpts, Runs) ->
+    #{outcome => ok, runs => Runs};
+sweep(Mod, [Seed | Seeds], Opts, RunOpts, Runs) when is_integer(Seed) ->
+    Result = run(Mod, RunOpts#{seed => Seed}),
+    case maps:get(outcome, Result) of
+        ok ->
+            sweep(Mod, Seeds, Opts, RunOpts, Runs + 1);
+        Outcome ->
+            Failed = #{outcome => Outcome, runs => Runs + 1, seed => Seed, result => Result},
+            case Outcome of
+                {violation, _} -> shrink_failed(Mod, Failed, Opts);
+                {error, _} -> Failed
+            end
+    end.
+
+shrink_failed(Mod, Failed = #{seed := Seed, result := #{trace := Trace}}, Opts) ->
+    case maps:get(shrink, Opts, true) of
+        true ->
+            ShrinkOpts = maps:remove(shrink, Opts#{seed => Seed}),
+            Failed#{shrunk => eta_shrink:shrink(Mod, Trace, ShrinkOpts)};
+        false ->
+            Failed
+    end.
 
 -if(?DOCATTRS).
 -doc """

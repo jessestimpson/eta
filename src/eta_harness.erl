@@ -22,7 +22,7 @@ the clock. `eta_run` records a trace that replays the run exactly.
 
 ## Callbacks
 
-Six callbacks are required and three are optional.
+Six callbacks are required and four are optional.
 
 | Callback | Required | Purpose |
 |---|---|---|
@@ -35,6 +35,7 @@ Six callbacks are required and three are optional.
 | `check_final/2` | no | Checks the invariants that hold only at the end of a run. |
 | `settle_done/1` | no | Ends the settle phase before `settle_steps` is spent. |
 | `labels/1` | no | Names processes for `eta_log`. |
+| `shrink_op/1` | no | Returns smaller operations for `eta_shrink`. |
 
 ## Requirements
 
@@ -218,6 +219,32 @@ A name is any term. `eta_log` renders a name as follows:
 | `{Kind, N}` with an atom and an integer | `kind-n` |
 | any other term | the `~p` format of the term |
 
+## `shrink_op(Op)`
+
+`shrink_op/1` is optional. It returns the operations that `eta_shrink:shrink/3`
+tries in place of `Op`, in the order to try them. Without the callback,
+`eta_shrink` removes operations and does not change an operation.
+
+- Return operations that are smaller than `Op` by a measure that has a least
+  value. Examples are a smaller integer, a shorter list and an earlier key.
+  `eta_shrink` calls `shrink_op/1` again on an operation that it keeps. A
+  callback that returns `Op`, or an operation that leads back to `Op`, makes
+  `eta_shrink` spend its `max_tests` budget without a result.
+- Return `[]` for an operation that has no smaller operation.
+- Return the most reduced operation first. `eta_shrink` keeps the first
+  operation that gives the same violation, and each operation that it tries
+  costs one replay. A common order is the least value, then the half, then the
+  value minus 1.
+- The callback receives the operation only, not the state of the harness. A
+  replay calls `execute/2` with the operation, so `execute/2` must accept every
+  operation that `shrink_op/1` returns.
+
+```erlang
+shrink_op({put, Key, Size}) ->
+    [{put, 1, Size} || Key > 1] ++
+        [{put, Key, S} || S <- [1, Size div 2, Size - 1], S >= 1, S < Size].
+```
+
 *This documentation is LLM-generated. See the AI disclosure in `README.md`.*
 """.
 -endif.
@@ -242,5 +269,6 @@ A name is any term. `eta_log` renders a name as follows:
 -callback labels(state()) -> #{pid() => term()}.
 -callback check_final(settled(), state()) -> ok | {violation, violation()}.
 -callback settle_done(state()) -> boolean().
+-callback shrink_op(op()) -> [op()].
 
--optional_callbacks([labels/1, check_final/2, settle_done/1]).
+-optional_callbacks([labels/1, check_final/2, settle_done/1, shrink_op/1]).
