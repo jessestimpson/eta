@@ -118,6 +118,9 @@ The driver also starts the simulated network, the simulated disk and the seeded
 
 -export([run/2, replay/3, spawn_op/1, preload/1]).
 
+%% Many seeds, with the first failure shrunk. See `sweep/3`.
+-export([sweep/3]).
+
 %% Reading a trace entry. See `action/1`.
 -export([action/1, created/1]).
 
@@ -127,7 +130,7 @@ The driver also starts the simulated network, the simulated disk and the seeded
 %% Trace fixtures — a failure pinned to disk. See `save_fixture/4`.
 -export([save_fixture/4, load_fixture/1, replay_fixture/1, check_fixture/1]).
 
--export_type([entry/0, created/0, outcome/0, result/0, fixture/0]).
+-export_type([entry/0, created/0, outcome/0, result/0, sweep/0, fixture/0]).
 
 -type entry() ::
     {op, eta_harness:op()}
@@ -174,6 +177,22 @@ The driver also starts the simulated network, the simulated disk and the seeded
     %% the scheduler was not stepping. See `eta_rand:stats/0`.
     rand := #{atom() => non_neg_integer()},
     sched := #{atom() => term()}
+}.
+
+-type sweep() :: #{
+    %% `ok` when every seed passed. Otherwise the outcome of the first run that
+    %% did not pass.
+    outcome := outcome(),
+    %% The number of seeds that were run, the failing seed included.
+    runs := non_neg_integer(),
+    %% The seed and the result of the first run that did not pass.
+    seed => integer(),
+    result => result(),
+    %% The result of `audit/1` for that run. Present with the `audit` option.
+    audit => ok | {suspect, [{atom(), term()}]},
+    %% The result of `eta_shrink:shrink/3` on the trace of that run. Present for
+    %% a violation, unless the `shrink` option is `false`.
+    shrunk => eta_shrink:result()
 }.
 
 -type fixture() :: #{
@@ -459,6 +478,124 @@ replay(Mod, Trace, Opts) ->
 
 -if(?DOCATTRS).
 -doc """
+Runs one seed after another and stops at the first run that does not pass. A
+violation is shrunk.
+
+`Seeds` is a list of seeds. `sweep/3` calls `run/2` once for each seed, in the
+order of the list, with `seed` set to that seed. `Opts` takes the options of
+`run/2` and the following options:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `audit` | `false` | Calls `audit/1` on each run. A run that passes its invariants and is suspect does not pass. |
+| `shrink` | `true` | Shrinks the trace of a violation with `eta_shrink:shrink/3`. |
+| `match` | see `eta_shrink:shrink/3` | Passed to `eta_shrink:shrink/3`. |
+| `max_tests` | 500 | Passed to `eta_shrink:shrink/3`. |
+
+A `seed` in `Opts` is ignored.
+
+The result has the following keys:
+
+| Key | Present | Value |
+|---|---|---|
+| `outcome` | always | `ok` when every seed passed. Otherwise the outcome of the first run that did not pass. |
+| `runs` | always | The number of seeds that were run, the failing seed included. |
+| `seed` | when a run did not pass | The seed of that run. |
+| `result` | when a run did not pass | The result of `run/2` for that seed. |
+| `audit` | when a run did not pass, with the `audit` option | The result of `audit/1` for that run. |
+| `shrunk` | for a violation, unless `shrink` is `false` | The result of `eta_shrink:shrink/3` on the trace of that run. |
+
+A run with the outcome `{error, Reason}` also stops the sweep. `eta_shrink`
+shrinks violations only, so the result has no `shrunk` key in that case.
+
+## The `audit` option
+
+A run can pass its invariants and still be suspect: the wall clock, not the
+schedule, decided a part of the interleaving. See `audit/1`. With
+`audit => true`, `sweep/3` calls `audit/1` on the result of each run:
+
+- A run with the outcome `ok` and the audit `{suspect, Reasons}` stops the
+  sweep. The outcome of the sweep is `{error, {suspect, Reasons}}`.
+- A run with a violation stops the sweep with the violation as the outcome,
+  and the trace is shrunk. The `audit` key of the result reports whether that
+  run was suspect. The seed is not certain to reproduce a violation of a
+  suspect run.
+
+A test that sweeps seeds sets `audit => true`, so that one assertion on
+`outcome` covers the invariants and the audit:
+
+```erlang
+#{outcome := ok} =
+    eta_run:sweep(my_harness, lists:seq(1, 40), #{audit => true, preload => [my_app]}).
+```
+
+```erlang
+case eta_run:sweep(my_harness, lists:seq(1, 200), #{max_ops => 25, preload => [my_app]}) of
+    #{outcome := ok} ->
+        ok;
+    #{outcome := {violation, V}, seed := Seed, shrunk := #{trace := Minimal, verified := true}} ->
+        error({violation, V, Seed, Minimal})
+end.
+```
+
+To reproduce the failure, replay the `trace` of `shrunk` with the same options
+and the reported seed. If `verified` of `shrunk` is `false`, replay the `trace`
+of `result`.
+
+Without the `audit` option, `sweep/3` does not call `audit/1`. A sweep that
+returns `ok` then shows that no seed of the list reached a violation. It does
+not show that the seeds reproduce the runs.
+""".
+-endif.
+-spec sweep(module(), [integer()], map()) -> sweep().
+sweep(Mod, Seeds, Opts) when is_atom(Mod), is_list(Seeds), is_map(Opts) ->
+    RunOpts = maps:without([audit, shrink, match, max_tests], Opts),
+    sweep(Mod, Seeds, Opts, RunOpts, 0).
+
+sweep(_Mod, [], _Opts, _RunOpts, Runs) ->
+    #{outcome => ok, runs => Runs};
+sweep(Mod, [Seed | Seeds], Opts, RunOpts, Runs) when is_integer(Seed) ->
+    Result = run(Mod, RunOpts#{seed => Seed}),
+    Audit = sweep_audit(Result, Opts),
+    case {maps:get(outcome, Result), Audit} of
+        {ok, {suspect, _}} ->
+            sweep_failed(Mod, {error, Audit}, Seed, Result, Audit, Runs, Opts);
+        {ok, _} ->
+            sweep(Mod, Seeds, Opts, RunOpts, Runs + 1);
+        {Outcome, _} ->
+            sweep_failed(Mod, Outcome, Seed, Result, Audit, Runs, Opts)
+    end.
+
+%% `not_asked` without the `audit` option.
+sweep_audit(Result, Opts) ->
+    case maps:get(audit, Opts, false) of
+        true -> audit(Result);
+        false -> not_asked
+    end.
+
+sweep_failed(Mod, Outcome, Seed, Result, Audit, Runs, Opts) ->
+    Failed0 = #{outcome => Outcome, runs => Runs + 1, seed => Seed, result => Result},
+    Failed =
+        case Audit of
+            not_asked -> Failed0;
+            _ -> Failed0#{audit => Audit}
+        end,
+    case Outcome of
+        {violation, _} -> shrink_failed(Mod, Failed, Opts);
+        {error, _} -> Failed
+    end.
+
+shrink_failed(Mod, Failed = #{seed := Seed, result := #{trace := Trace}}, Opts) ->
+    case maps:get(shrink, Opts, true) of
+        true ->
+            ShrinkOpts = maps:without([audit, shrink], Opts#{seed => Seed}),
+            Failed#{shrunk => eta_shrink:shrink(Mod, Trace, ShrinkOpts)};
+        false ->
+            Failed
+    end.
+
+-if(?DOCATTRS).
+-doc """
 Spawns a process that performs an operation. Call `spawn_op/1` from `execute/2`
 instead of `spawn/1`.
 
@@ -640,7 +777,7 @@ Take the trace from a result of `eta_shrink:shrink/3` whose `verified` is
   a fixed implementation does not return `ok`. The fix changes which messages
   exist, so the recorded step ids are no longer runnable, and the replay returns
   `{error, {diverged, _, _}}`. That a fix works is a property of the whole
-  system. Test it with a sweep of seeds.
+  system. Test it with `sweep/3`.
 """.
 -endif.
 -spec save_fixture(file:name_all(), module(), [entry()], map()) ->

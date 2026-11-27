@@ -930,7 +930,7 @@ that option.
 implementation to show that the fix works. The replay does not report `ok`.
 The fix changes which messages exist, so the recorded step ids are no longer
 runnable, and the replay returns `{error, {diverged, _, _}}`. "The fix works"
-is a claim about the whole system. Use a seed sweep to test it.
+is a claim about the whole system. Use `eta_run:sweep/3` to test it.
 
 ## Fault injection hazards
 

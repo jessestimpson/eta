@@ -114,6 +114,13 @@ When a run fails, shrink it:
 
 The seed produces the same trace each time, and the shrink reduces the size of that trace.
 
+To run many seeds, use `eta_run:sweep/3`. The sweep stops at the first seed that fails and shrinks the trace of that run:
+
+```erlang
+#{outcome := ok} =
+    eta_run:sweep(my_harness, lists:seq(1, 200), #{max_ops => 25, preload => [my_app]}).
+```
+
 ### Prompting an LLM
 
 Modern LLMs are effective at building the DST harness and interpretting the results. An initial prompt like the one below has been shown to yield high quality findings for projects that are conducive to deterministic testing, such as implementations of Raft distributed consensus. All findings should be independently confirmed.

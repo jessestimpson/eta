@@ -5,6 +5,12 @@
 ### Enhancements
 
 - Elixir support: `use Eta` and the `mix compile.eta` compiler.
+- `eta_run:sweep/3` runs a list of seeds, stops at the first run that does not
+  pass, and shrinks the trace of a violation. With the option `audit`, a run
+  that passes its invariants and fails `eta_run:audit/1` does not pass.
+- `eta_shrink:shrink/3` replaces an operation with a smaller operation when the
+  harness exports the new optional callback `shrink_op/1`. The result has the
+  new key `ops_shrunk`.
 - `Eta.Beam.instrument/1` rewrites dependency and stdlib modules in memory.
 - `eta_disk`: a simulated disk that loses unsynced writes on `kill_node/2`.
 - `eta_ns`: per-node registered names, named ETS tables and `persistent_term` keys.

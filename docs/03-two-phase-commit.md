@@ -367,11 +367,10 @@ error that is unrelated to the run.
 The following call runs the correct mode over 40 seeds:
 
 ```erlang
-[eta_run:run(eta_2pc, #{seed => S, max_ops => 25, max_steps => 20000})
- || S <- lists:seq(1, 40)].
+eta_run:sweep(eta_2pc, lists:seq(1, 40), #{max_ops => 25, max_steps => 20000}).
 ```
 
-Every run returns `#{outcome := ok}`.
+The call returns `#{outcome => ok, runs => 40}`.
 
 The following call turns the defect on:
 
@@ -508,10 +507,12 @@ run executed. If the strict replay does not reproduce the violation,
   partitions. It exercises scheduling only. Fault injection has its own
   reproducibility hazard, which [Hazards](05-gotchas.md)
   describes.
-- The shrinker deletes whole entries. It does not simplify an entry. The
-  shrunk transaction still has 3 participants, because the generator
-  produced that operation. The shrinker does not search for a minimal
-  workload.
+- The shrinker deletes whole entries of this example. It does not simplify an
+  entry, because `eta_2pc` does not export the optional callback `shrink_op/1`
+  of `eta_harness`. The shrunk transaction still has 3 participants, because
+  the generator produced that operation. With `shrink_op/1`, the shrinker also
+  tries smaller operations. See "Shrinking the content of an operation" in
+  `eta_shrink`.
 - The shrinker cannot remove the entries that the system needs to reach the
   violation. The surviving operation is such an entry.
 

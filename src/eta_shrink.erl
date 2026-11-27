@@ -82,9 +82,28 @@ and a shrink has just performed several hundred of them, so the log currently
 holds whatever its last candidate did. Replaying the surviving trace is what
 puts your failure in the log and nothing else.
 
-It cannot shrink below what the system needs to reach the violation at all, and it
-does not try to simplify the *contents* of an operation (a smaller name, fewer
-participants). That is a separate axis and the one now worth doing next.
+It cannot shrink below what the system needs to reach the violation at all.
+
+## Shrinking the content of an operation
+
+`shrink/3` also replaces an operation with a smaller operation, when the harness
+exports the optional callback `shrink_op/1` of `eta_harness`. `shrink_op(Op)`
+returns the operations to try in place of `Op`, in the order to try them.
+
+1. `shrink/3` removes entries from the trace, as described above.
+2. For each operation of the remaining trace, from the first to the last,
+   `shrink/3` replays the trace with each operation that `shrink_op/1` returns.
+   The first replay that gives the same violation keeps its operation.
+   `shrink/3` then calls `shrink_op/1` on the kept operation, until no
+   replacement gives the same violation.
+3. If step 2 replaced an operation, `shrink/3` repeats from step 1. A smaller
+   operation can make other entries unnecessary.
+
+A replacement keeps the ids of the processes that the original operation
+created. Each replay of step 2 counts against `max_tests`. `ops_shrunk` in the
+result is the number of replacements that were kept.
+
+A harness without `shrink_op/1` gets step 1 only, and `ops_shrunk` is 0.
 
 ## Ids used to be positional, and that used to bound the whole search
 
@@ -128,6 +147,9 @@ that is about causality rather than about counting.
     original := non_neg_integer(),
     shrunk := non_neg_integer(),
     tests := non_neg_integer(),
+    %% The number of operations that were replaced by a smaller operation. See
+    %% "Shrinking the content of an operation" in the module doc.
+    ops_shrunk := non_neg_integer(),
     outcome := eta_run:outcome(),
     verified := boolean()
 }.
@@ -137,7 +159,8 @@ that is about causality rather than about counting.
     opts :: map(),
     match :: fun((eta_harness:violation()) -> boolean()),
     tests = 0 :: non_neg_integer(),
-    budget :: non_neg_integer()
+    ops_shrunk = 0 :: non_neg_integer(),
+    budget :: integer()
 }).
 
 %% ---------------------------------------------------------------------------
@@ -146,7 +169,10 @@ that is about causality rather than about counting.
 
 -if(?DOCATTRS).
 -doc """
-Shrinks `Trace` to the shortest prefix-free subsequence that still violates.
+Shrinks `Trace` to the shortest prefix-free subsequence that still violates. If
+the harness exports `shrink_op/1`, `shrink/3` also replaces operations with
+smaller operations. See "Shrinking the content of an operation" in the module
+doc.
 
 `Opts` are `eta_run:run/2`'s, plus:
 
@@ -182,7 +208,7 @@ shrink(Mod, Trace, Opts) ->
                 match = maps:get(match, Opts, default_match(Detail)),
                 budget = maps:get(max_tests, Opts, 500)
             },
-            {Minimal, S1} = ddmin(Trace, 2, S),
+            {Minimal, S1} = minimise(Trace, S),
             finish(Trace, Minimal, S1);
         Other ->
             %% Nothing to shrink. Reporting it beats returning a "minimal" trace
@@ -192,6 +218,7 @@ shrink(Mod, Trace, Opts) ->
                 original => length(Trace),
                 shrunk => length(Trace),
                 tests => 0,
+                ops_shrunk => 0,
                 outcome => Other,
                 verified => false
             }
@@ -211,6 +238,7 @@ finish(Original, Minimal, S = #s{mod = Mod, opts = Opts}) ->
                 original => length(Original),
                 shrunk => length(Executed),
                 tests => S#s.tests,
+                ops_shrunk => S#s.ops_shrunk,
                 outcome => maps:get(outcome, Strict),
                 verified => true
             };
@@ -220,9 +248,62 @@ finish(Original, Minimal, S = #s{mod = Mod, opts = Opts}) ->
                 original => length(Original),
                 shrunk => length(Original),
                 tests => S#s.tests,
+                ops_shrunk => 0,
                 outcome => maps:get(outcome, Strict),
                 verified => false
             }
+    end.
+
+%% Removes entries, then replaces operations with smaller operations. A smaller
+%% operation can make other entries unnecessary, so the two passes repeat until
+%% the second pass replaces nothing. Every kept replacement costs one test, so
+%% the budget bounds the number of repetitions.
+minimise(Trace, S) ->
+    {Shorter, S1} = ddmin(Trace, 2, S),
+    case shrink_ops(Shorter, S1) of
+        {Shorter, S2} -> {Shorter, S2};
+        {Smaller, S2} -> minimise(Smaller, S2)
+    end.
+
+%% ---------------------------------------------------------------------------
+%% The content of an operation
+%% ---------------------------------------------------------------------------
+
+%% `shrink_op/1` is an optional callback. The harness is loaded here, because
+%% `classify/3` has replayed the trace.
+shrink_ops(Trace, S = #s{mod = Mod}) ->
+    case erlang:function_exported(Mod, shrink_op, 1) of
+        true -> shrink_ops([], Trace, S);
+        false -> {Trace, S}
+    end.
+
+%% `Done` holds the entries before the current entry, newest first.
+shrink_ops(Done, [], S) ->
+    {lists:reverse(Done), S};
+shrink_ops(Done, [Entry | Rest], S = #s{mod = Mod}) ->
+    case eta_run:action(Entry) of
+        {op, Op} ->
+            case first_smaller(Done, Entry, Mod:shrink_op(Op), Rest, S) of
+                %% The kept operation is tried again, so the callback can return
+                %% one level of smaller operations at a time.
+                {ok, Entry1, S1} -> shrink_ops(Done, [Entry1 | Rest], S1);
+                {none, S1} -> shrink_ops([Entry | Done], Rest, S1)
+            end;
+        _ ->
+            shrink_ops([Entry | Done], Rest, S)
+    end.
+
+first_smaller(_Done, _Entry, [], _Rest, S) ->
+    {none, S};
+first_smaller(_Done, _Entry, _Ops, _Rest, S = #s{budget = B}) when B =< 0 ->
+    {none, S};
+first_smaller(Done, Entry, [Op | Ops], Rest, S) ->
+    %% The second element of an entry is the operation. A third element, the ids
+    %% of the processes that the operation created, stays as it is.
+    Entry1 = setelement(2, Entry, Op),
+    case still_fails(lists:reverse(Done, [Entry1 | Rest]), S) of
+        {true, S1} -> {ok, Entry1, S1#s{ops_shrunk = S1#s.ops_shrunk + 1}};
+        {false, S1} -> first_smaller(Done, Entry, Ops, Rest, S1)
     end.
 
 %% ---------------------------------------------------------------------------
