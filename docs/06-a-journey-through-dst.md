@@ -953,6 +953,27 @@ executed and replayed it again strictly, and it still failed. `false` means the
 search found something smaller that doesn't reproduce, and you get the original
 back.
 
+### Steps 9 and 10 in one call
+
+`eta_run:sweep/3` does the search of step 9 and the shrink of step 10 in one
+call. It runs the seeds in order, stops at the first seed that fails, and
+shrinks the trace of that run:
+
+```elixir
+sweep = :eta_run.sweep(:abd_harness, Enum.to_list(1..200), opts)
+sweep.seed
+:eta_run.summary(sweep.shrunk)
+```
+
+`sweep.seed` is the seed that failed, and `sweep.shrunk` is the same result
+that `:eta_shrink.shrink/3` returned above. A sweep stops at the first failure,
+so it does not tell you how many of the 200 seeds fail. Step 9 used a loop for
+that reason.
+
+In a test, pass `audit: true` as well. The sweep then also stops at a run that
+passes its invariants but fails `:eta_run.audit/1`, so one assertion on
+`sweep.outcome` covers both.
+
 ## Step 11: make the failure readable
 
 Here is the shrunk trace:
