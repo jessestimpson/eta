@@ -11,7 +11,7 @@ Nothing else about the module changes, and the rewrite is a pure call-target
 substitution: `erlang:send_after(T, D, M)` becomes `eta_time:send_after(T, D, M)`,
 and so on for the table below.
 
-## Five passes, one transform
+## Passes
 
 A module never names more than one `parse_transform`. The extra passes are
 controlled by attributes rather than by naming another transform:
@@ -33,6 +33,9 @@ controlled by attributes rather than by naming another transform:
 6. **`gen_fsm` time-outs** — takes the `Timeout` off a callback's return and
    arms a virtual deadline instead; `gen_fsm` delivers it itself. Applied to
    every module declaring `-behaviour(gen_fsm)`. See `eta_fsm`.
+7. **Preemption points** — puts a call of `eta_sched:preempt/0` before each
+   call that the module names in `-eta_preempt(...)`. Applied only to a module
+   that declares the attribute. See "Preemption points" below.
 
 They live here rather than in modules of their own for a build reason, and it is
 worth recording because it cost a broken CI run to find. **Mix does not reliably
@@ -104,6 +107,38 @@ mailbox before failing, so a miss scans twice, and a miss is the deep selective
 receive `gen_server:call/3` produces. It also duplicates every clause body into
 both receives. With the flush gone from the hit path there is little left to
 win.
+
+## Preemption points
+
+A step of `eta_sched` runs a process until the process blocks in a `receive`.
+The code of one callback is therefore atomic in a run, and it is not atomic on
+the BEAM. A module that shares state with another process outside of messages
+declares which calls are preemption points:
+
+```erlang
+-eta_preempt([ets, atomics]).
+```
+
+The value is a list. Each element is a module, or `{Module, Function, Arity}`:
+
+| Element | Calls that become preemption points |
+|---|---|
+| `ets` | Every qualified call of a function of `ets` in this module. |
+| `{ets, insert, 2}` | Every qualified call of `ets:insert/2` in this module. |
+
+The pass turns `ets:insert(T, Row)` into
+`begin eta_sched:preempt(), ets:insert(T, Row) end`. The pass runs first, so the
+other passes still rewrite the call. `eta_sched:preempt/0` yields with the
+probability of the `preempt` option of `eta_run:run/2`, which is 0.0 by
+default. A module with the attribute therefore behaves as before until a run
+sets the option.
+
+- The attribute names the calls in the module that declares it. A call in
+  another module, or in OTP, is not a preemption point.
+- `fun ets:insert/2` and `apply(ets, insert, Args)` are not calls of the form
+  `ets:insert(...)`, and the pass does not change them.
+- A module without the transform ignores the attribute.
+- Any other value of the attribute is a compile error.
 
 ## Enabling it
 
@@ -702,7 +737,10 @@ while a scheduler is active and calls the original otherwise.
 -doc "The `parse_transform` entry point. See the module doc.".
 -endif.
 -spec parse_transform(Forms, list()) -> Forms when Forms :: [erl_parse:abstract_form()].
-parse_transform(Forms, _Options) ->
+parse_transform(Forms0, _Options) ->
+    %% The preemption pass runs first: it matches the calls as the module wrote
+    %% them, and the passes below still rewrite the calls that it wraps.
+    Forms = preempt_pass(Forms0),
     Locals = local_functions(Forms),
     Rewritten = [walk(Form, Locals) || Form <- Forms],
     %% The state-time-out pass runs **last**, and that is not arbitrary. It
@@ -723,6 +761,59 @@ parse_transform(Forms, _Options) ->
         ),
         Locals
     ).
+
+%% Puts a call of `eta_sched:preempt/0` before each call that the attribute
+%% `-eta_preempt(...)` names. See "Preemption points" in the module doc.
+preempt_pass(Forms) ->
+    case [Spec || {attribute, _, eta_preempt, Spec} <- Forms] of
+        [] ->
+            Forms;
+        Specs ->
+            Points = lists:flatmap(fun preempt_points/1, Specs),
+            [preempt_form(Form, Points) || Form <- Forms]
+    end.
+
+preempt_points(Spec) when is_list(Spec) ->
+    lists:map(
+        fun
+            (Mod) when is_atom(Mod) ->
+                Mod;
+            ({Mod, Fun, Arity}) when is_atom(Mod), is_atom(Fun), is_integer(Arity), Arity >= 0 ->
+                {Mod, Fun, Arity};
+            (Other) ->
+                error(
+                    {eta_preempt,
+                        {bad_point, Other, <<"expected Module or {Module, Function, Arity}">>}}
+                )
+        end,
+        Spec
+    );
+preempt_points(Spec) ->
+    error({eta_preempt, {bad_spec, Spec, <<"expected a list">>}}).
+
+%% Only the bodies of functions have calls to wrap. A call cannot occur in a
+%% pattern or in a guard with the modules that a system shares state through,
+%% so the walk does not need to know where it is.
+preempt_form({function, _, _, _, _} = Form, Points) -> preempt_walk(Form, Points);
+preempt_form(Form, _Points) -> Form.
+
+preempt_walk({call, Anno, {remote, _, {atom, _, Mod}, {atom, _, Fun}} = Callee, Args0}, Points) ->
+    Args = preempt_walk(Args0, Points),
+    Call = {call, Anno, Callee, Args},
+    case lists:member(Mod, Points) orelse lists:member({Mod, Fun, length(Args)}, Points) of
+        true ->
+            Preempt =
+                {call, Anno, {remote, Anno, {atom, Anno, eta_sched}, {atom, Anno, preempt}}, []},
+            {block, Anno, [Preempt, Call]};
+        false ->
+            Call
+    end;
+preempt_walk(Node, Points) when is_tuple(Node) ->
+    list_to_tuple(preempt_walk(tuple_to_list(Node), Points));
+preempt_walk(Nodes, Points) when is_list(Nodes) ->
+    [preempt_walk(Node, Points) || Node <- Nodes];
+preempt_walk(Node, _Points) ->
+    Node.
 
 %% Routes the return value of every `gen_server` callback that can carry a
 %% time-out through `eta_sched:timeout_return/1`, which yields on a time-out of

@@ -512,6 +512,48 @@ all of them are auto-imported. Without the rewrite, a bare
 `spawn(Node, M, F, A)` would run ungated and would appear only in
 `adopted_late`.
 
+### The code of one callback is atomic in a run
+
+A step runs a process until the process blocks in a `receive`. No other
+process runs between 2 function calls of one callback. On the BEAM a process
+can lose its scheduler thread between any 2 calls.
+
+The difference matters for state that 2 processes share outside of messages:
+
+- an ETS table that one process writes and another process reads
+- an `atomics` or `counters` array
+- a `persistent_term`
+
+A system that writes 2 rows in one callback has a state between the 2 writes.
+A reader in another process can see that state on the BEAM. A run does not
+reach it, so a run cannot find a defect that needs it.
+
+Declare the calls that touch the shared state as preemption points, in the
+module that makes the calls:
+
+```erlang
+-eta_preempt([ets, atomics]).
+```
+
+Then set the `preempt` option of `eta_run:run/2` to a probability, for example
+`preempt => 0.3`. At each declared call, the seed decides whether the process
+yields. Other processes can then run before the call. See "Preemption points"
+in `eta_transform` and `eta_sched:preempt/0`.
+
+- Declare the calls of the writer and the calls of the reader. A reader that
+  makes 2 reads has a state between the reads too.
+- The option is 0.0 by default. A module with the attribute behaves as before
+  until a run sets the option.
+- `check/1` of the harness runs between steps. With the option, a step can end
+  inside a callback, so `check/1` can see the state between 2 writes. Check the
+  values that the processes of the system observed, or state that the system
+  publishes at the end of a callback.
+- A replay and a shrink need the same value of the option.
+- `sched.preempt_points` and `sched.preemptions` of the result count the
+  declared calls that ran and the calls that yielded. Assert that
+  `preemptions` is above 0, so that a test does not pass because no call was
+  declared.
+
 ### The scheduler is unverified above a few hundred processes
 
 The scheduler is built on `erlang:suspend_process/1`, which OTP documents as

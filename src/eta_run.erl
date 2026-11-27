@@ -276,6 +276,12 @@ Every option has a default.
   of injecting an operation, when no process is runnable. Defects that occur only
   in a period without operations are reachable because of this option. See the
   module documentation.
+- `preempt` (default 0.0): the probability, from 0.0 to 1.0, that a preemption
+  point yields. A preemption point is a call that the attribute
+  `-eta_preempt(...)` of a transformed module names, or a call of
+  `eta_sched:preempt/0`. With a probability above 0.0, another process can run
+  between 2 calls of one callback, as on the BEAM. A replay needs the same
+  value. See `eta_sched:preempt/0`.
 - `busy_steps` (default `infinity`): the number of actions without a clock
   advance after which the driver advances the clock to the next deadline. The
   clock otherwise moves only when no process is runnable. A system that spins
@@ -892,7 +898,7 @@ drive(Mod, Opts, Source) ->
     ok = eta_rand:start(#{seed => Seed}),
     try
         {ok, Sut} = Mod:init(Seed, maps:get(config, Opts, #{})),
-        Sched0 = eta_sched:new(#{seed => Seed}),
+        Sched0 = eta_sched:new(#{seed => Seed, preempt => maps:get(preempt, Opts, 0.0)}),
         Sched = eta_sched:register(Sched0, Mod:processes(Sut)),
         %% Snapshot here rather than at the top: whatever `init/2` loaded was
         %% loaded before a scheduler existed, which is exactly where a system is

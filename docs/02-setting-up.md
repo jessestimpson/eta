@@ -437,6 +437,7 @@ The table lists the most commonly used options of `eta_run:run/2`. The
 | `check_every` | 1 | Run the invariants every N actions |
 | `check_timeout` | 5000 | Milliseconds of real time an invariant may take before the run reports `check_blocked` |
 | `preload` | `[]` | Applications to load before the run starts. Name the application under test. |
+| `preempt` | 0.0 | Probability that a preemption point yields. See [Hazards](05-gotchas.md), "The code of one callback is atomic in a run". |
 | `log` | `true` | Collect an `eta_log` record of the run |
 
 Three options need an explanation.

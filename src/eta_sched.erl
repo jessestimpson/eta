@@ -325,8 +325,8 @@ A step ends in a time-out under one of these conditions:
 %% `erlang:is_process_alive/1` for a system under simulation. See `is_alive/1`.
 -export([is_alive/1]).
 
-%% Yield points. See `yield/0` and `timeout_return/1`.
--export([yield/0, timeout_return/1]).
+%% Yield points. See `yield/0`, `preempt/0` and `timeout_return/1`.
+-export([yield/0, preempt/0, timeout_return/1]).
 
 %% The distributed forms. Between simulated nodes they spawn on the named node;
 %% anywhere else they raise while a run is active. See `dist/5`.
@@ -543,9 +543,11 @@ new() ->
 -doc """
 Starts a scheduler process and returns a handle to it.
 
-`Opts` has one key:
+`Opts` has 2 keys:
 
 - `seed`: an integer that determines the choices of `run/2`. The default is 0.
+- `preempt`: the probability, from 0.0 to 1.0, that `preempt/0` yields. The
+  default is 0.0. See `preempt/0`.
 
 The scheduler is linked to the caller. When the driver exits, the scheduler
 exits and the suspensions that the scheduler holds end. The system under test
@@ -555,8 +557,12 @@ One VM runs one scheduler at a time. A second scheduler fails to start with the
 reason `{eta_sched, {scheduler_in_use, Owner, Hint}}`.
 """.
 -endif.
--spec new(#{seed => integer()}) -> sched().
+-spec new(#{seed => integer(), preempt => float()}) -> sched().
 new(Opts) ->
+    case maps:get(preempt, Opts, 0.0) of
+        P when is_number(P), P >= 0, P =< 1 -> ok;
+        Bad -> error({eta_sched, {bad_preempt, Bad, <<"expected a number from 0.0 to 1.0">>}})
+    end,
     {ok, Pid} = gen_server:start_link(?MODULE, Opts, []),
     {eta_sched, Pid}.
 
@@ -1852,6 +1858,8 @@ Returns the statistics of the run as a map.
 | `cold_code` | A list of `t:cold/0`, one for each process that waited on `code_server` when a run ended. | `[]` |
 | `pid_reuse` | The number of children whose pid compares below the pid of an earlier child. See "Limitations" in the module documentation. | 0, if the system or its harness depends on the order of pids |
 | `unpinned` | The number of processes that a pinned replay adopted with no pinned id. See `pin_mode/2`. | 0 in a run without pinning and in a replay that follows its trace |
+| `preempt_points` | The number of calls of `preempt/0` by a stepped process, while the probability of the `preempt` option is above 0.0. | Any |
+| `preemptions` | The number of those calls that yielded. | Any |
 
 A non-zero `adopted_late`, a non-zero `timeouts` or a non-empty `cold_code`
 means that the seed does not reproduce the run. See "Determinism" in the module
@@ -2129,6 +2137,21 @@ init(Opts) ->
     end,
     _ = ets:new(?ACTIVE, [named_table, public, set]),
     true = ets:insert(?ACTIVE, {sched, {?MODULE, self()}}),
+    %% The state of `preempt/0`. The stepped process reads and writes it. The
+    %% generator is separate from the generator of the schedule, so a run with a
+    %% probability of 0.0 has the schedule that it had without the option.
+    case maps:get(preempt, Opts, 0.0) of
+        P when P > 0 ->
+            true = ets:insert(?ACTIVE, [
+                {preempt, P, rand:seed_s(exsss, {Seed + 7, Seed + 19, Seed + 37})},
+                {preempt_points, 0},
+                {preemptions, 0}
+            ]);
+        _ ->
+            %% `new/1` has checked the value. With 0.0 there is no row, and
+            %% `preempt/0` returns after one lookup.
+            true
+    end,
     %% A traced process then produces a `call` trace event for each call to
     %% `erlang:exit/2`. See `settle_in_step/3`.
     _ = erlang:trace_pattern({erlang, exit, 2}, true, []),
@@ -2190,7 +2213,11 @@ handle_call(stats, _From, St) ->
         pid_reuse => PidReuse,
         %% Processes a pinned replay adopted that its trace did not account for.
         %% Zero on a generating run, and on a faithful replay. See `pin/2`.
-        unpinned => Fresh
+        unpinned => Fresh,
+        %% The calls of `preempt/0` by a stepped process, and the calls that
+        %% yielded. Both are 0 when the probability is 0.0.
+        preempt_points => preempt_counter(preempt_points),
+        preemptions => preempt_counter(preemptions)
     },
     {reply, Reply, St};
 handle_call({step, Id}, _From, St) ->
@@ -3353,6 +3380,73 @@ yield() ->
             end;
         _ ->
             ok
+    end.
+
+-if(?DOCATTRS).
+-doc """
+A preemption point: yields with the probability of the `preempt` option.
+
+A step runs a process until the process blocks in a `receive`. Code between two
+`receive` expressions is therefore atomic in a run. On the BEAM it is not: a
+process can lose its scheduler thread between any 2 function calls, and another
+process can read or write shared state in between. Shared state is an ETS table
+that another process reads, an `atomics` or `counters` array, or a
+`persistent_term`. A system that writes 2 rows in one callback, and has a reader
+in another process, has states on the BEAM that no run reaches.
+
+`preempt/0` makes such a state reachable. The seed decides at each call whether
+the process yields (see `yield/0`). With the probability 0.0, which is the
+default, the function reads one ETS row and returns.
+
+`eta_transform` puts a call of `preempt/0` before each call that the attribute
+`-eta_preempt(...)` of a module names. See "Preemption points" in
+`eta_transform`. A module can also call the function directly.
+
+- The decisions come from a generator of their own, which is seeded from the
+  seed of the scheduler. A run and its replay with the same probability make the
+  same decisions.
+- Outside a step of the calling process, for example with no scheduler
+  running, the function returns at once.
+- `stats/1` counts the calls in `preempt_points` and the yields in
+  `preemptions`.
+
+A harness reads the state of the system between steps. With a probability above
+0.0, a step can end inside a callback, so `check/1` of the harness can see the
+state between 2 writes of one callback. An invariant must hold in that state, or
+the harness must read only state that the system publishes at the end of a
+callback.
+
+Returns `ok`.
+""".
+-endif.
+-spec preempt() -> ok.
+preempt() ->
+    Self = self(),
+    case stepping() of
+        Self ->
+            case ets:lookup(?ACTIVE, preempt) of
+                [{preempt, P, Rand0}] ->
+                    {Draw, Rand1} = rand:uniform_s(Rand0),
+                    true = ets:insert(?ACTIVE, {preempt, P, Rand1}),
+                    _ = ets:update_counter(?ACTIVE, preempt_points, 1),
+                    case Draw < P of
+                        true ->
+                            _ = ets:update_counter(?ACTIVE, preemptions, 1),
+                            yield();
+                        false ->
+                            ok
+                    end;
+                [] ->
+                    ok
+            end;
+        _ ->
+            ok
+    end.
+
+preempt_counter(Counter) ->
+    case ets:lookup(?ACTIVE, Counter) of
+        [{_, N}] -> N;
+        [] -> 0
     end.
 
 -if(?DOCATTRS).
