@@ -22,6 +22,13 @@
 - `eta_file`: `filelib:ensure_path/1`, `filelib:safe_relative_path/2`,
   `file:del_dir_r/1` and `file:consult/1` without `file_server`.
 - `eta_disk` tracks `prim_file:write_file/2`.
+- `eta_disk` policy: `sync => barrier`. A sync of a file records the contents of
+  the file and makes nothing durable, as `fcntl(F_BARRIERFSYNC)` does for
+  `file:sync/1` on macOS. The new function `eta_disk:flush/0` makes the recorded
+  contents of the node durable, as `fcntl(F_FULLFSYNC)` does. A crash keeps a
+  prefix of the syncs that are not flushed. The default, `sync => durable`, is
+  the behaviour of before. `eta_disk:stats/0` has the new counters `flushes`,
+  `barriers_kept` and `barriers_undone`.
 - `eta_sched:stats/1` and the run result report `pid_reuse`: the number of
   processes whose pid compares below the pid of an earlier process. The VM
   reuses pid values after it has created about as many processes as its

@@ -55,6 +55,42 @@ The seed decides the length of each prefix. A third of the decisions keep
 everything, a third keep nothing, and a third keep a part. A part of the new
 bytes is a torn write.
 
+## The `barrier` policy
+
+The model above is the `durable` value of the `sync` key of the policy, and it
+is the default. It is what `fsync(2)` promises on Linux.
+
+On macOS, `file:sync/1` and `file:datasync/1` of Erlang/OTP 25 and later issue
+`fcntl(F_BARRIERFSYNC)`. That call fixes the order of the writes. It does not
+wait until the data is on permanent storage. Only `fcntl(F_FULLFSYNC)` does
+that, and OTP has no function that issues it on macOS. A loss of power can
+therefore lose data that a sync returned for.
+
+With `sync => barrier` in the policy, the disk models that behaviour:
+
+- **A sync of a file** records the contents of the file at the sync, in the
+  order of the syncs of the node. The sync makes nothing durable. A sync that
+  finds the contents that the previous sync of the file recorded records
+  nothing.
+- **`flush/0`** is `F_FULLFSYNC` for the node of the calling process. The
+  contents that the syncs of that node recorded become durable.
+- **A crash** keeps a prefix of the syncs of the node that are not flushed, in
+  their order. The seed decides the length of the prefix, as it does for every
+  other decision of a crash. Each file with contents that are not durable
+  then has exactly the contents of its last kept sync. A file with no kept
+  sync has its durable contents. No data that was written after the last kept
+  sync of a file remains, and no write is torn.
+- **A rename** of a file moves the recorded syncs of the file to the new name
+  and drops the recorded syncs of a file that the rename replaces. **A delete**
+  drops the recorded syncs of the file.
+
+A sync of a directory is the same under both values of `sync`: it makes the
+directory operations in the directory durable.
+
+A system that acknowledges a write after `file:sync/1` loses acknowledged data
+under this policy, unless the system or the harness calls `flush/0` before the
+acknowledgement.
+
 ## Errors
 
 With `error_p` above 0, a tracked `write/2`, `pwrite/3`, `sync/1`,
@@ -73,6 +109,14 @@ With `error_p` above 0, a tracked `write/2`, `pwrite/3`, `sync/1`,
   as they do on any handle.
 - A file that two nodes change is rolled back by the crash of the node that
   changed it first after the last sync.
+- Under the `barrier` policy, a sync of a directory is durable at once, and a
+  crash loses every write that no sync recorded. A real drive can keep such a
+  write.
+- `crash/1` reads the `sync` key of the policy at the time of the crash. Set
+  the key before the system writes, and do not change it during a run.
+- `eta_transform` does not rewrite a call to `flush/0`. A system that issues
+  `F_FULLFSYNC` through a NIF calls `flush/0` next to that call, or the harness
+  calls it.
 - A module that the transform did not rewrite uses real handles. A sync through
   such a handle makes nothing durable in the simulation. Recompile every module
   of the system after the transform changes.
@@ -97,6 +141,9 @@ With `error_p` above 0, a tracked `write/2`, `pwrite/3`, `sync/1`,
 %% Faults a harness injects.
 -export([crash/1, node_killed/1]).
 
+%% `F_FULLFSYNC`, for the `barrier` policy. See `flush/0`.
+-export([flush/0]).
+
 %% What `eta_transform` points a module's `file` calls at.
 -export([
     open/2,
@@ -113,7 +160,9 @@ With `error_p` above 0, a tracked `write/2`, `pwrite/3`, `sync/1`,
 
 -export_type([policy/0]).
 
--type policy() :: #{error_p => float(), lose_on_kill => boolean()}.
+-type policy() :: #{
+    error_p => float(), lose_on_kill => boolean(), sync => durable | barrier
+}.
 
 -define(STATE, eta_disk_state).
 %% `{Fd, Path, Node, file | dir}` for each tracked handle.
@@ -122,6 +171,9 @@ With `error_p` above 0, a tracked `write/2`, `pwrite/3`, `sync/1`,
 -define(DIRTY, eta_disk_dirty).
 %% `{Seq, Dir, Node, Op}` for each directory operation that is not durable.
 -define(OPS, eta_disk_ops).
+%% `{Seq, Node, Path, Contents}` for each sync of a file under the `barrier`
+%% policy that is not flushed: the contents of the file at the sync.
+-define(BARRIERS, eta_disk_barriers).
 
 -define(COUNTERS, [
     syncs,
@@ -132,7 +184,10 @@ With `error_p` above 0, a tracked `write/2`, `pwrite/3`, `sync/1`,
     files_kept,
     files_torn,
     files_lost,
-    ops_undone
+    ops_undone,
+    flushes,
+    barriers_kept,
+    barriers_undone
 ]).
 
 %% ---------------------------------------------------------------------------
@@ -166,6 +221,7 @@ start(Opts) ->
     ?OPEN = ets:new(?OPEN, [named_table, public, set]),
     ?DIRTY = ets:new(?DIRTY, [named_table, public, set]),
     ?OPS = ets:new(?OPS, [named_table, public, ordered_set]),
+    ?BARRIERS = ets:new(?BARRIERS, [named_table, public, ordered_set]),
     Seed = maps:get(seed, Opts, 0),
     ets:insert(?STATE, [
         {rand, rand:seed_s(exsss, {Seed + 5, Seed + 17, Seed + 31})},
@@ -192,7 +248,7 @@ stop() ->
                 error:badarg -> ok
             end
         end,
-        [?STATE, ?OPEN, ?DIRTY, ?OPS]
+        [?STATE, ?OPEN, ?DIRTY, ?OPS, ?BARRIERS]
     ),
     ok.
 
@@ -211,8 +267,13 @@ Sets the policy.
   Defaults to `0.0`.
 - `lose_on_kill` — whether `eta_net:kill_node/2` applies `crash/1` to the node
   that it kills. Defaults to `true`.
+- `sync` — what a sync of a tracked file does. With `durable`, the contents of
+  the file are durable. With `barrier`, the sync records the contents, and the
+  contents are durable after the next `flush/0` of the node. Defaults to
+  `durable`. See "The `barrier` policy" in the module doc.
 
-A key that is absent is set to its default.
+A key that is absent is set to its default. An unknown key or an unknown value
+of `sync` raises an error.
 """.
 -endif.
 -spec set_policy(policy()) -> ok.
@@ -229,9 +290,15 @@ policy() ->
     ets:lookup_element(?STATE, policy, 2).
 
 merge_policy(Policy) ->
-    case maps:keys(Policy) -- [error_p, lose_on_kill] of
-        [] -> maps:merge(#{error_p => 0.0, lose_on_kill => true}, Policy);
+    case maps:keys(Policy) -- [error_p, lose_on_kill, sync] of
+        [] -> ok;
         Unknown -> error({eta_disk, {unknown_policy_keys, Unknown}})
+    end,
+    Merged = maps:merge(#{error_p => 0.0, lose_on_kill => true, sync => durable}, Policy),
+    case maps:get(sync, Merged) of
+        durable -> Merged;
+        barrier -> Merged;
+        Sync -> error({eta_disk, {unknown_sync_policy, Sync}})
     end.
 
 -if(?DOCATTRS).
@@ -245,6 +312,12 @@ What the disk did.
   were not durable at a crash: whether all, a part, or none of the new contents
   remained.
 - `ops_undone` — directory operations that a crash undid.
+- `flushes` — calls to `flush/0` while a disk was running.
+- `barriers_kept`, `barriers_undone` — under the `barrier` policy, the syncs
+  that were not flushed at a crash: the syncs that the crash kept, and the syncs
+  that the crash undid. Under that policy, `files_kept` counts the files that a
+  crash left unchanged, `files_lost` counts the files that a crash changed, and
+  `files_torn` stays 0.
 
 A run whose `crashes` is above 0 and whose `files_torn`, `files_lost` and
 `ops_undone` are all 0 lost nothing: every crash found only durable data.
@@ -296,8 +369,42 @@ crash(Node) ->
         lists:reverse(Undone)
     ),
     lists:foreach(fun(Op) -> true = ets:delete_object(?OPS, Op) end, Ops),
-    lists:foreach(fun roll_back/1, lists:sort(ets:match_object(?DIRTY, {'_', Node, '_'}))),
+    Barriers = lists:sort(ets:match_object(?BARRIERS, {'_', Node, '_', '_'})),
+    lists:foreach(fun(B) -> true = ets:delete_object(?BARRIERS, B) end, Barriers),
+    Dirty = lists:sort(ets:match_object(?DIRTY, {'_', Node, '_'})),
+    case maps:get(sync, policy()) of
+        durable -> lists:foreach(fun roll_back/1, Dirty);
+        barrier -> undo_barriers(Barriers, Dirty)
+    end,
     ok.
+
+%% A crash under the `barrier` policy. The seed keeps a prefix of the syncs of
+%% the node that are not flushed. Each file goes to the contents of its last
+%% kept sync, or to its durable contents. The directory operations are already
+%% undone, and `undo/1` moved the syncs of a file with the file.
+undo_barriers(Barriers, Dirty) ->
+    {Kept, Undone} = lists:split(cut(length(Barriers)), Barriers),
+    lists:foreach(fun(_) -> bump(barriers_kept) end, Kept),
+    lists:foreach(fun(_) -> bump(barriers_undone) end, Undone),
+    %% A later sync of a path replaces an earlier one in the map.
+    Last = maps:from_list([{Path, Contents} || {_Seq, _Node, Path, Contents} <- Kept]),
+    lists:foreach(
+        fun(Row = {Path, _Node, Durable}) ->
+            true = ets:delete_object(?DIRTY, Row),
+            Target = maps:get(Path, Last, Durable),
+            case prim_file:read_file(Path) of
+                {ok, Target} ->
+                    bump(files_kept);
+                {ok, _Other} ->
+                    bump(files_lost),
+                    ok = prim_file:write_file(Path, Target);
+                {error, _} ->
+                    %% The file is gone. A deleted file has no contents to decide.
+                    ok
+            end
+        end,
+        Dirty
+    ).
 
 -if(?DOCATTRS).
 -doc false.
@@ -314,6 +421,7 @@ node_killed(Node) ->
 undo({create, Path}) ->
     _ = prim_file:delete(Path),
     true = ets:delete(?DIRTY, Path),
+    true = ets:match_delete(?BARRIERS, {'_', '_', Path, '_'}),
     ok;
 undo({delete, Path, Contents}) ->
     _ = prim_file:write_file(Path, Contents),
@@ -321,6 +429,7 @@ undo({delete, Path, Contents}) ->
 undo({rename, From, To, Overwritten}) ->
     _ = prim_file:rename(To, From),
     ok = move_dirty(To, From),
+    ok = move_barriers(To, From),
     case Overwritten of
         none -> ok;
         {contents, Contents} -> _ = prim_file:write_file(To, Contents)
@@ -468,6 +577,9 @@ truncate(Fd) ->
 `file:sync/1`. A sync of a tracked file makes the contents of the file durable.
 A sync of a tracked directory makes the directory operations in it durable. The
 real file is not synced.
+
+Under the `barrier` policy, a sync of a tracked file records the contents of the
+file and makes nothing durable. See "The `barrier` policy" in the module doc.
 """.
 -endif.
 -spec sync(file:io_device()) -> ok | {error, term()}.
@@ -485,18 +597,87 @@ sync(Fd, Real) ->
     case tracked(Fd) of
         untracked ->
             Real(Fd);
-        {Path, _Node, Kind} ->
+        {Path, Node, Kind} ->
             case fault(sync_errors) of
                 true ->
                     {error, eio};
                 false ->
                     bump(syncs),
-                    case Kind of
-                        file -> true = ets:delete(?DIRTY, Path);
-                        dir -> true = ets:match_delete(?OPS, {'_', Path, '_', '_'})
+                    case {Kind, maps:get(sync, policy())} of
+                        {file, durable} ->
+                            true = ets:delete(?DIRTY, Path),
+                            true = ets:match_delete(?BARRIERS, {'_', '_', Path, '_'});
+                        {file, barrier} ->
+                            ok = barrier(Path, Node);
+                        {dir, _} ->
+                            true = ets:match_delete(?OPS, {'_', Path, '_', '_'})
                     end,
                     ok
             end
+    end.
+
+%% A sync of a file under the `barrier` policy. The sync records the contents
+%% of the file, unless the sync orders nothing new: the file has its durable
+%% contents and no recorded sync, or the file has the contents of its last
+%% recorded sync.
+barrier(Path, Node) ->
+    case ets:lookup(?DIRTY, Path) of
+        [] ->
+            ok;
+        [{_Path, _Node, Durable}] ->
+            {ok, Contents} = prim_file:read_file(Path),
+            Recorded =
+                case lists:sort(ets:match_object(?BARRIERS, {'_', '_', Path, '_'})) of
+                    [] -> Durable;
+                    Barriers -> element(4, lists:last(Barriers))
+                end,
+            case Contents of
+                Recorded ->
+                    ok;
+                _ ->
+                    Seq = ets:update_counter(?STATE, seq, 1),
+                    true = ets:insert(?BARRIERS, {Seq, Node, Path, Contents}),
+                    ok
+            end
+    end.
+
+-if(?DOCATTRS).
+-doc """
+`fcntl(F_FULLFSYNC)` for the node of the calling process, under the `barrier`
+policy: the contents that the syncs of the node recorded become durable.
+
+- A file that changed after its last sync is durable as of that sync. The
+  later change is not durable.
+- Under the `durable` policy every sync is durable already. The function counts
+  the call in `flushes` and changes nothing.
+- With no disk running, the function does nothing and returns `ok`. A system can
+  therefore call it in every build.
+
+See "The `barrier` policy" in the module doc.
+""".
+-endif.
+-spec flush() -> ok.
+flush() ->
+    case running() of
+        false ->
+            ok;
+        true ->
+            bump(flushes),
+            Barriers = lists:sort(ets:match_object(?BARRIERS, {'_', here(), '_', '_'})),
+            lists:foreach(fun(B) -> true = ets:delete_object(?BARRIERS, B) end, Barriers),
+            Last = maps:from_list([{Path, Contents} || {_Seq, _Node, Path, Contents} <- Barriers]),
+            maps:foreach(fun flushed/2, Last)
+    end.
+
+%% `Contents` of `Path` are durable now. The file stays in the table of files
+%% that are not durable if it has changed since the sync.
+flushed(Path, Contents) ->
+    case prim_file:read_file(Path) of
+        {ok, Contents} ->
+            true = ets:delete(?DIRTY, Path);
+        _ ->
+            _ = ets:update_element(?DIRTY, Path, {3, Contents}),
+            true
     end.
 
 -if(?DOCATTRS).
@@ -547,6 +728,7 @@ delete(Name) ->
     case prim_file:delete(Name) of
         ok ->
             true = ets:delete(?DIRTY, Path),
+            true = ets:match_delete(?BARRIERS, {'_', '_', Path, '_'}),
             _ = is_binary(Durable) andalso add_op(Path, here(), {delete, Path, Durable}),
             ok;
         Error ->
@@ -577,7 +759,9 @@ rename(From0, To0) ->
                     case prim_file:rename(From0, To0) of
                         ok ->
                             true = ets:delete(?DIRTY, To),
+                            true = ets:match_delete(?BARRIERS, {'_', '_', To, '_'}),
                             ok = move_dirty(From, To),
+                            ok = move_barriers(From, To),
                             ok = move_open(From, To),
                             add_op(To, here(), {rename, From, To, Overwritten}),
                             ok;
@@ -626,6 +810,17 @@ move_dirty(From, To) ->
         [{_From, Node, Contents}] -> true = ets:insert(?DIRTY, {To, Node, Contents});
         [] -> true
     end,
+    ok.
+
+%% The recorded syncs of a file follow the file through a rename. Each keeps
+%% its place in the order of the syncs.
+move_barriers(From, To) ->
+    lists:foreach(
+        fun({Seq, Node, _From, Contents}) ->
+            true = ets:insert(?BARRIERS, {Seq, Node, To, Contents})
+        end,
+        ets:match_object(?BARRIERS, {'_', '_', From, '_'})
+    ),
     ok.
 
 %% An open handle follows its file through a rename.
